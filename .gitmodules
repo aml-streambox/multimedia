@@ -1,0 +1,72 @@
+[submodule "aml_amaudioutils"]
+	path = aml_amaudioutils
+	url = git@192.168.12.166:streambox/aml_amaudioutils.git
+[submodule "aml_audio_hal"]
+	path = aml_audio_hal
+	url = git@192.168.12.166:streambox/aml_audio_hal.git
+[submodule "aml_mp_sdk"]
+	path = aml_mp_sdk
+	url = git@192.168.12.166:streambox/aml_mp_sdk.git
+[submodule "avsync-lib"]
+	path = avsync-lib
+	url = git@192.168.12.166:streambox/avsync-lib.git
+[submodule "cas-hal"]
+	path = cas-hal
+	url = git@192.168.12.166:streambox/cas-hal.git
+[submodule "ffmpeg-aml"]
+	path = ffmpeg-aml
+	url = git@192.168.12.166:streambox/ffmpeg-aml.git
+[submodule "ffmpeg-vendor"]
+	path = ffmpeg-vendor
+	url = git@192.168.12.166:streambox/ffmpeg-vendor.git
+[submodule "gst-aml-drm-plugins1"]
+	path = gst-aml-drm-plugins1
+	url = git@192.168.12.166:streambox/gst-aml-drm-plugins1.git
+[submodule "gst-aml-drmbufferpool1"]
+	path = gst-aml-drmbufferpool1
+	url = git@192.168.12.166:streambox/gst-aml-drmbufferpool1.git
+[submodule "gst-aml-utils"]
+	path = gst-aml-utils
+	url = git@192.168.12.166:streambox/gst-aml-utils.git
+[submodule "gst-plugin-aml-asink"]
+	path = gst-plugin-aml-asink
+	url = git@192.168.12.166:streambox/gst-plugin-aml-asink.git
+[submodule "gst-plugin-aml-picsink"]
+	path = gst-plugin-aml-picsink
+	url = git@192.168.12.166:streambox/gst-plugin-aml-picsink.git
+[submodule "gst-plugin-aml-v4l2dec"]
+	path = gst-plugin-aml-v4l2dec
+	url = git@192.168.12.166:streambox/gst-plugin-aml-v4l2dec.git
+[submodule "gst-plugin-aml-vsink"]
+	path = gst-plugin-aml-vsink
+	url = git@192.168.12.166:streambox/gst-plugin-aml-vsink.git
+[submodule "gst-plugin-venc"]
+	path = gst-plugin-venc
+	url = git@192.168.12.166:streambox/gst-plugin-venc.git
+[submodule "gst-plugin-video-sink"]
+	path = gst-plugin-video-sink
+	url = git@192.168.12.166:streambox/gst-plugin-video-sink.git
+[submodule "gst_agmplayer"]
+	path = gst_agmplayer
+	url = git@192.168.12.166:streambox/gst_agmplayer.git
+[submodule "hal_audio_service"]
+	path = hal_audio_service
+	url = git@192.168.12.166:streambox/hal_audio_service.git
+[submodule "iptv-middlewave-bin"]
+	path = iptv-middlewave-bin
+	url = git@192.168.12.166:streambox/iptv-middlewave-bin.git
+[submodule "libdvr"]
+	path = libdvr
+	url = git@192.168.12.166:streambox/libdvr.git
+[submodule "libmediadrm"]
+	path = libmediadrm
+	url = git@192.168.12.166:streambox/libmediadrm.git
+[submodule "libvideorender"]
+	path = libvideorender
+	url = git@192.168.12.166:streambox/libvideorender.git
+[submodule "mediahal-sdk"]
+	path = mediahal-sdk
+	url = git@192.168.12.166:streambox/mediahal-sdk.git
+[submodule "gst-aml-plugins1"]
+	path = gst-aml-plugins1
+	url = git@192.168.12.166:streambox/gst-aml-plugins1.git

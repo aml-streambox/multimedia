@@ -4,11 +4,9 @@
 //
 // Hardware writes with WORDS_SWAP=1 + WR_ENDIAN=0 (big endian).
 // Correction: bswap64 each 64-bit word during tile load into shared memory.
-// After correction, data is in native little-endian byte order — same as
-// what the amlvenc shader expects with no_swap_en=1.
 //
 // Workgroup: 128 threads x 1 row.
-// Each thread processes 2 consecutive pixel pairs (4 pixels → 4 Y bytes packed).
+// Each thread processes 2 consecutive pixel pairs (4 pixels -> 4 Y bytes packed).
 // Tile = 256 pairs = 1280 bytes = 320 uint32 words + 2 guard.
 //
 // Component order in 40-bit after bswap64 correction:
@@ -20,10 +18,23 @@
 //   y1 = (bs >> 2)  & 0x3FF
 //   v0 = ((bs & 0x3) << 8) | hi
 //
-// HDR mode (hdr_mode == 1):
-//   Limited-range BT.2020 YCbCr 10-bit → BT.709 YCbCr 8-bit
+// Color space conversion (hdr_mode == 1):
+//   BT.2020 YCbCr 10-bit -> BT.709 YCbCr 8-bit using a YCbCr-domain matrix.
+//
+//   Mathematical derivation:
+//     M_composite = RGB_to_YCbCr_709 * Gamut_2020_to_709 * YCbCr_to_RGB_2020
+//   This yields a 3x3 matrix where the Y row is [1, ~0, ~0] — luma is
+//   unchanged by gamut conversion. So Y_8 = Y_10 >> 2 (identical to SDR).
+//   Only chroma needs a 2x2 matrix multiply:
+//     Cb_8 = clamp(m00*(Cb_10-512) + m01*(Cr_10-512) + 128, 16, 240)
+//     Cr_8 = clamp(m10*(Cb_10-512) + m11*(Cr_10-512) + 128, 16, 240)
+//
+//   This is the industry-standard approach: fold quantization scaling into the
+//   color matrix so the GPU does a single multiply-add per component with no
+//   intermediate normalize/denormalize steps.
+//
 // SDR mode (hdr_mode == 0):
-//   Simple 10-bit to 8-bit truncation (val >> 2).
+//   Simple 10-bit to 8-bit truncation (val >> 2), no color space conversion.
 
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
@@ -43,16 +54,32 @@ layout(push_constant) uniform Params {
     uint width;
     uint height;
     uint pairs_per_row;
-    uint hdr_mode;    // 0 = SDR passthrough, 1 = HDR BT.2020 → SDR BT.709
+    uint hdr_mode;    // 0 = SDR passthrough, 1 = BT.2020 -> BT.709 CSC
 } params;
 
 // 256 pairs * 5 bytes = 1280 bytes, + up to 3 bytes alignment + 8 bytes guard = 1291
-// Worst case: (1291 + 3) / 4 = 323.5 → 324 words
+// Worst case: (1291 + 3) / 4 = 323.5 -> 324 words
 #define TILE_PAIRS 256u
 #define TILE_BYTES (TILE_PAIRS * 5u)
 #define TILE_WORDS ((TILE_BYTES + 3u + 8u) / 4u + 1u)  // 324
 
 shared uint tile[TILE_WORDS];
+
+// ============================================================
+// BT.2020 -> BT.709 chroma conversion matrix (2x2)
+//
+// Derived from: M = Quant_709_8bit * Composite * Dequant_2020_10bit
+// where Composite = RGB2YCbCr_709 * GamutMap * YCbCr2RGB_2020
+//
+// Luma row is [0.25, ~0, ~0] with offset ~0, equivalent to Y >> 2.
+// Only the chroma 2x2 submatrix is needed:
+//   Cb_8 = m00*(Cb_10 - 512) + m01*(Cr_10 - 512) + 128
+//   Cr_8 = m10*(Cb_10 - 512) + m11*(Cr_10 - 512) + 128
+// ============================================================
+const float CSC_M00 =  0.2857988609;   // 224/896 * 1.14320
+const float CSC_M01 =  0.0041541729;   // 224/896 * 0.01662
+const float CSC_M10 = -0.0064098041;   // 224/896 * -0.02564
+const float CSC_M11 =  0.4420313078;   // 224/896 * 1.76813
 
 // Byte-swap a 32-bit word
 uint bswap32(uint val) {
@@ -63,8 +90,6 @@ uint bswap32(uint val) {
 }
 
 // Load input words into shared memory with bswap64 correction.
-// bswap64: for each 64-bit block (2 uint32 words), swap word order and
-// byte-reverse each word.
 void load_tile(uint base_word_idx, uint n_words) {
     uint lid = gl_LocalInvocationID.x;
 
@@ -82,28 +107,9 @@ void load_tile(uint base_word_idx, uint n_words) {
     barrier();
 }
 
-// Extract 40-bit pair from shared memory tile at local pair index.
-void extract_pair_from_tile(uint local_pair, out uint lo, out uint hi) {
-    uint byte_off = local_pair * 5u;
-    uint widx = byte_off >> 2;
-    uint shift = (byte_off & 3u) << 3;
-
-    uint w0 = tile[widx];
-    uint w1 = tile[widx + 1u];
-
-    if (shift == 0u) {
-        lo = w0;
-        hi = w1 & 0xFFu;
-    } else {
-        uint w2 = tile[widx + 2u];
-        lo = (w0 >> shift) | (w1 << (32u - shift));
-        hi = ((w1 >> shift) | (w2 << (32u - shift))) & 0xFFu;
-    }
-}
-
-// Same as above but with additional byte offset for tile alignment.
-void extract_pair_from_tile_offset(uint local_pair, uint byte_offset_base,
-                                   out uint lo, out uint hi) {
+// Extract 40-bit pair from shared memory tile with byte offset.
+void extract_pair(uint local_pair, uint byte_offset_base,
+                  out uint lo, out uint hi) {
     uint byte_off = byte_offset_base + local_pair * 5u;
     uint widx = byte_off >> 2;
     uint shift = (byte_off & 3u) << 3;
@@ -122,26 +128,17 @@ void extract_pair_from_tile_offset(uint local_pair, uint byte_offset_base,
 }
 
 // Read a corrected 40-bit pair from global memory (for next-row UV reads).
-// Uses inline bswap64 for each word accessed.
 void read_pair_global(uint pair_idx, out uint lo, out uint hi) {
     uint byte_offset = pair_idx * 5u;
     uint word_idx = byte_offset >> 2;
     uint shift = (byte_offset & 3u) << 3;
 
-    // Corrected word at global index p:
-    //   block_base = p & ~1u  (64-bit aligned)
-    //   raw_even = input[block_base], raw_odd = input[block_base + 1]
-    //   corrected[even] = bswap32(raw_odd)
-    //   corrected[odd]  = bswap32(raw_even)
-
-    // Load corrected word 0
     uint p0 = word_idx;
     uint b0 = p0 & ~1u;
     uint r0a = input_buffer.data[b0];
     uint r0b = input_buffer.data[b0 + 1u];
     uint cw0 = ((p0 & 1u) == 0u) ? bswap32(r0b) : bswap32(r0a);
 
-    // Load corrected word 1
     uint p1 = word_idx + 1u;
     uint b1 = p1 & ~1u;
     uint cw1;
@@ -157,12 +154,10 @@ void read_pair_global(uint pair_idx, out uint lo, out uint hi) {
         lo = cw0;
         hi = cw1 & 0xFFu;
     } else {
-        // Need corrected word 2
         uint p2 = word_idx + 2u;
         uint b2 = p2 & ~1u;
         uint cw2;
         if (b2 == b1) {
-            // Same block as word 1
             if (b1 == b0) {
                 cw2 = ((p2 & 1u) == 0u) ? bswap32(r0b) : bswap32(r0a);
             } else {
@@ -180,28 +175,23 @@ void read_pair_global(uint pair_idx, out uint lo, out uint hi) {
     }
 }
 
-// ============================================================
-// HDR → SDR conversion: BT.2020 YCbCr → BT.709 YCbCr
-// ============================================================
-void bt2020_to_bt709_pixel_pair(uint y0_10, uint y1_10, uint u_10, uint v_10,
-                                out uint y0_8, out uint y1_8,
-                                out uint u_8, out uint v_8) {
-    // Dequantize 10-bit limited-range to normalized
-    float Cb_n = (float(u_10) - 512.0) / 896.0;
-    float Cr_n = (float(v_10) - 512.0) / 896.0;
+// Decode AMLY 40-bit pair into 10-bit Y0, U, Y1, V components.
+void decode_pair(uint lo, uint hi, out uint y0, out uint u0, out uint y1, out uint v0) {
+    uint bs = bswap32(lo);
+    y0 = (bs >> 22) & 0x3FFu;
+    u0 = (bs >> 12) & 0x3FFu;
+    y1 = (bs >> 2)  & 0x3FFu;
+    v0 = ((bs & 0x3u) << 8) | hi;
+}
 
-    float Y0_n = clamp(float(y0_10) - 64.0, 0.0, 876.0) / 876.0;
-    float Y1_n = clamp(float(y1_10) - 64.0, 0.0, 876.0) / 876.0;
-
-    // Chroma gamut mapping: BT.2020 → BT.709
-    float Cb_709 = 1.143122 * Cb_n + 0.016609 * Cr_n;
-    float Cr_709 = -0.025627 * Cb_n + 1.768185 * Cr_n;
-
-    // Quantize to 8-bit limited range
-    y0_8 = uint(clamp(Y0_n * 219.0 + 16.0, 16.0, 235.0));
-    y1_8 = uint(clamp(Y1_n * 219.0 + 16.0, 16.0, 235.0));
-    u_8  = uint(clamp(Cb_709 * 224.0 + 128.0, 16.0, 240.0));
-    v_8  = uint(clamp(Cr_709 * 224.0 + 128.0, 16.0, 240.0));
+// BT.2020 -> BT.709 chroma conversion for a UV pair.
+// Input: 10-bit Cb (u_10), Cr (v_10) in [64..960] limited range.
+// Output: 8-bit Cb (u_8), Cr (v_8) in [16..240] limited range.
+void csc_chroma(uint u_10, uint v_10, out uint u_8, out uint v_8) {
+    float cb = float(u_10) - 512.0;
+    float cr = float(v_10) - 512.0;
+    u_8 = uint(clamp(CSC_M00 * cb + CSC_M01 * cr + 128.0, 16.0, 240.0));
+    v_8 = uint(clamp(CSC_M10 * cb + CSC_M11 * cr + 128.0, 16.0, 240.0));
 }
 
 void main() {
@@ -214,74 +204,40 @@ void main() {
     uint row_byte_start = row * params.pairs_per_row * 5u;
     uint tile_byte_start = row_byte_start + tile_start * 5u;
     uint base_word_idx = tile_byte_start >> 2;
-    uint tile_byte_offset = tile_byte_start & 3u;  // 0-3 byte offset into first word
+    uint tile_byte_offset = tile_byte_start & 3u;
 
     uint tile_bytes_needed = tile_byte_offset + tile_pairs * 5u;
     uint n_words = (tile_bytes_needed + 3u) / 4u + 2u;
     if (n_words > TILE_WORDS) n_words = TILE_WORDS;
 
-    // Cooperative tile load with bswap64 (ALL threads must participate for barrier)
+    // Cooperative tile load (ALL threads must participate for barrier)
     load_tile(base_word_idx, n_words);
 
-    // Bounds checks after barrier
     if (row >= params.height) return;
 
-    // Each thread processes 2 consecutive pairs: pair_a = 2*lid, pair_b = 2*lid+1
+    // Each thread processes 2 consecutive pairs: pair_a, pair_b
     uint local_pair_a = lid * 2u;
     uint local_pair_b = lid * 2u + 1u;
     uint global_pair_a = tile_start + local_pair_a;
 
     if (local_pair_a >= tile_pairs) return;
 
-    // --- Extract pair A ---
+    // --- Extract and decode pair A ---
     uint lo_a, hi_a;
-    extract_pair_from_tile_offset(local_pair_a, tile_byte_offset, lo_a, hi_a);
+    extract_pair(local_pair_a, tile_byte_offset, lo_a, hi_a);
+    uint y0_a, u0_a, y1_a, v0_a;
+    decode_pair(lo_a, hi_a, y0_a, u0_a, y1_a, v0_a);
 
-    uint bs_a = bswap32(lo_a);
-    uint y0_a = (bs_a >> 22) & 0x3FFu;
-    uint u0_a = (bs_a >> 12) & 0x3FFu;
-    uint y1_a = (bs_a >> 2) & 0x3FFu;
-    uint v0_a = ((bs_a & 0x3u) << 8) | hi_a;
+    // --- Y plane: luma is Y_10 >> 2 in both SDR and CSC modes ---
+    // (BT.2020->BT.709 gamut conversion does not change luma)
+    uint y_word = (y0_a >> 2) | ((y1_a >> 2) << 8);
 
-    // --- Y plane ---
-    uint y_word;
-
-    if (params.hdr_mode == 0u) {
-        // SDR: simple 10→8 bit truncation
-        uint y0_a8 = y0_a >> 2;
-        uint y1_a8 = y1_a >> 2;
-        y_word = (y0_a8 & 0xFFu) | ((y1_a8 & 0xFFu) << 8);
-
-        if (local_pair_b < tile_pairs) {
-            uint lo_b, hi_b;
-            extract_pair_from_tile_offset(local_pair_b, tile_byte_offset, lo_b, hi_b);
-            uint bs_b = bswap32(lo_b);
-            uint y0_b = (bs_b >> 22) & 0x3FFu;
-            uint y1_b = (bs_b >> 2) & 0x3FFu;
-            y_word |= ((y0_b >> 2) & 0xFFu) << 16;
-            y_word |= ((y1_b >> 2) & 0xFFu) << 24;
-        }
-    } else {
-        // HDR: BT.2020 → BT.709
-        uint y0_a8, y1_a8, u_a8_hdr, v_a8_hdr;
-        bt2020_to_bt709_pixel_pair(y0_a, y1_a, u0_a, v0_a,
-                              y0_a8, y1_a8, u_a8_hdr, v_a8_hdr);
-        y_word = (y0_a8 & 0xFFu) | ((y1_a8 & 0xFFu) << 8);
-
-        if (local_pair_b < tile_pairs) {
-            uint lo_b, hi_b;
-            extract_pair_from_tile_offset(local_pair_b, tile_byte_offset, lo_b, hi_b);
-            uint bs_b = bswap32(lo_b);
-            uint u0_b = (bs_b >> 12) & 0x3FFu;
-            uint y0_b = (bs_b >> 22) & 0x3FFu;
-            uint v0_b = ((bs_b & 0x3u) << 8) | hi_b;
-            uint y1_b = (bs_b >> 2) & 0x3FFu;
-
-            uint y0_b8, y1_b8, u_b8_hdr, v_b8_hdr;
-            bt2020_to_bt709_pixel_pair(y0_b, y1_b, u0_b, v0_b,
-                                  y0_b8, y1_b8, u_b8_hdr, v_b8_hdr);
-            y_word |= ((y0_b8 & 0xFFu) << 16) | ((y1_b8 & 0xFFu) << 24);
-        }
+    if (local_pair_b < tile_pairs) {
+        uint lo_b, hi_b;
+        extract_pair(local_pair_b, tile_byte_offset, lo_b, hi_b);
+        uint y0_b, u0_b, y1_b, v0_b;
+        decode_pair(lo_b, hi_b, y0_b, u0_b, y1_b, v0_b);
+        y_word |= ((y0_b >> 2) << 16) | ((y1_b >> 2) << 24);
     }
 
     uint y_byte_off = row * params.width + global_pair_a * 2u;
@@ -290,98 +246,53 @@ void main() {
     // --- UV plane: even rows only, vertical 2:1 average ---
     if ((row & 1u) != 0u || row + 1u >= params.height) return;
 
+    // Read next-row pair A from global memory
+    uint next_pair_a = global_pair_a + params.pairs_per_row;
+    uint nlo_a, nhi_a;
+    read_pair_global(next_pair_a, nlo_a, nhi_a);
+    uint ny0_a, nu0_a, ny1_a, nv0_a;
+    decode_pair(nlo_a, nhi_a, ny0_a, nu0_a, ny1_a, nv0_a);
+
+    // Average chroma from current and next row (in 10-bit domain)
+    uint u_avg_a = (u0_a + nu0_a + 1u) >> 1;
+    uint v_avg_a = (v0_a + nv0_a + 1u) >> 1;
+
     uint uv_word;
 
-    if (params.hdr_mode == 0u) {
-        // SDR mode: average UV from current and next row, then 10→8 bit
-        uint u_a = u0_a;
-        uint v_a = v0_a;
-
-        uint next_pair_a = global_pair_a + params.pairs_per_row;
-        uint nlo_a, nhi_a;
-        read_pair_global(next_pair_a, nlo_a, nhi_a);
-        uint nbs_a = bswap32(nlo_a);
-        uint u_next_a = (nbs_a >> 12) & 0x3FFu;
-        uint v_next_a = ((nbs_a & 0x3u) << 8) | nhi_a;
-
-        uint u_avg_a = (u_a + u_next_a + 1u) >> 1;
-        uint v_avg_a = (v_a + v_next_a + 1u) >> 1;
-        uint u8_a = u_avg_a >> 2;
-        uint v8_a = v_avg_a >> 2;
-
+    if (params.hdr_mode != 0u) {
+        // CSC mode: apply BT.2020->BT.709 2x2 chroma matrix
+        uint u8_a, v8_a;
+        csc_chroma(u_avg_a, v_avg_a, u8_a, v8_a);
         uv_word = (u8_a & 0xFFu) | ((v8_a & 0xFFu) << 8);
+    } else {
+        // SDR mode: simple 10->8 bit truncation
+        uv_word = ((u_avg_a >> 2) & 0xFFu) | (((v_avg_a >> 2) & 0xFFu) << 8);
+    }
 
-        if (local_pair_b < tile_pairs) {
-            uint lo_b2, hi_b2;
-            extract_pair_from_tile_offset(local_pair_b, tile_byte_offset, lo_b2, hi_b2);
-            uint bs_b2 = bswap32(lo_b2);
-            uint u_b = (bs_b2 >> 12) & 0x3FFu;
-            uint v_b = ((bs_b2 & 0x3u) << 8) | hi_b2;
+    if (local_pair_b < tile_pairs) {
+        // Re-extract pair B from tile for chroma (we need u0_b, v0_b)
+        uint lo_b2, hi_b2;
+        extract_pair(local_pair_b, tile_byte_offset, lo_b2, hi_b2);
+        uint y0_b2, u0_b2, y1_b2, v0_b2;
+        decode_pair(lo_b2, hi_b2, y0_b2, u0_b2, y1_b2, v0_b2);
 
-            uint next_pair_b = global_pair_a + 1u + params.pairs_per_row;
-            uint nlo_b, nhi_b;
-            read_pair_global(next_pair_b, nlo_b, nhi_b);
-            uint nbs_b = bswap32(nlo_b);
-            uint u_next_b = (nbs_b >> 12) & 0x3FFu;
-            uint v_next_b = ((nbs_b & 0x3u) << 8) | nhi_b;
+        // Next-row pair B
+        uint next_pair_b = global_pair_a + 1u + params.pairs_per_row;
+        uint nlo_b, nhi_b;
+        read_pair_global(next_pair_b, nlo_b, nhi_b);
+        uint ny0_b, nu0_b, ny1_b, nv0_b;
+        decode_pair(nlo_b, nhi_b, ny0_b, nu0_b, ny1_b, nv0_b);
 
-            uint u_avg_b = (u_b + u_next_b + 1u) >> 1;
-            uint v_avg_b = (v_b + v_next_b + 1u) >> 1;
+        uint u_avg_b = (u0_b2 + nu0_b + 1u) >> 1;
+        uint v_avg_b = (v0_b2 + nv0_b + 1u) >> 1;
+
+        if (params.hdr_mode != 0u) {
+            uint u8_b, v8_b;
+            csc_chroma(u_avg_b, v_avg_b, u8_b, v8_b);
+            uv_word |= ((u8_b & 0xFFu) << 16) | ((v8_b & 0xFFu) << 24);
+        } else {
             uv_word |= (((u_avg_b >> 2) & 0xFFu) << 16) |
                         (((v_avg_b >> 2) & 0xFFu) << 24);
-        }
-    } else {
-        // HDR mode: convert both rows to 8-bit BT.709, then average UV
-        uint y0_a8_cur, y1_a8_cur, u_a8_cur, v_a8_cur;
-        bt2020_to_bt709_pixel_pair(y0_a, y1_a, u0_a, v0_a,
-                              y0_a8_cur, y1_a8_cur, u_a8_cur, v_a8_cur);
-
-        uint next_pair_a = global_pair_a + params.pairs_per_row;
-        uint nlo_a, nhi_a;
-        read_pair_global(next_pair_a, nlo_a, nhi_a);
-        uint nbs_a = bswap32(nlo_a);
-        uint ny0_a = (nbs_a >> 22) & 0x3FFu;
-        uint nu0_a = (nbs_a >> 12) & 0x3FFu;
-        uint ny1_a = (nbs_a >> 2) & 0x3FFu;
-        uint nv0_a = ((nbs_a & 0x3u) << 8) | nhi_a;
-
-        uint ny0_a8, ny1_a8, nu_a8_next, nv_a8_next;
-        bt2020_to_bt709_pixel_pair(ny0_a, ny1_a, nu0_a, nv0_a,
-                              ny0_a8, ny1_a8, nu_a8_next, nv_a8_next);
-
-        uint u8_a = (u_a8_cur + nu_a8_next + 1u) >> 1;
-        uint v8_a = (v_a8_cur + nv_a8_next + 1u) >> 1;
-        uv_word = (u8_a & 0xFFu) | ((v8_a & 0xFFu) << 8);
-
-        if (local_pair_b < tile_pairs) {
-            uint lo_b2, hi_b2;
-            extract_pair_from_tile_offset(local_pair_b, tile_byte_offset, lo_b2, hi_b2);
-            uint bs_b2 = bswap32(lo_b2);
-            uint u0_b = (bs_b2 >> 12) & 0x3FFu;
-            uint y0_b = (bs_b2 >> 22) & 0x3FFu;
-            uint v0_b = ((bs_b2 & 0x3u) << 8) | hi_b2;
-            uint y1_b = (bs_b2 >> 2) & 0x3FFu;
-
-            uint y0_b8_cur, y1_b8_cur, u_b8_cur, v_b8_cur;
-            bt2020_to_bt709_pixel_pair(y0_b, y1_b, u0_b, v0_b,
-                                  y0_b8_cur, y1_b8_cur, u_b8_cur, v_b8_cur);
-
-            uint next_pair_b = global_pair_a + 1u + params.pairs_per_row;
-            uint nlo_b, nhi_b;
-            read_pair_global(next_pair_b, nlo_b, nhi_b);
-            uint nbs_b = bswap32(nlo_b);
-            uint nu0_b = (nbs_b >> 12) & 0x3FFu;
-            uint ny0_b = (nbs_b >> 22) & 0x3FFu;
-            uint nv0_b = ((nbs_b & 0x3u) << 8) | nhi_b;
-            uint ny1_b = (nbs_b >> 2) & 0x3FFu;
-
-            uint ny0_b8, ny1_b8, nu_b8_next, nv_b8_next;
-            bt2020_to_bt709_pixel_pair(ny0_b, ny1_b, nu0_b, nv0_b,
-                                  ny0_b8, ny1_b8, nu_b8_next, nv_b8_next);
-
-            uint u8_b = (u_b8_cur + nu_b8_next + 1u) >> 1;
-            uint v8_b = (v_b8_cur + nv_b8_next + 1u) >> 1;
-            uv_word |= ((u8_b & 0xFFu) << 16) | ((v8_b & 0xFFu) << 24);
         }
     }
 

@@ -245,17 +245,21 @@ int vfmcap_convert_wait(vfmcap_ctx_t *ctx);
 /* ---------- HDR mode control ---------- */
 
 /**
- * vfmcap_set_hdr_mode - Enable/disable HDR-to-SDR conversion for NV12 output
+ * vfmcap_set_hdr_mode - Enable/disable BT.2020 -> BT.709 color space conversion
  * @ctx: Context
  * @hdr_mode: 0 = SDR passthrough (10-bit truncation to 8-bit),
- *            1 = HDR BT.2020 PQ -> SDR BT.709 (PQ EOTF, Hable tone mapping,
- *                BT.2020->BT.709 matrix, BT.709 OETF)
+ *            1 = BT.2020 -> BT.709 YCbCr-domain matrix CSC (default)
  *
  * Only affects NV12 conversion (vfmcap_convert_nv12 and vfmcap_convert_submit
  * with VFMCAP_FMT_NV12). P010 always passes through as-is (HDR preserved).
  *
- * Call before vfmcap_start() or at any time during streaming. Takes effect
- * on the next conversion call.
+ * The conversion uses an industry-standard 3x3 YCbCr-domain matrix that
+ * folds quantization into the coefficients for maximum GPU throughput.
+ * Luma (Y) is unchanged by gamut mapping — only chroma (Cb/Cr) is converted
+ * via a 2x2 matrix multiply.
+ *
+ * Default is ON (hdr_mode=1). Call with 0 to disable for SDR content.
+ * Takes effect on the next conversion call.
  */
 void vfmcap_set_hdr_mode(vfmcap_ctx_t *ctx, int hdr_mode);
 

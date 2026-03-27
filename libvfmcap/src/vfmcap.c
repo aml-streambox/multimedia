@@ -71,7 +71,9 @@ struct vfmcap_ctx {
     uint32_t             sizeimage;
     uint32_t             bitdepth;
 
-    /* HDR mode for NV12 output: 0=SDR passthrough, 1=HDR BT.2020 PQ -> SDR BT.709 */
+    /* Color space conversion for NV12 output:
+     * 0 = SDR passthrough (10-bit truncation to 8-bit)
+     * 1 = BT.2020 -> BT.709 matrix CSC (default) */
     uint32_t             hdr_mode;
 
     /* V4L2 MMAP buffers (flow-control tokens only) */
@@ -135,6 +137,7 @@ vfmcap_ctx_t *vfmcap_open(const char *device)
 
     ctx->fd = fd;
     strncpy(ctx->device, dev, sizeof(ctx->device) - 1);
+    ctx->hdr_mode = 1;  /* Default: BT.2020 -> BT.709 CSC enabled */
 
     /* Read current format */
     struct v4l2_format fmt;
@@ -591,7 +594,7 @@ void vfmcap_set_hdr_mode(vfmcap_ctx_t *ctx, int hdr_mode)
     ctx->hdr_mode = (hdr_mode != 0) ? 1 : 0;
     fprintf(stderr, "[vfmcap] HDR mode set to %u (%s)\n",
             ctx->hdr_mode,
-            ctx->hdr_mode ? "HDR BT.2020 PQ -> SDR BT.709" : "SDR passthrough");
+            ctx->hdr_mode ? "BT.2020 -> BT.709 CSC" : "SDR passthrough");
 }
 
 int vfmcap_get_hdr_mode(vfmcap_ctx_t *ctx)

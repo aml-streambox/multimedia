@@ -1,0 +1,266 @@
+#version 450
+
+// AMLY (40-bit packed YUV422 10-bit) to P010 (semi-planar 10-bit) conversion
+//
+// Hardware writes with WORDS_SWAP=1 + WR_ENDIAN=0 (big endian).
+// Correction: bswap64 each 64-bit word during tile load into shared memory.
+// After correction, data is in native little-endian byte order — same as
+// what the original amlvenc shader expects with no_swap_en=1.
+//
+// Workgroup: 128 threads x 1 row.
+// Each thread processes 1 pixel pair (2 pixels).
+// Tile = 128 pairs = 640 bytes = 160 uint32 words (+2 guard).
+//
+// Component order in 40-bit after bswap64 correction:
+// The corrected bytes are in big-endian order within each 40-bit group.
+// When loaded as LE uint32 (lo) + 1 byte (hi), extract via bswap32(lo):
+//   uint bs = bswap32(lo);
+//   y0 = (bs >> 22) & 0x3FF
+//   u0 = (bs >> 12) & 0x3FF
+//   y1 = (bs >> 2)  & 0x3FF
+//   v0 = ((bs & 0x3) << 8) | hi
+//
+// P010 output: 10-bit value left-justified in 16 bits (val << 6).
+// Two Y values packed per uint32. UV plane: half height, U and V interleaved.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer InputBuffer {
+    uint data[];
+} input_buffer;
+
+layout(set = 0, binding = 1, std430) writeonly buffer YOutputBuffer {
+    uint data[];
+} y_output;
+
+layout(set = 0, binding = 2, std430) writeonly buffer UVOutputBuffer {
+    uint data[];
+} uv_output;
+
+layout(push_constant) uniform Params {
+    uint width;
+    uint height;
+    uint pairs_per_row;
+    uint hdr_mode;     // unused for P010, reserved for API compatibility
+} params;
+
+// Tile: 128 pairs * 5 bytes = 640 bytes, + up to 3 bytes alignment + 8 bytes guard = 651
+// Worst case: (651 + 3) / 4 = 163.5 → 164 words
+#define TILE_PAIRS 128u
+#define TILE_BYTES (TILE_PAIRS * 5u)
+#define TILE_WORDS ((TILE_BYTES + 3u + 8u) / 4u + 1u)  // 164
+
+shared uint tile[TILE_WORDS];
+
+// Byte-swap a 32-bit word
+uint bswap32(uint val) {
+    return ((val & 0x000000FFu) << 24) |
+           ((val & 0x0000FF00u) <<  8) |
+           ((val & 0x00FF0000u) >>  8) |
+           ((val & 0xFF000000u) >> 24);
+}
+
+// Load input words into shared memory with bswap64 correction.
+// Process pairs of uint32 words: swap word order and byte-reverse each.
+// Input memory: w0=[B3,B2,B1,B0], w1=[B7,B6,B5,B4]  (LE uint32 storage)
+// After bswap64: tile[i]=[B4,B5,B6,B7]=bswap32(w1), tile[i+1]=[B0,B1,B2,B3]=bswap32(w0)
+void load_tile(uint base_word_idx, uint n_words) {
+    uint lid = gl_LocalInvocationID.x;
+
+    // Each thread loads up to 2 words (64 bits) at a time.
+    // 128 threads * 2 words = 256 words per pass > 162 needed.
+    for (uint i = lid * 2u; i < n_words; i += 128u * 2u) {
+        if (i + 1u < n_words) {
+            uint w0 = input_buffer.data[base_word_idx + i];
+            uint w1 = input_buffer.data[base_word_idx + i + 1u];
+            // bswap64: swap words and byte-reverse each
+            tile[i]      = bswap32(w1);
+            tile[i + 1u] = bswap32(w0);
+        } else if (i < n_words) {
+            // Odd trailing word — can't do full bswap64 pair.
+            // This only happens at the very end of a tile and the data
+            // in this word won't be used (it's past the tile boundary).
+            tile[i] = 0u;
+        }
+    }
+    barrier();
+}
+
+// Extract 40 contiguous bits from tile[] starting at local pair index.
+// Returns {lo, hi} where lo has bits 0..31 and hi has bit 32..39.
+void extract_pair_from_tile(uint local_pair, out uint lo, out uint hi) {
+    uint byte_off = local_pair * 5u;
+    uint widx = byte_off >> 2;
+    uint shift = (byte_off & 3u) << 3;  // 0, 8, 16, or 24
+
+    uint w0 = tile[widx];
+    uint w1 = tile[widx + 1u];
+
+    if (shift == 0u) {
+        lo = w0;
+        hi = w1 & 0xFFu;
+    } else {
+        uint w2 = tile[widx + 2u];
+        lo = (w0 >> shift) | (w1 << (32u - shift));
+        hi = ((w1 >> shift) | (w2 << (32u - shift))) & 0xFFu;
+    }
+}
+
+// Same as above, but with an additional byte offset for tile alignment.
+// When tile_byte_start is not word-aligned, the first pair starts at
+// byte_offset within the first tile word.
+void extract_pair_from_tile_offset(uint local_pair, uint byte_offset_base,
+                                   out uint lo, out uint hi) {
+    uint byte_off = byte_offset_base + local_pair * 5u;
+    uint widx = byte_off >> 2;
+    uint shift = (byte_off & 3u) << 3;
+
+    uint w0 = tile[widx];
+    uint w1 = tile[widx + 1u];
+
+    if (shift == 0u) {
+        lo = w0;
+        hi = w1 & 0xFFu;
+    } else {
+        uint w2 = tile[widx + 2u];
+        lo = (w0 >> shift) | (w1 << (32u - shift));
+        hi = ((w1 >> shift) | (w2 << (32u - shift))) & 0xFFu;
+    }
+}
+
+// Read a corrected 40-bit pair from global memory (for next-row UV reads).
+// Uses inline bswap64: find the 64-bit block containing each needed word,
+// load the pair, swap+bswap32.
+void read_pair_global(uint pair_idx, out uint lo, out uint hi) {
+    uint byte_offset = pair_idx * 5u;
+    uint word_idx = byte_offset >> 2;
+    uint shift = (byte_offset & 3u) << 3;
+
+    // We need corrected words at positions word_idx, word_idx+1, and
+    // possibly word_idx+2. For each, find its 64-bit aligned pair and apply bswap64.
+
+    // Corrected word at position p:
+    //   block_base = p & ~1u  (align to 64-bit = 2 words)
+    //   raw0 = input[block_base], raw1 = input[block_base + 1]
+    //   corrected[block_base]   = bswap32(raw1)
+    //   corrected[block_base+1] = bswap32(raw0)
+    //   if (p & 1) == 0 -> return bswap32(raw1)
+    //   if (p & 1) == 1 -> return bswap32(raw0)
+
+    // Helper: load corrected word at global index p
+    // Inline 3 calls to avoid function overhead.
+
+    uint p0 = word_idx;
+    uint base0 = p0 & ~1u;
+    uint raw0_a = input_buffer.data[base0];
+    uint raw0_b = input_buffer.data[base0 + 1u];
+    uint cw0 = ((p0 & 1u) == 0u) ? bswap32(raw0_b) : bswap32(raw0_a);
+
+    uint p1 = word_idx + 1u;
+    uint base1 = p1 & ~1u;
+    uint cw1;
+    if (base1 == base0) {
+        // Same 64-bit block as cw0
+        cw1 = ((p1 & 1u) == 0u) ? bswap32(raw0_b) : bswap32(raw0_a);
+    } else {
+        uint raw1_a = input_buffer.data[base1];
+        uint raw1_b = input_buffer.data[base1 + 1u];
+        cw1 = ((p1 & 1u) == 0u) ? bswap32(raw1_b) : bswap32(raw1_a);
+    }
+
+    if (shift == 0u) {
+        lo = cw0;
+        hi = cw1 & 0xFFu;
+    } else {
+        uint p2 = word_idx + 2u;
+        uint base2 = p2 & ~1u;
+        uint cw2;
+        if (base2 == base1) {
+            // Same block as cw1 — reuse loaded data
+            // But we need the other word from that block
+            if (base1 != base0) {
+                uint raw1_a = input_buffer.data[base1];
+                uint raw1_b = input_buffer.data[base1 + 1u];
+                cw2 = ((p2 & 1u) == 0u) ? bswap32(raw1_b) : bswap32(raw1_a);
+            } else {
+                cw2 = ((p2 & 1u) == 0u) ? bswap32(raw0_b) : bswap32(raw0_a);
+            }
+        } else {
+            uint raw2_a = input_buffer.data[base2];
+            uint raw2_b = input_buffer.data[base2 + 1u];
+            cw2 = ((p2 & 1u) == 0u) ? bswap32(raw2_b) : bswap32(raw2_a);
+        }
+        lo = (cw0 >> shift) | (cw1 << (32u - shift));
+        hi = ((cw1 >> shift) | (cw2 << (32u - shift))) & 0xFFu;
+    }
+}
+
+void main() {
+    uint row = gl_WorkGroupID.y;
+    uint lid = gl_LocalInvocationID.x;
+
+    if (row >= params.height) return;
+
+    // Tile boundaries for this workgroup
+    uint tile_start = gl_WorkGroupID.x * TILE_PAIRS;  // first pair index in row
+    uint tile_pairs = min(TILE_PAIRS, params.pairs_per_row - tile_start);
+
+    // Compute byte range and word range for tile load.
+    // The tile_byte_start may not be word-aligned, so we round down to
+    // the nearest word boundary and track the byte offset within the first word.
+    uint row_byte_start = row * params.pairs_per_row * 5u;
+    uint tile_byte_start = row_byte_start + tile_start * 5u;
+    uint base_word_idx = tile_byte_start >> 2;
+    uint tile_byte_offset = tile_byte_start & 3u;  // 0-3 byte offset into first word
+
+    uint tile_bytes_needed = tile_byte_offset + tile_pairs * 5u;
+    uint n_words = (tile_bytes_needed + 3u) / 4u + 2u;
+    if (n_words > TILE_WORDS) n_words = TILE_WORDS;
+
+    // Cooperative tile load with bswap64 correction
+    load_tile(base_word_idx, n_words);
+
+    // Bounds check after barrier
+    uint global_pair = tile_start + lid;
+    if (lid >= tile_pairs) return;
+
+    // Extract 40-bit pair from tile, accounting for byte alignment offset
+    uint lo, hi;
+    extract_pair_from_tile_offset(lid, tile_byte_offset, lo, hi);
+
+    // Component extraction: bswap32(lo) to get BE 40-bit layout, then extract
+    uint bs = bswap32(lo);
+    uint y0 = (bs >> 22) & 0x3FFu;
+    uint u0 = (bs >> 12) & 0x3FFu;
+    uint y1 = (bs >> 2) & 0x3FFu;
+    uint v0 = ((bs & 0x3u) << 8) | hi;
+
+    // P010: left-justify 10-bit in 16-bit
+    uint y0_p010 = y0 << 6;
+    uint y1_p010 = y1 << 6;
+
+    // Pack two Y values into one uint32
+    uint pair_idx = row * params.pairs_per_row + global_pair;
+    y_output.data[pair_idx] = y0_p010 | (y1_p010 << 16);
+
+    // UV plane: only even rows, vertical 2-tap average with next row
+    if ((row & 1u) == 0u && (row + 1u) < params.height) {
+        // Read corresponding pair from next row (global memory, bswap64 corrected)
+        uint next_pair_idx = pair_idx + params.pairs_per_row;
+        uint nlo, nhi;
+        read_pair_global(next_pair_idx, nlo, nhi);
+
+        uint nbs = bswap32(nlo);
+        uint nu0 = (nbs >> 12) & 0x3FFu;
+        uint nv0 = ((nbs & 0x3u) << 8) | nhi;
+
+        // Average with rounding
+        uint u_avg = (u0 + nu0 + 1u) >> 1;
+        uint v_avg = (v0 + nv0 + 1u) >> 1;
+
+        // P010 UV: left-justify 10-bit in 16-bit, U then V packed
+        uint uv_row = row >> 1;
+        uint uv_idx = uv_row * params.pairs_per_row + global_pair;
+        uv_output.data[uv_idx] = (u_avg << 6) | ((v_avg << 6) << 16);
+    }
+}

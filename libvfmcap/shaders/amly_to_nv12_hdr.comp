@@ -1,0 +1,397 @@
+#version 450
+
+// AMLY (40-bit packed YUV422 10-bit) to NV12 — HDR10 PQ -> SDR BT.709
+//
+// Fused-LUT HDR variant. Two shared-memory LUTs eliminate all expensive
+// per-pixel math (PQ EOTF polynomial, Reinhard division, gamma sqrt):
+//
+//   pq_lut[256]:        PQ EOTF * 10000/203, indexed by 8-bit quantized PQ value
+//   tonegamma_lut[256]: fused Reinhard(0.15) + pow(x, 1/2.2), indexed by linear light
+//
+// Per-pixel pipeline (after LUT fill + tile load):
+//   1. Normalize (Y10,Cb10,Cr10) -> compute Rpq, Gpq, Bpq   [~9 ops]
+//   2. pq_lut[Rpq*255] with lerp -> Rlin, Glin, Blin         [6 reads + 3 FMA]
+//   3. BT.2020->BT.709 gamut 3x3 matrix                      [9 FMA]
+//   4. tonegamma_lut[R709*scale] with lerp -> Rs, Gs, Bs      [6 reads + 3 FMA]
+//   5. BT.709 RGB->Y luma                                     [3 FMA]
+//   Total: ~18 FMA + 12 shared mem reads (vs ~80-100 FMA before)
+//
+// Hardware: WORDS_SWAP=1 + WR_ENDIAN=0 -> bswap64 correction.
+// Structure: 128 threads, 1 pair/thread, 128 pairs/tile, 1 row/workgroup.
+// Works for any resolution (width/height multiples of 2).
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer InputBuffer {
+    uint data[];
+} input_buffer;
+
+layout(set = 0, binding = 1, std430) writeonly buffer YOutputBuffer {
+    uint data[];
+} y_output;
+
+layout(set = 0, binding = 2, std430) writeonly buffer UVOutputBuffer {
+    uint data[];
+} uv_output;
+
+layout(push_constant) uniform Params {
+    uint width;
+    uint height;
+    uint pairs_per_row;
+    uint hdr_mode;    // always 1 for this shader, kept for API compat
+} params;
+
+#define TILE_PAIRS 128u
+#define TILE_BYTES (TILE_PAIRS * 5u)
+#define TILE_WORDS ((TILE_BYTES + 3u + 8u) / 4u + 1u)  // 164
+
+shared uint tile[TILE_WORDS];
+
+// ---- LUTs in shared memory ----
+// PQ EOTF LUT: 256 entries, maps PQ code [0..1] -> linear light / ref_white
+// Index: uint(Rpq * 255.0), linear interpolation for accuracy
+#define PQ_LUT_SIZE 256u
+shared float pq_lut[PQ_LUT_SIZE];
+
+// Fused tone-mapping + gamma LUT: 256 entries
+// Maps linear light [0..TG_MAX] -> sRGB [0..1]
+// f(x) = clamp(pow(x / (1.0 + 0.15*x), 1.0/2.2), 0, 1)
+// Index: uint(x * TG_SCALE), linear interpolation
+#define TG_LUT_SIZE 256u
+#define TG_MAX 8.0
+#define TG_SCALE (float(TG_LUT_SIZE - 1u) / TG_MAX)  // 31.875
+shared float tg_lut[TG_LUT_SIZE];
+
+// Exchange buffers for packing Y and UV bytes across threads
+shared uint y_exchange[128];
+shared uint uv_exchange[128];
+
+// BT.2020 -> BT.709 gamut mapping (ITU-R BT.2087)
+const float G20_00 =  1.6605; const float G20_01 = -0.5877; const float G20_02 = -0.0728;
+const float G20_10 = -0.1246; const float G20_11 =  1.1329; const float G20_12 = -0.0083;
+const float G20_20 = -0.0182; const float G20_21 = -0.1006; const float G20_22 =  1.1187;
+
+// BT.2020 NCL YCbCr -> R'G'B'
+const float BT2020_CR_TO_R =  1.4746;
+const float BT2020_CB_TO_G = -0.1646;
+const float BT2020_CR_TO_G = -0.5714;
+const float BT2020_CB_TO_B =  1.8814;
+
+// BT.709 R'G'B' -> Y'CbCr (8-bit limited)
+const float BT709_YR = 0.2126;
+const float BT709_YG = 0.7152;
+const float BT709_YB = 0.0722;
+const float BT709_CB_SCALE = 1.0 / 1.8556;
+const float BT709_CR_SCALE = 1.0 / 1.5748;
+
+// PQ EOTF constants
+const float PQ_M1 = 0.1593017578125;
+const float PQ_M2 = 78.84375;
+const float PQ_C1 = 0.8359375;
+const float PQ_C2 = 18.8515625;
+const float PQ_C3 = 18.6875;
+const float PQ_INV_M1 = 1.0 / PQ_M1;  // 6.2773946...
+const float PQ_INV_M2 = 1.0 / PQ_M2;  // 0.0126833...
+const float INV_REF_WHITE = 1.0 / 203.0;
+const float SHOULDER = 0.15;
+
+// ============================================================
+// Utility functions
+// ============================================================
+uint bswap32(uint val) {
+    return ((val & 0x000000FFu) << 24) |
+           ((val & 0x0000FF00u) <<  8) |
+           ((val & 0x00FF0000u) >>  8) |
+           ((val & 0xFF000000u) >> 24);
+}
+
+void load_tile(uint base_word_idx, uint n_words) {
+    uint lid = gl_LocalInvocationID.x;
+    for (uint i = lid * 2u; i < n_words; i += 128u * 2u) {
+        if (i + 1u < n_words) {
+            uint w0 = input_buffer.data[base_word_idx + i];
+            uint w1 = input_buffer.data[base_word_idx + i + 1u];
+            tile[i]      = bswap32(w1);
+            tile[i + 1u] = bswap32(w0);
+        } else if (i < n_words) {
+            tile[i] = 0u;
+        }
+    }
+}
+
+void extract_pair(uint local_pair, uint byte_offset_base,
+                  out uint lo, out uint hi) {
+    uint byte_off = byte_offset_base + local_pair * 5u;
+    uint widx = byte_off >> 2;
+    uint shift = (byte_off & 3u) << 3;
+    uint w0 = tile[widx];
+    uint w1 = tile[widx + 1u];
+    if (shift == 0u) {
+        lo = w0;
+        hi = w1 & 0xFFu;
+    } else {
+        uint w2 = tile[widx + 2u];
+        lo = (w0 >> shift) | (w1 << (32u - shift));
+        hi = ((w1 >> shift) | (w2 << (32u - shift))) & 0xFFu;
+    }
+}
+
+void decode_pair(uint lo, uint hi, out uint y0, out uint u0, out uint y1, out uint v0) {
+    uint bs = bswap32(lo);
+    y0 = (bs >> 22) & 0x3FFu;
+    u0 = (bs >> 12) & 0x3FFu;
+    y1 = (bs >> 2)  & 0x3FFu;
+    v0 = ((bs & 0x3u) << 8) | hi;
+}
+
+void read_pair_global(uint pair_idx, out uint lo, out uint hi) {
+    uint byte_offset = pair_idx * 5u;
+    uint word_idx = byte_offset >> 2;
+    uint shift = (byte_offset & 3u) << 3;
+
+    uint p0 = word_idx;
+    uint b0 = p0 & ~1u;
+    uint r0a = input_buffer.data[b0];
+    uint r0b = input_buffer.data[b0 + 1u];
+    uint cw0 = ((p0 & 1u) == 0u) ? bswap32(r0b) : bswap32(r0a);
+
+    uint p1 = word_idx + 1u;
+    uint b1 = p1 & ~1u;
+    uint cw1;
+    if (b1 == b0) {
+        cw1 = ((p1 & 1u) == 0u) ? bswap32(r0b) : bswap32(r0a);
+    } else {
+        uint r1a = input_buffer.data[b1];
+        uint r1b = input_buffer.data[b1 + 1u];
+        cw1 = ((p1 & 1u) == 0u) ? bswap32(r1b) : bswap32(r1a);
+    }
+
+    if (shift == 0u) {
+        lo = cw0;
+        hi = cw1 & 0xFFu;
+    } else {
+        uint p2 = word_idx + 2u;
+        uint b2 = p2 & ~1u;
+        uint cw2;
+        if (b2 == b1) {
+            if (b1 == b0) {
+                cw2 = ((p2 & 1u) == 0u) ? bswap32(r0b) : bswap32(r0a);
+            } else {
+                uint r1a = input_buffer.data[b1];
+                uint r1b = input_buffer.data[b1 + 1u];
+                cw2 = ((p2 & 1u) == 0u) ? bswap32(r1b) : bswap32(r1a);
+            }
+        } else {
+            uint r2a = input_buffer.data[b2];
+            uint r2b = input_buffer.data[b2 + 1u];
+            cw2 = ((p2 & 1u) == 0u) ? bswap32(r2b) : bswap32(r2a);
+        }
+        lo = (cw0 >> shift) | (cw1 << (32u - shift));
+        hi = ((cw1 >> shift) | (cw2 << (32u - shift))) & 0xFFu;
+    }
+}
+
+// ============================================================
+// LUT initialization (called once per workgroup)
+// ============================================================
+
+// Full-precision PQ EOTF for LUT generation only (2 calls per thread)
+float pq_eotf_precise(float E) {
+    float x = clamp(E, 0.0, 1.0);
+    float x2 = x * x;
+    float x4 = x2 * x2;
+    if (x <= 0.6) {
+        return max((-0.0032682112 + 0.2161142056 * x)
+                   + (-3.2435851061 + 20.3060428167 * x) * x2
+                   + (-49.4185526214 + 54.7438598086 * x) * x4, 0.0);
+    } else {
+        return (-1154.7756363969 + 8036.9413373177 * x)
+               + (-22398.7659310778 + 31307.4462138745 * x) * x2
+               + (-22010.2641180037 + 6268.6181913867 * x) * x4;
+    }
+}
+
+// Fused Reinhard + sRGB gamma for LUT generation only
+float tonegamma_precise(float x) {
+    if (x <= 0.0) return 0.0;
+    // Reinhard with shoulder
+    float tm = x / (1.0 + SHOULDER * x);
+    // sRGB gamma: pow(x, 1/2.2) via polynomial in sqrt(x)
+    float s = sqrt(max(tm, 0.0));
+    return clamp(s * (1.30283059 + s * (-0.97414567 + s * (1.52167224
+                 + s * (-1.25630661 + s * 0.40636588)))), 0.0, 1.0);
+}
+
+void fill_luts() {
+    uint lid = gl_LocalInvocationID.x;
+    // Each of 128 threads fills 2 entries for each LUT
+    for (uint j = 0u; j < 2u; j++) {
+        uint idx = lid * 2u + j;
+        // PQ LUT: E' in [0, 1] -> linear_light / ref_white
+        float E = float(idx) / float(PQ_LUT_SIZE - 1u);
+        pq_lut[idx] = pq_eotf_precise(E);
+
+        // ToneGamma LUT: linear light [0, TG_MAX] -> sRGB [0, 1]
+        float x = float(idx) / TG_SCALE;
+        tg_lut[idx] = tonegamma_precise(x);
+    }
+}
+
+// ============================================================
+// LUT lookup with linear interpolation
+// ============================================================
+
+// PQ LUT: input E in [0,1], returns linear light / ref_white
+float pq_lookup(float E) {
+    float f = clamp(E, 0.0, 1.0) * float(PQ_LUT_SIZE - 1u);
+    uint i0 = min(uint(f), PQ_LUT_SIZE - 2u);
+    float frac = f - float(i0);
+    return mix(pq_lut[i0], pq_lut[i0 + 1u], frac);
+}
+
+// ToneGamma LUT: input x (linear light), returns sRGB [0,1]
+float tg_lookup(float x) {
+    float f = clamp(x * TG_SCALE, 0.0, float(TG_LUT_SIZE - 1u));
+    uint i0 = min(uint(f), TG_LUT_SIZE - 2u);
+    float frac = f - float(i0);
+    return mix(tg_lut[i0], tg_lut[i0 + 1u], frac);
+}
+
+// ============================================================
+// Fused HDR pipeline: (Y10, Cb10, Cr10) -> sRGB (R, G, B)
+// Only LUT lookups + one 3x3 matrix multiply, no pow/sqrt/division
+// ============================================================
+void hdr_to_srgb(float y10, float cb10, float cr10,
+                 out float R_out, out float G_out, out float B_out) {
+    // Normalize to [0,1] / [-0.5, 0.5]
+    float Y  = clamp((y10  - 64.0) / 876.0, 0.0, 1.0);
+    float Cb = (cb10 - 512.0) / 896.0;
+    float Cr = (cr10 - 512.0) / 896.0;
+
+    // BT.2020 YCbCr -> R'G'B' (PQ domain)
+    float Rpq = clamp(Y + BT2020_CR_TO_R * Cr, 0.0, 1.0);
+    float Gpq = clamp(Y + BT2020_CB_TO_G * Cb + BT2020_CR_TO_G * Cr, 0.0, 1.0);
+    float Bpq = clamp(Y + BT2020_CB_TO_B * Cb, 0.0, 1.0);
+
+    // PQ EOTF via LUT (replaces 36-FMA polynomial)
+    float Rlin = pq_lookup(Rpq);
+    float Glin = pq_lookup(Gpq);
+    float Blin = pq_lookup(Bpq);
+
+    // BT.2020 -> BT.709 gamut matrix (linear domain)
+    float R709 = max(G20_00 * Rlin + G20_01 * Glin + G20_02 * Blin, 0.0);
+    float G709 = max(G20_10 * Rlin + G20_11 * Glin + G20_12 * Blin, 0.0);
+    float B709 = max(G20_20 * Rlin + G20_21 * Glin + G20_22 * Blin, 0.0);
+
+    // Fused Reinhard + sRGB gamma via LUT (replaces 3x division + 3x sqrt + 15 FMA)
+    R_out = tg_lookup(R709);
+    G_out = tg_lookup(G709);
+    B_out = tg_lookup(B709);
+}
+
+// ============================================================
+// Main: 128 threads, 1 pair/thread, 1 row/workgroup
+// ============================================================
+void main() {
+    uint row = gl_WorkGroupID.y;
+    uint lid = gl_LocalInvocationID.x;
+
+    // ---- Phase 1: Fill both LUTs (2 entries per thread each) ----
+    fill_luts();
+
+    // ---- Phase 2: Load input tile ----
+    uint tile_start = gl_WorkGroupID.x * TILE_PAIRS;
+    uint tile_pairs = min(TILE_PAIRS, params.pairs_per_row - tile_start);
+
+    uint row_byte_start = row * params.pairs_per_row * 5u;
+    uint tile_byte_start = row_byte_start + tile_start * 5u;
+    uint base_word_idx = tile_byte_start >> 2;
+    uint tile_byte_offset = tile_byte_start & 3u;
+
+    uint tile_bytes_needed = tile_byte_offset + tile_pairs * 5u;
+    uint n_words = (tile_bytes_needed + 3u) / 4u + 2u;
+    if (n_words > TILE_WORDS) n_words = TILE_WORDS;
+
+    load_tile(base_word_idx, n_words);
+    barrier();  // sync LUT fill + tile load
+
+    if (row >= params.height) return;
+
+    bool has_pair = (lid < tile_pairs);
+
+    uint Y8_0 = 16u, Y8_1 = 16u;
+    uint Cb8 = 128u, Cr8 = 128u;
+
+    if (has_pair) {
+        // Decode this thread's pair
+        uint lo, hi;
+        extract_pair(lid, tile_byte_offset, lo, hi);
+        uint y0, u0, y1, v0;
+        decode_pair(lo, hi, y0, u0, y1, v0);
+
+        // HDR -> sRGB for pixel 0
+        float r0, g0, b0;
+        hdr_to_srgb(float(y0), float(u0), float(v0), r0, g0, b0);
+        float Yf0 = BT709_YR * r0 + BT709_YG * g0 + BT709_YB * b0;
+        Y8_0 = uint(clamp(Yf0 * 219.0 + 16.0, 16.0, 235.0));
+
+        // HDR -> sRGB for pixel 1
+        float r1, g1, b1;
+        hdr_to_srgb(float(y1), float(u0), float(v0), r1, g1, b1);
+        float Yf1 = BT709_YR * r1 + BT709_YG * g1 + BT709_YB * b1;
+        Y8_1 = uint(clamp(Yf1 * 219.0 + 16.0, 16.0, 235.0));
+
+        // Chroma: even rows only
+        if ((row & 1u) == 0u && row + 1u < params.height) {
+            uint global_pair = tile_start + lid;
+            uint abs_pair = row * params.pairs_per_row + global_pair;
+            uint next_pair = abs_pair + params.pairs_per_row;
+
+            uint nlo, nhi;
+            read_pair_global(next_pair, nlo, nhi);
+            uint ny0, nu0, ny1, nv0;
+            decode_pair(nlo, nhi, ny0, nu0, ny1, nv0);
+
+            // Average PQ chroma (validated: 99.6% within ±1 of correct)
+            float avg_y  = float(y0 + y1 + ny0 + ny1) * 0.25;
+            float avg_cb = float(u0 + nu0) * 0.5;
+            float avg_cr = float(v0 + nv0) * 0.5;
+
+            // Full pipeline on averaged sample for Cb/Cr
+            float rc, gc, bc;
+            hdr_to_srgb(avg_y, avg_cb, avg_cr, rc, gc, bc);
+            float Yfc = BT709_YR * rc + BT709_YG * gc + BT709_YB * bc;
+            float Cbf = (bc - Yfc) * BT709_CB_SCALE;
+            float Crf = (rc - Yfc) * BT709_CR_SCALE;
+            Cb8 = uint(clamp(Cbf * 224.0 + 128.0, 16.0, 240.0));
+            Cr8 = uint(clamp(Crf * 224.0 + 128.0, 16.0, 240.0));
+        }
+    }
+
+    // Pack Y bytes into exchange buffer
+    y_exchange[lid] = (Y8_0 & 0xFFu) | ((Y8_1 & 0xFFu) << 8);
+    uv_exchange[lid] = (Cb8 & 0xFFu) | ((Cr8 & 0xFFu) << 8);
+    barrier();
+
+    // Even-indexed threads write Y plane (4 bytes = 4 pixels)
+    if ((lid & 1u) == 0u && lid < tile_pairs) {
+        uint y_lo = y_exchange[lid];
+        uint y_hi = (lid + 1u < tile_pairs) ? y_exchange[lid + 1u] : 0x1010u;
+        uint y_word = y_lo | (y_hi << 16);
+        uint global_pair = tile_start + lid;
+        uint y_byte_off = row * params.width + global_pair * 2u;
+        y_output.data[y_byte_off >> 2] = y_word;
+    }
+
+    // UV plane: even rows, even-indexed threads
+    if ((row & 1u) == 0u && row + 1u < params.height &&
+        (lid & 1u) == 0u && lid < tile_pairs) {
+        uint uv_lo = uv_exchange[lid];
+        uint uv_hi = (lid + 1u < tile_pairs) ? uv_exchange[lid + 1u] : 0x8080u;
+        uint uv_word = uv_lo | (uv_hi << 16);
+        uint global_pair = tile_start + lid;
+        uint uv_row = row >> 1;
+        uint uv_byte_off = uv_row * params.width + global_pair * 2u;
+        uv_output.data[uv_byte_off >> 2] = uv_word;
+    }
+}

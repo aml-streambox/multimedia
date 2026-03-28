@@ -2,8 +2,9 @@
 # Compile GLSL compute shaders to SPIR-V and generate C headers.
 #
 # Produces:
-#   amly_to_p010_spv.h  (included by vfmcap_vulkan.c)
-#   amly_to_nv12_spv.h  (included by vfmcap_vulkan.c)
+#   amly_to_p010_spv.h      (included by vfmcap_vulkan.c)
+#   amly_to_nv12_spv.h      (NV12 SDR passthrough — included by vfmcap_vulkan.c)
+#   amly_to_nv12_hdr_spv.h  (NV12 HDR10 PQ->SDR — included by vfmcap_vulkan.c)
 #
 # Requires glslangValidator (from KhronosGroup/glslang) or glslc, plus xxd.
 #
@@ -17,7 +18,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-SHADERS=("amly_to_p010" "amly_to_nv12")
+SHADERS=("amly_to_p010" "amly_to_nv12" "amly_to_nv12_hdr")
 
 for shader in "${SHADERS[@]}"; do
     INPUT="${shader}.comp"

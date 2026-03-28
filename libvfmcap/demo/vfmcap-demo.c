@@ -633,6 +633,8 @@ int main(int argc, char *argv[])
     /* Enable BT.2020->BT.709 CSC (default ON, disabled by -S flag) */
     if (do_hdr) {
         vfmcap_set_hdr_mode(ctx, 1);
+    } else {
+        vfmcap_set_hdr_mode(ctx, 0);
     }
 
     /* Start streaming */

@@ -17,8 +17,8 @@
  *
  * Usage:
  *   vfmcap-demo [-d /dev/video_cap] [-n 100] [-c p010|nv12|both]
- *   vfmcap-demo -p -c nv12 -n 300       # profile NV12 with BT.2020->BT.709 CSC (default)
- *   vfmcap-demo -p -c nv12 -n 300 -S    # profile NV12, SDR passthrough (no CSC)
+ *   vfmcap-demo -p -c nv12 -n 300       # profile NV12 conversion
+ *   vfmcap-demo -p -c p010 -n 300       # profile P010 conversion
  *
  * Copyright (C) 2026 StreamBox
  * SPDX-License-Identifier: MIT
@@ -460,7 +460,8 @@ static int run_profiling(vfmcap_ctx_t *ctx, int num_frames, int do_p010,
             ((double)width * height * 5 / 2 * captured / total_s) / (1024.0 * 1024.0) : 0);
     fprintf(stderr, "  Throughput:       %.1f MB/s (output %s)\n",
             (captured > 0 && total_s > 0) ?
-            ((double)out_size * captured / total_s) / (1024.0 * 1024.0) : 0);
+            ((double)out_size * captured / total_s) / (1024.0 * 1024.0) : 0,
+            fmt_name);
     fprintf(stderr, "\n");
 
     /* Extract timing arrays for statistics */
@@ -557,12 +558,11 @@ int main(int argc, char *argv[])
     int num_frames = 100;
     int do_p010 = 0, do_nv12 = 0;
     int do_profile = 0;
-    int do_hdr = 1;  /* CSC default ON */
     int opt;
 
     const char *raw_path = NULL;
 
-    while ((opt = getopt(argc, argv, "d:n:c:o:r:pSh")) != -1) {
+    while ((opt = getopt(argc, argv, "d:n:c:o:r:ph")) != -1) {
         switch (opt) {
         case 'd':
             device = optarg;
@@ -589,21 +589,16 @@ int main(int argc, char *argv[])
         case 'p':
             do_profile = 1;
             break;
-        case 'S':
-            do_hdr = 0;
-            break;
         case 'h':
         default:
             fprintf(stderr,
-                "Usage: %s [-d device] [-n frames] [-c p010|nv12|both] [-o outfile] [-r rawfile] [-p] [-S]\n"
+                "Usage: %s [-d device] [-n frames] [-c p010|nv12|both] [-o outfile] [-r rawfile] [-p]\n"
                 "  -d  Device path (default: /dev/video_cap)\n"
                 "  -n  Number of frames to capture (default: 100)\n"
                 "  -c  GPU convert: p010, nv12, or both\n"
                 "  -o  Dump converted frame to file (raw P010/NV12)\n"
                 "  -r  Dump raw AMLY input frame to file\n"
-                "  -p  Profiling mode: GPU-convert every frame, report timing stats\n"
-                "  -S  SDR passthrough: disable BT.2020->BT.709 CSC (NV12 only)\n"
-                "       Default: CSC ON (BT.2020 10-bit -> BT.709 8-bit)\n",
+                "  -p  Profiling mode: GPU-convert every frame, report timing stats\n",
                 argv[0]);
             return (opt == 'h') ? 0 : 1;
         }
@@ -619,8 +614,6 @@ int main(int argc, char *argv[])
             do_p010 ? "P010 " : "", do_nv12 ? "NV12 " : "",
             (!do_p010 && !do_nv12) ? "none" : "");
     if (do_profile) fprintf(stderr, "Mode: PROFILING\n");
-    if (do_hdr) fprintf(stderr, "CSC: BT.2020 -> BT.709 (NV12 chroma matrix)\n");
-    else         fprintf(stderr, "CSC: OFF (SDR passthrough)\n");
 
     /* Open */
     vfmcap_ctx_t *ctx = vfmcap_open(device);
@@ -628,13 +621,6 @@ int main(int argc, char *argv[])
         fprintf(stderr, "ERROR: vfmcap_open failed: %s\n",
                 vfmcap_last_error(NULL));
         return 1;
-    }
-
-    /* Enable BT.2020->BT.709 CSC (default ON, disabled by -S flag) */
-    if (do_hdr) {
-        vfmcap_set_hdr_mode(ctx, 1);
-    } else {
-        vfmcap_set_hdr_mode(ctx, 0);
     }
 
     /* Start streaming */

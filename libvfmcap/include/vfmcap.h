@@ -3,7 +3,11 @@
  *
  * Zero-copy HDMI capture library for Amlogic A311D2 (T7) SoC.
  * Wraps /dev/video_cap (vfm_cap kernel module) with V4L2 streaming
- * and Vulkan-based 10-bit format conversion on the Mali-G52 GPU.
+ * and Vulkan-based raw format conversion on the Mali-G52 GPU.
+ *
+ * This SDK performs raw format packing ONLY (AMLY -> P010, AMLY -> NV12).
+ * No color space conversion, tone mapping, or gamut mapping is performed.
+ * For color-processed capture, use vdin1 loopback (VPP HDR->SDR path).
  *
  * Data flow (CPU never touches pixel data):
  *   vdin0 CMA buffer -> DMA-buf fd -> Vulkan GPU import ->
@@ -211,7 +215,8 @@ int vfmcap_convert_p010(vfmcap_ctx_t *ctx, vfmcap_frame_t *frame, int out_dmabuf
  *                 Required size: width * height * 3 / 2 (Y=w*h + UV=w*h/2)
  *
  * Same as vfmcap_convert_p010 but outputs 8-bit NV12 (10-bit to 8-bit
- * truncation: val >> 2).
+ * truncation: val >> 2). No color space conversion is applied —
+ * output preserves original BT.2020 PQ colorimetry.
  *
  * Returns VFMCAP_OK or negative error code.
  */
@@ -241,35 +246,6 @@ int vfmcap_convert_submit(vfmcap_ctx_t *ctx, vfmcap_frame_t *frame,
  * Returns VFMCAP_OK or negative error code.
  */
 int vfmcap_convert_wait(vfmcap_ctx_t *ctx);
-
-/* ---------- HDR mode control ---------- */
-
-/**
- * vfmcap_set_hdr_mode - Enable/disable BT.2020 -> BT.709 color space conversion
- * @ctx: Context
- * @hdr_mode: 0 = SDR passthrough (10-bit truncation to 8-bit),
- *            1 = BT.2020 -> BT.709 YCbCr-domain matrix CSC (default)
- *
- * Only affects NV12 conversion (vfmcap_convert_nv12 and vfmcap_convert_submit
- * with VFMCAP_FMT_NV12). P010 always passes through as-is (HDR preserved).
- *
- * The conversion uses an industry-standard 3x3 YCbCr-domain matrix that
- * folds quantization into the coefficients for maximum GPU throughput.
- * Luma (Y) is unchanged by gamut mapping — only chroma (Cb/Cr) is converted
- * via a 2x2 matrix multiply.
- *
- * Default is ON (hdr_mode=1). Call with 0 to disable for SDR content.
- * Takes effect on the next conversion call.
- */
-void vfmcap_set_hdr_mode(vfmcap_ctx_t *ctx, int hdr_mode);
-
-/**
- * vfmcap_get_hdr_mode - Get current HDR mode
- * @ctx: Context
- *
- * Returns 0 (SDR passthrough) or 1 (HDR->SDR conversion).
- */
-int vfmcap_get_hdr_mode(vfmcap_ctx_t *ctx);
 
 /* ---------- Signal event handling ---------- */
 

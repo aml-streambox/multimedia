@@ -3,8 +3,9 @@
  *
  * Ported from amlvenc yuv422_converter_vulkan.c.
  * Key changes from amlvenc version:
- *   - Three shader pipelines: P010, NV12 SDR (no HDR), NV12 HDR (PQ→SDR tone map)
+ *   - Two shader pipelines: P010 (val << 6) and NV12 (val >> 2)
  *   - No wave_swap() — standard P010/NV12 output
+ *   - No color space conversion — raw format packing only
  *   - Runtime pipeline selection via format parameter
  *
  * Copyright (C) 2026 StreamBox
@@ -49,7 +50,6 @@
 
 #include "../shaders/amly_to_p010_spv.h"
 #include "../shaders/amly_to_nv12_spv.h"
-#include "../shaders/amly_to_nv12_hdr_spv.h"
 
 /* ---------- DMA-buf import cache ---------- */
 
@@ -79,13 +79,11 @@ typedef struct {
     VkFence                 fence;
     VkPipelineLayout        pipeline_layout;
 
-    /* Three pipelines: P010, NV12 SDR, NV12 HDR */
+    /* Two pipelines: P010 and NV12 */
     VkPipeline              pipeline_p010;
     VkPipeline              pipeline_nv12;
-    VkPipeline              pipeline_nv12_hdr;
     VkShaderModule          shader_p010;
     VkShaderModule          shader_nv12;
-    VkShaderModule          shader_nv12_hdr;
 
     VkPhysicalDeviceMemoryProperties memory_props;
 
@@ -501,7 +499,7 @@ int vfmcap_vk_init(uint32_t width, uint32_t height)
     result = vkAllocateDescriptorSets(ctx.device, &desc_alloc, &ctx.descriptor_set);
     VK_CHECK(result, "vkAllocateDescriptorSets");
 
-    /* Pipeline layout: push constants = { width, height, pairs_per_row, hdr_mode } */
+    /* Pipeline layout: push constants = { width, height, pairs_per_row, reserved } */
     VkPushConstantRange push_constant = {
         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
         .offset = 0,
@@ -520,17 +518,13 @@ int vfmcap_vk_init(uint32_t width, uint32_t height)
                                     &ctx.pipeline_layout);
     VK_CHECK(result, "vkCreatePipelineLayout");
 
-    /* Load all shaders */
+    /* Load shaders */
     if (load_shader(amly_to_p010_spv, sizeof(amly_to_p010_spv),
                     &ctx.shader_p010) != 0) {
         return -1;
     }
     if (load_shader(amly_to_nv12_spv, sizeof(amly_to_nv12_spv),
                     &ctx.shader_nv12) != 0) {
-        return -1;
-    }
-    if (load_shader(amly_to_nv12_hdr_spv, sizeof(amly_to_nv12_hdr_spv),
-                    &ctx.shader_nv12_hdr) != 0) {
         return -1;
     }
 
@@ -550,21 +544,15 @@ int vfmcap_vk_init(uint32_t width, uint32_t height)
                                       &pipeline_info, NULL, &ctx.pipeline_p010);
     VK_CHECK(result, "vkCreateComputePipelines(P010)");
 
-    /* Create NV12 SDR pipeline */
+    /* Create NV12 pipeline */
     pipeline_info.stage.module = ctx.shader_nv12;
     result = vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1,
                                       &pipeline_info, NULL, &ctx.pipeline_nv12);
     VK_CHECK(result, "vkCreateComputePipelines(NV12)");
 
-    /* Create NV12 HDR pipeline */
-    pipeline_info.stage.module = ctx.shader_nv12_hdr;
-    result = vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1,
-                                      &pipeline_info, NULL, &ctx.pipeline_nv12_hdr);
-    VK_CHECK(result, "vkCreateComputePipelines(NV12_HDR)");
-
     ctx.initialized = 1;
     ctx.frame_count = 0;
-    fprintf(stderr, "[vfmcap-vk] Initialized: %ux%u, P010+NV12_SDR+NV12_HDR pipelines ready\n",
+    fprintf(stderr, "[vfmcap-vk] Initialized: %ux%u, P010+NV12 pipelines ready\n",
             width, height);
 
     return 0;
@@ -573,8 +561,7 @@ int vfmcap_vk_init(uint32_t width, uint32_t height)
 /* ---------- Async submit ---------- */
 
 int vfmcap_vk_convert_submit(int in_fd, int out_fd, uint32_t width,
-                             uint32_t height, vfmcap_vk_fmt_t fmt,
-                             uint32_t hdr_mode)
+                             uint32_t height, vfmcap_vk_fmt_t fmt)
 {
     if (!ctx.initialized) {
         snprintf(ctx.last_error, sizeof(ctx.last_error), "Not initialized");
@@ -657,39 +644,29 @@ int vfmcap_vk_convert_submit(int in_fd, int out_fd, uint32_t width,
 
     vkUpdateDescriptorSets(ctx.device, 3, writes, 0, NULL);
 
-    /* Bind pipeline: P010, NV12 SDR, or NV12 HDR */
-    VkPipeline pipeline;
-    if (fmt == VFMCAP_VK_FMT_P010)
-        pipeline = ctx.pipeline_p010;
-    else if (hdr_mode != 0)
-        pipeline = ctx.pipeline_nv12_hdr;
-    else
-        pipeline = ctx.pipeline_nv12;
+    /* Bind pipeline */
+    VkPipeline pipeline = (fmt == VFMCAP_VK_FMT_P010) ?
+                          ctx.pipeline_p010 : ctx.pipeline_nv12;
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                             ctx.pipeline_layout, 0, 1,
                             &ctx.descriptor_set, 0, NULL);
 
-    /* Push constants */
+    /* Push constants: { width, height, pairs_per_row, reserved } */
     uint32_t pairs_per_row = width / 2;
-    /* hdr_mode only applies to NV12 shader; P010 shader ignores 4th constant */
-    uint32_t push_data[] = { width, height, pairs_per_row,
-                             (fmt == VFMCAP_VK_FMT_NV12) ? hdr_mode : 0u };
+    uint32_t push_data[] = { width, height, pairs_per_row, 0u };
     vkCmdPushConstants(cmd, ctx.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(push_data), push_data);
 
     /* 2D dispatch
-     * P010:     local_size=(128,1,1), 1 pair/thread, 1 row/workgroup
-     *           tile = 128 pairs, groups_x = ceil(pairs_per_row/128), groups_y = height
-     * NV12 SDR: local_size=(64,1,1), 2 pairs/thread, 1 row/workgroup
-     *           tile = 128 pairs, groups_x = ceil(pairs_per_row/128), groups_y = height
-     * NV12 HDR: local_size=(128,1,1), 1 pair/thread, 1 row/workgroup
-     *           tile = 128 pairs, groups_x = ceil(pairs_per_row/128), groups_y = height
+     * P010: local_size=(128,1,1), 1 pair/thread, 1 row/workgroup
+     *       tile = 128 pairs, groups_x = ceil(pairs_per_row/128), groups_y = height
+     * NV12: local_size=(64,1,1), 2 pairs/thread, 1 row/workgroup
+     *       tile = 128 pairs, groups_x = ceil(pairs_per_row/128), groups_y = height
      */
-    uint32_t groups_x, groups_y;
-    groups_x = (pairs_per_row + 127) / 128;
-    groups_y = height;
+    uint32_t groups_x = (pairs_per_row + 127) / 128;
+    uint32_t groups_y = height;
     vkCmdDispatch(cmd, groups_x, groups_y, 1);
 
     /* Memory barrier */
@@ -765,10 +742,9 @@ int vfmcap_vk_convert_wait(void)
 /* ---------- Synchronous conversion ---------- */
 
 int vfmcap_vk_convert(int in_fd, int out_fd, uint32_t width,
-                      uint32_t height, vfmcap_vk_fmt_t fmt,
-                      uint32_t hdr_mode)
+                      uint32_t height, vfmcap_vk_fmt_t fmt)
 {
-    int ret = vfmcap_vk_convert_submit(in_fd, out_fd, width, height, fmt, hdr_mode);
+    int ret = vfmcap_vk_convert_submit(in_fd, out_fd, width, height, fmt);
     if (ret != 0) return ret;
     return vfmcap_vk_convert_wait();
 }
@@ -794,16 +770,12 @@ void vfmcap_vk_cleanup(void)
         vkDestroyPipeline(ctx.device, ctx.pipeline_p010, NULL);
     if (ctx.pipeline_nv12 != VK_NULL_HANDLE)
         vkDestroyPipeline(ctx.device, ctx.pipeline_nv12, NULL);
-    if (ctx.pipeline_nv12_hdr != VK_NULL_HANDLE)
-        vkDestroyPipeline(ctx.device, ctx.pipeline_nv12_hdr, NULL);
     if (ctx.pipeline_layout != VK_NULL_HANDLE)
         vkDestroyPipelineLayout(ctx.device, ctx.pipeline_layout, NULL);
     if (ctx.shader_p010 != VK_NULL_HANDLE)
         vkDestroyShaderModule(ctx.device, ctx.shader_p010, NULL);
     if (ctx.shader_nv12 != VK_NULL_HANDLE)
         vkDestroyShaderModule(ctx.device, ctx.shader_nv12, NULL);
-    if (ctx.shader_nv12_hdr != VK_NULL_HANDLE)
-        vkDestroyShaderModule(ctx.device, ctx.shader_nv12_hdr, NULL);
     if (ctx.descriptor_set_layout != VK_NULL_HANDLE)
         vkDestroyDescriptorSetLayout(ctx.device, ctx.descriptor_set_layout, NULL);
     if (ctx.descriptor_pool != VK_NULL_HANDLE)

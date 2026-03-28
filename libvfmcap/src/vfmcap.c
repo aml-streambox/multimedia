@@ -3,6 +3,7 @@
  *
  * Wraps /dev/video_cap V4L2 device with zero-copy DMA-buf streaming.
  * CPU never touches frame data — only control plane (ioctls, poll).
+ * Raw format conversion only (AMLY -> P010/NV12). No color space conversion.
  *
  * Copyright (C) 2026 StreamBox
  * SPDX-License-Identifier: MIT
@@ -71,11 +72,6 @@ struct vfmcap_ctx {
     uint32_t             sizeimage;
     uint32_t             bitdepth;
 
-    /* Color space conversion for NV12 output:
-     * 0 = SDR passthrough (10-bit truncation to 8-bit)
-     * 1 = BT.2020 -> BT.709 matrix CSC (default) */
-    uint32_t             hdr_mode;
-
     /* V4L2 MMAP buffers (flow-control tokens only) */
     unsigned int         num_buffers;
 
@@ -137,7 +133,6 @@ vfmcap_ctx_t *vfmcap_open(const char *device)
 
     ctx->fd = fd;
     strncpy(ctx->device, dev, sizeof(ctx->device) - 1);
-    ctx->hdr_mode = 1;  /* Default: BT.2020 -> BT.709 CSC enabled */
 
     /* Read current format */
     struct v4l2_format fmt;
@@ -447,7 +442,7 @@ int vfmcap_convert_p010(vfmcap_ctx_t *ctx, vfmcap_frame_t *frame, int out_dmabuf
 
     int ret = vfmcap_vk_convert(frame->dmabuf_fd, out_dmabuf_fd,
                                 frame->width, frame->height,
-                                VFMCAP_VK_FMT_P010, 0);
+                                VFMCAP_VK_FMT_P010);
     if (ret != 0) {
         snprintf(ctx->last_error, sizeof(ctx->last_error),
                  "Vulkan P010 conversion failed: %s", vfmcap_vk_last_error());
@@ -472,7 +467,7 @@ int vfmcap_convert_nv12(vfmcap_ctx_t *ctx, vfmcap_frame_t *frame, int out_dmabuf
 
     int ret = vfmcap_vk_convert(frame->dmabuf_fd, out_dmabuf_fd,
                                 frame->width, frame->height,
-                                VFMCAP_VK_FMT_NV12, ctx->hdr_mode);
+                                VFMCAP_VK_FMT_NV12);
     if (ret != 0) {
         snprintf(ctx->last_error, sizeof(ctx->last_error),
                  "Vulkan NV12 conversion failed: %s", vfmcap_vk_last_error());
@@ -490,11 +485,9 @@ int vfmcap_convert_submit(vfmcap_ctx_t *ctx, vfmcap_frame_t *frame,
 
     vfmcap_vk_fmt_t vk_fmt = (fmt == VFMCAP_FMT_NV12) ?
                               VFMCAP_VK_FMT_NV12 : VFMCAP_VK_FMT_P010;
-    uint32_t hdr = (fmt == VFMCAP_FMT_NV12) ? ctx->hdr_mode : 0;
 
     int ret = vfmcap_vk_convert_submit(frame->dmabuf_fd, out_dmabuf_fd,
-                                       frame->width, frame->height, vk_fmt,
-                                       hdr);
+                                       frame->width, frame->height, vk_fmt);
     if (ret != 0) {
         snprintf(ctx->last_error, sizeof(ctx->last_error),
                  "Vulkan submit failed: %s", vfmcap_vk_last_error());
@@ -584,23 +577,6 @@ int vfmcap_get_signal_info(vfmcap_ctx_t *ctx, vfmcap_signal_info_t *info)
     /* fps, signal_type, hdr_status etc. come from sysfs or future G_CTRL */
 
     return VFMCAP_OK;
-}
-
-/* ---------- HDR mode control ---------- */
-
-void vfmcap_set_hdr_mode(vfmcap_ctx_t *ctx, int hdr_mode)
-{
-    if (!ctx) return;
-    ctx->hdr_mode = (hdr_mode != 0) ? 1 : 0;
-    fprintf(stderr, "[vfmcap] HDR mode set to %u (%s)\n",
-            ctx->hdr_mode,
-            ctx->hdr_mode ? "BT.2020 -> BT.709 CSC" : "SDR passthrough");
-}
-
-int vfmcap_get_hdr_mode(vfmcap_ctx_t *ctx)
-{
-    if (!ctx) return 0;
-    return (int)ctx->hdr_mode;
 }
 
 /* ---------- Utility ---------- */

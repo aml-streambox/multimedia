@@ -1,8 +1,8 @@
 /*
  * vfmcap_vulkan.h - Internal Vulkan converter header
  *
- * Ported from amlvenc yuv422_converter_vulkan.c/h.
  * Provides AMLY -> P010 and AMLY -> NV12 compute shader conversion.
+ * Raw format conversion only — no color space conversion or tone mapping.
  *
  * Copyright (C) 2026 StreamBox
  * SPDX-License-Identifier: MIT
@@ -41,9 +41,7 @@ int vfmcap_vk_init(uint32_t width, uint32_t height);
  * @out_fd: Output DMA-buf fd (P010 or NV12, caller-allocated)
  * @width: Frame width
  * @height: Frame height
- * @fmt: Output format
- * @hdr_mode: 0 = SDR passthrough, 1 = HDR BT.2020 PQ -> SDR BT.709
- *            (only affects NV12 pipeline; ignored for P010)
+ * @fmt: Output format (P010 or NV12)
  *
  * Dispatches compute shader and returns immediately.
  * Must call vfmcap_vk_convert_wait() before next submit.
@@ -51,8 +49,7 @@ int vfmcap_vk_init(uint32_t width, uint32_t height);
  * Returns 0 on success, -1 on failure.
  */
 int vfmcap_vk_convert_submit(int in_fd, int out_fd, uint32_t width,
-                             uint32_t height, vfmcap_vk_fmt_t fmt,
-                             uint32_t hdr_mode);
+                             uint32_t height, vfmcap_vk_fmt_t fmt);
 
 /**
  * vfmcap_vk_convert_wait - Wait for GPU work to complete
@@ -65,8 +62,7 @@ int vfmcap_vk_convert_wait(void);
  * vfmcap_vk_convert - Synchronous conversion (submit + wait)
  */
 int vfmcap_vk_convert(int in_fd, int out_fd, uint32_t width,
-                      uint32_t height, vfmcap_vk_fmt_t fmt,
-                      uint32_t hdr_mode);
+                      uint32_t height, vfmcap_vk_fmt_t fmt);
 
 /**
  * vfmcap_vk_cleanup - Destroy all Vulkan resources

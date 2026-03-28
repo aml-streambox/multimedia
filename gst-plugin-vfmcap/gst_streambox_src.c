@@ -59,6 +59,7 @@ GST_DEBUG_CATEGORY_STATIC(gst_streambox_src_debug);
 #define DEFAULT_SIGNAL_TIMEOUT 5000
 
 #define DMA_HEAP_PATH          "/dev/dma_heap/system-uncached"
+#define DMA_HEAP_CMA_PATH      "/dev/dma_heap/heap-codecmm"
 
 /*
  * vdin1 V4L2 input index for VPP post-blend loopback.
@@ -204,6 +205,39 @@ alloc_output_dmabuf(GstStreamboxSrc *self, guint32 size)
     return alloc.fd;
 }
 
+/*
+ * Allocate a CMA-backed DMA-buf from /dev/dma_heap/heap-codecmm.
+ * Required for vdin1 DMABUF mode: the vdin1 driver extracts a single
+ * physical address from sg_page(sgl), so the buffer must be physically
+ * contiguous (CMA).
+ */
+static int
+alloc_cma_dmabuf(GstStreamboxSrc *self, guint32 size)
+{
+    if (self->heap_cma_fd < 0) {
+        self->heap_cma_fd = open(DMA_HEAP_CMA_PATH, O_RDWR);
+        if (self->heap_cma_fd < 0) {
+            GST_ERROR_OBJECT(self, "Cannot open %s: %s",
+                             DMA_HEAP_CMA_PATH, strerror(errno));
+            return -1;
+        }
+    }
+
+    struct dma_heap_allocation_data alloc = {
+        .len = size,
+        .fd_flags = O_CLOEXEC | O_RDWR,
+        .heap_flags = 0,
+    };
+
+    if (ioctl(self->heap_cma_fd, DMA_HEAP_IOCTL_ALLOC, &alloc) < 0) {
+        GST_ERROR_OBJECT(self, "CMA DMA_HEAP_IOCTL_ALLOC(%u) failed: %s",
+                         size, strerror(errno));
+        return -1;
+    }
+
+    return alloc.fd;
+}
+
 /* ---------- V4L2 helpers (Path B) ---------- */
 
 static int
@@ -318,10 +352,27 @@ vdin1_set_format(GstStreamboxSrc *self, guint w, guint h)
         return FALSE;
     }
 
-    /* Re-read what driver actually set */
+    /* Re-read what driver actually set (captures sizeimage with padding) */
     guint np = 0;
-    return vdin1_get_format(self, &self->width, &self->height,
-                            &self->vdin1_pixfmt, &np);
+    if (!vdin1_get_format(self, &self->width, &self->height,
+                          &self->vdin1_pixfmt, &np))
+        return FALSE;
+
+    /* Capture sizeimage from the format the driver returned */
+    memset(&fmt, 0, sizeof(fmt));
+    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    if (xioctl(self->vdin1_fd, VIDIOC_G_FMT, &fmt) == 0) {
+        self->vdin1_sizeimage = fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
+        GST_INFO_OBJECT(self, "vdin1: sizeimage=%u (actual NV21=%u, padding=%u)",
+                        self->vdin1_sizeimage,
+                        self->width * self->height * 3 / 2,
+                        self->vdin1_sizeimage - self->width * self->height * 3 / 2);
+    } else {
+        /* Fallback */
+        self->vdin1_sizeimage = self->width * self->height * 3 / 2;
+    }
+
+    return TRUE;
 }
 
 static gboolean
@@ -331,10 +382,10 @@ vdin1_reqbufs(GstStreamboxSrc *self, guint count)
     memset(&req, 0, sizeof(req));
     req.count = count;
     req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-    req.memory = V4L2_MEMORY_MMAP;
+    req.memory = V4L2_MEMORY_DMABUF;
 
     if (xioctl(self->vdin1_fd, VIDIOC_REQBUFS, &req) < 0) {
-        GST_ERROR_OBJECT(self, "VIDIOC_REQBUFS(%u) failed: %s",
+        GST_ERROR_OBJECT(self, "VIDIOC_REQBUFS(%u, DMABUF) failed: %s",
                          count, strerror(errno));
         return FALSE;
     }
@@ -346,59 +397,46 @@ vdin1_reqbufs(GstStreamboxSrc *self, guint count)
     }
 
     self->vdin1_n_bufs = req.count;
-    GST_INFO_OBJECT(self, "vdin1: allocated %u buffers", req.count);
+    GST_INFO_OBJECT(self, "vdin1: DMABUF mode, %u buffers", req.count);
     return TRUE;
 }
 
+/*
+ * Allocate DMA-bufs from /dev/dma_heap/system-uncached for vdin1 DMABUF mode.
+ * vdin1 will DMA-write directly into these buffers — zero CPU memcpy.
+ * Must use driver's sizeimage (includes alignment padding).
+ */
 static gboolean
-vdin1_mmap_buffers(GstStreamboxSrc *self)
+vdin1_alloc_dmabufs(GstStreamboxSrc *self)
 {
+    guint32 buf_size = self->vdin1_sizeimage;
+
     for (guint i = 0; i < self->vdin1_n_bufs; i++) {
-        struct v4l2_buffer buf;
-        struct v4l2_plane planes[1];
-        memset(&buf, 0, sizeof(buf));
-        memset(&planes, 0, sizeof(planes));
-        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-        buf.memory = V4L2_MEMORY_MMAP;
-        buf.index = i;
-        buf.m.planes = planes;
-        buf.length = 1;  /* single plane for NV21 */
-
-        if (xioctl(self->vdin1_fd, VIDIOC_QUERYBUF, &buf) < 0) {
-            GST_ERROR_OBJECT(self, "VIDIOC_QUERYBUF(%u) failed: %s",
-                             i, strerror(errno));
+        int fd = alloc_cma_dmabuf(self, buf_size);
+        if (fd < 0) {
+            GST_ERROR_OBJECT(self, "Failed to allocate DMA-buf %u (%u bytes)",
+                             i, buf_size);
             return FALSE;
         }
+        self->vdin1_bufs[i].dma_fd = fd;
+        self->vdin1_bufs[i].size = buf_size;
+        self->vdin1_bufs[i].queued = FALSE;
 
-        self->vdin1_bufs[i].length = planes[0].length;
-        self->vdin1_bufs[i].start = mmap(NULL, planes[0].length,
-                                         PROT_READ | PROT_WRITE,
-                                         MAP_SHARED,
-                                         self->vdin1_fd,
-                                         planes[0].m.mem_offset);
-
-        if (self->vdin1_bufs[i].start == MAP_FAILED) {
-            GST_ERROR_OBJECT(self, "mmap buffer %u failed: %s",
-                             i, strerror(errno));
-            self->vdin1_bufs[i].start = NULL;
-            return FALSE;
-        }
-
-        GST_DEBUG_OBJECT(self, "vdin1: buffer %u mapped at %p, length %zu",
-                         i, self->vdin1_bufs[i].start,
-                         self->vdin1_bufs[i].length);
+        GST_DEBUG_OBJECT(self, "vdin1: DMA-buf %u fd=%d size=%u",
+                         i, fd, buf_size);
     }
     return TRUE;
 }
 
 static void
-vdin1_munmap_buffers(GstStreamboxSrc *self)
+vdin1_free_dmabufs(GstStreamboxSrc *self)
 {
     for (guint i = 0; i < self->vdin1_n_bufs; i++) {
-        if (self->vdin1_bufs[i].start && self->vdin1_bufs[i].start != MAP_FAILED) {
-            munmap(self->vdin1_bufs[i].start, self->vdin1_bufs[i].length);
-            self->vdin1_bufs[i].start = NULL;
+        if (self->vdin1_bufs[i].dma_fd >= 0) {
+            close(self->vdin1_bufs[i].dma_fd);
+            self->vdin1_bufs[i].dma_fd = -1;
         }
+        self->vdin1_bufs[i].queued = FALSE;
     }
     self->vdin1_n_bufs = 0;
 }
@@ -412,16 +450,19 @@ vdin1_qbuf_all(GstStreamboxSrc *self)
         memset(&buf, 0, sizeof(buf));
         memset(&planes, 0, sizeof(planes));
         buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-        buf.memory = V4L2_MEMORY_MMAP;
+        buf.memory = V4L2_MEMORY_DMABUF;
         buf.index = i;
         buf.m.planes = planes;
         buf.length = 1;
+        planes[0].m.fd = self->vdin1_bufs[i].dma_fd;
+        planes[0].length = self->vdin1_bufs[i].size;
 
         if (xioctl(self->vdin1_fd, VIDIOC_QBUF, &buf) < 0) {
-            GST_ERROR_OBJECT(self, "VIDIOC_QBUF(%u) failed: %s",
-                             i, strerror(errno));
+            GST_ERROR_OBJECT(self, "VIDIOC_QBUF(%u, fd=%d) failed: %s",
+                             i, self->vdin1_bufs[i].dma_fd, strerror(errno));
             return FALSE;
         }
+        self->vdin1_bufs[i].queued = TRUE;
     }
     return TRUE;
 }
@@ -572,14 +613,20 @@ gst_streambox_src_init(GstStreamboxSrc *self)
 
     /* Path B */
     self->vdin1_fd = -1;
+    self->heap_cma_fd = -1;
     self->vdin1_n_bufs = 0;
     self->vdin1_pixfmt = 0;
     self->vdin1_num_planes = 0;
+    self->vdin1_sizeimage = 0;
     self->vdin1_prev_width = 0;
     self->vdin1_prev_height = 0;
     self->vdin1_prev_pixfmt = 0;
     self->vdin1_fmt_poll_counter = 0;
-    memset(self->vdin1_bufs, 0, sizeof(self->vdin1_bufs));
+    for (guint i = 0; i < STREAMBOX_VDIN1_MAX_BUFFERS; i++) {
+        self->vdin1_bufs[i].dma_fd = -1;
+        self->vdin1_bufs[i].size = 0;
+        self->vdin1_bufs[i].queued = FALSE;
+    }
 
     /* Flush pipe */
     self->flushing = FALSE;
@@ -1207,18 +1254,18 @@ start_path_b(GstStreamboxSrc *self)
     self->vdin1_prev_pixfmt = self->vdin1_pixfmt;
     self->vdin1_fmt_poll_counter = 0;
 
-    /* Request buffers */
+    /* Request buffers (DMABUF mode) */
     guint req_count = self->num_buffers;
     if (req_count > STREAMBOX_VDIN1_MAX_BUFFERS)
         req_count = STREAMBOX_VDIN1_MAX_BUFFERS;
     if (!vdin1_reqbufs(self, req_count))
         goto fail;
 
-    /* mmap buffers */
-    if (!vdin1_mmap_buffers(self))
+    /* Allocate DMA-bufs from heap */
+    if (!vdin1_alloc_dmabufs(self))
         goto fail;
 
-    /* Queue all buffers */
+    /* Queue all buffers (passes DMA-buf fds to vdin1) */
     if (!vdin1_qbuf_all(self))
         goto fail;
 
@@ -1237,7 +1284,7 @@ start_path_b(GstStreamboxSrc *self)
     return TRUE;
 
 fail:
-    vdin1_munmap_buffers(self);
+    vdin1_free_dmabufs(self);
     close(self->vdin1_fd);
     self->vdin1_fd = -1;
     return FALSE;
@@ -1248,18 +1295,25 @@ stop_path_b(GstStreamboxSrc *self)
 {
     if (self->vdin1_fd >= 0) {
         vdin1_streamoff(self);
-        vdin1_munmap_buffers(self);
 
-        /* Free buffers */
+        /* Release V4L2 buffers */
         struct v4l2_requestbuffers req;
         memset(&req, 0, sizeof(req));
         req.count = 0;
         req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-        req.memory = V4L2_MEMORY_MMAP;
+        req.memory = V4L2_MEMORY_DMABUF;
         xioctl(self->vdin1_fd, VIDIOC_REQBUFS, &req);
+
+        /* Free DMA-bufs */
+        vdin1_free_dmabufs(self);
 
         close(self->vdin1_fd);
         self->vdin1_fd = -1;
+    }
+
+    if (self->heap_cma_fd >= 0) {
+        close(self->heap_cma_fd);
+        self->heap_cma_fd = -1;
     }
 
     if (self->heap_fd >= 0) {
@@ -1307,15 +1361,15 @@ vdin1_reconfigure(GstStreamboxSrc *self)
 
     /* Stop streaming */
     vdin1_streamoff(self);
-    vdin1_munmap_buffers(self);
 
-    /* Free old buffers */
+    /* Free old DMA-bufs and release V4L2 buffers */
     struct v4l2_requestbuffers req;
     memset(&req, 0, sizeof(req));
     req.count = 0;
     req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-    req.memory = V4L2_MEMORY_MMAP;
+    req.memory = V4L2_MEMORY_DMABUF;
     xioctl(self->vdin1_fd, VIDIOC_REQBUFS, &req);
+    vdin1_free_dmabufs(self);
 
     /* Small delay to let VPP stabilize after resolution change */
     g_usleep(100000);  /* 100ms */
@@ -1347,13 +1401,13 @@ vdin1_reconfigure(GstStreamboxSrc *self)
     self->vdin1_prev_height = self->height;
     self->vdin1_prev_pixfmt = self->vdin1_pixfmt;
 
-    /* Re-allocate buffers */
+    /* Re-allocate buffers (DMABUF mode) */
     guint req_count = self->num_buffers;
     if (req_count > STREAMBOX_VDIN1_MAX_BUFFERS)
         req_count = STREAMBOX_VDIN1_MAX_BUFFERS;
     if (!vdin1_reqbufs(self, req_count))
         return FALSE;
-    if (!vdin1_mmap_buffers(self))
+    if (!vdin1_alloc_dmabufs(self))
         return FALSE;
     if (!vdin1_qbuf_all(self))
         return FALSE;
@@ -1367,6 +1421,47 @@ vdin1_reconfigure(GstStreamboxSrc *self)
     GST_INFO_OBJECT(self, "vdin1 reconfigured: %ux%u pixfmt=0x%08x",
                      self->width, self->height, self->vdin1_pixfmt);
     return TRUE;
+}
+
+/*
+ * Context passed to the GstBuffer dispose callback so we can re-QBUF
+ * the V4L2 buffer when downstream is done with it.
+ */
+typedef struct {
+    GstStreamboxSrc *self;
+    guint            buf_index;
+} PathBBufContext;
+
+static void
+path_b_buf_release(gpointer data)
+{
+    PathBBufContext *ctx = (PathBBufContext *)data;
+    GstStreamboxSrc *self = ctx->self;
+    guint idx = ctx->buf_index;
+
+    if (self->vdin1_fd >= 0 && self->streaming && idx < self->vdin1_n_bufs) {
+        struct v4l2_buffer qbuf;
+        struct v4l2_plane qplanes[1];
+        memset(&qbuf, 0, sizeof(qbuf));
+        memset(&qplanes, 0, sizeof(qplanes));
+        qbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+        qbuf.memory = V4L2_MEMORY_DMABUF;
+        qbuf.index = idx;
+        qbuf.m.planes = qplanes;
+        qbuf.length = 1;
+        qplanes[0].m.fd = self->vdin1_bufs[idx].dma_fd;
+        qplanes[0].length = self->vdin1_bufs[idx].size;
+
+        if (xioctl(self->vdin1_fd, VIDIOC_QBUF, &qbuf) < 0) {
+            GST_WARNING_OBJECT(self, "re-QBUF(%u) failed: %s",
+                               idx, strerror(errno));
+        } else {
+            self->vdin1_bufs[idx].queued = TRUE;
+        }
+    }
+
+    gst_object_unref(self);
+    g_free(ctx);
 }
 
 static GstFlowReturn
@@ -1449,13 +1544,13 @@ retry:
         }
     }
 
-    /* DQBUF */
+    /* DQBUF (DMABUF mode) */
     struct v4l2_buffer v4l2_buf;
     struct v4l2_plane planes[1];
     memset(&v4l2_buf, 0, sizeof(v4l2_buf));
     memset(&planes, 0, sizeof(planes));
     v4l2_buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-    v4l2_buf.memory = V4L2_MEMORY_MMAP;
+    v4l2_buf.memory = V4L2_MEMORY_DMABUF;
     v4l2_buf.m.planes = planes;
     v4l2_buf.length = 1;
 
@@ -1467,67 +1562,43 @@ retry:
     }
 
     guint idx = v4l2_buf.index;
-    guint32 bytesused = planes[0].bytesused;
 
-    if (idx >= self->vdin1_n_bufs || !self->vdin1_bufs[idx].start) {
+    if (idx >= self->vdin1_n_bufs || self->vdin1_bufs[idx].dma_fd < 0) {
         GST_ERROR_OBJECT(self, "DQBUF returned invalid index %u", idx);
         return GST_FLOW_ERROR;
     }
 
+    self->vdin1_bufs[idx].queued = FALSE;
+
     /*
-     * Wrap frame data in a DMA-buf backed GstBuffer.
-     * vdin1 uses MMAP, so we copy data into a DMA-buf (allocated from
-     * /dev/dma_heap/system) since we must QBUF the V4L2 buffer back
-     * promptly. The downstream encoder (amlvenc) requires DMA-buf input
-     * for zero-copy access by the hardware encoder.
-     *
-     * The vdin1 driver's sizeimage (and sometimes bytesused) can be
-     * slightly larger than the actual NV21 frame data (W*H*1.5).
-     * Amlogic's 00027-resize-gstbuffer-for-NV12-and-NV21.patch handles
-     * this by trimming the buffer. We do the same: allocate and copy
-     * only the actual NV21 data size.
+     * Zero-copy DMA-buf path.
+     * vdin1 wrote directly into our pre-allocated DMA-buf via DMABUF mode.
+     * We dup() the fd and wrap it with gst_dmabuf_allocator_alloc().
+     * The original fd stays owned by us for re-QBUF.
+     * When the GstBuffer is freed by downstream, the dispose callback
+     * re-QBUFs the buffer back to vdin1.
      */
     guint32 actual_size = self->width * self->height * 3 / 2;
-    if (bytesused > actual_size) {
-        GST_LOG_OBJECT(self, "Trimming bytesused %u -> %u (NV21 W*H*1.5)",
-                       bytesused, actual_size);
-        bytesused = actual_size;
-    }
 
-    GstBuffer *buffer = NULL;
-
-    /* Allocate DMA-buf for output */
-    int out_fd = alloc_output_dmabuf(self, bytesused);
-    if (out_fd < 0) {
-        GST_ERROR_OBJECT(self, "Failed to allocate output DMA-buf (%u bytes)",
-                         bytesused);
+    int dup_fd = dup(self->vdin1_bufs[idx].dma_fd);
+    if (dup_fd < 0) {
+        GST_ERROR_OBJECT(self, "dup(fd=%d) failed: %s",
+                         self->vdin1_bufs[idx].dma_fd, strerror(errno));
+        /* Re-QBUF immediately since we can't use this buffer */
         goto qbuf_return;
     }
 
-    /* mmap DMA-buf for CPU write, copy frame data, then munmap */
-    void *dma_ptr = mmap(NULL, bytesused, PROT_WRITE, MAP_SHARED, out_fd, 0);
-    if (dma_ptr == MAP_FAILED) {
-        GST_ERROR_OBJECT(self, "Failed to mmap DMA-buf fd=%d: %s",
-                         out_fd, strerror(errno));
-        close(out_fd);
-        out_fd = -1;
-        goto qbuf_return;
-    }
-    memcpy(dma_ptr, self->vdin1_bufs[idx].start, bytesused);
-    munmap(dma_ptr, bytesused);
-
-    /* Wrap DMA-buf fd in GstBuffer */
     GstAllocator *dmabuf_alloc = gst_dmabuf_allocator_new();
-    GstMemory *mem = gst_dmabuf_allocator_alloc(dmabuf_alloc, out_fd, bytesused);
+    GstMemory *mem = gst_dmabuf_allocator_alloc(dmabuf_alloc, dup_fd, actual_size);
     gst_object_unref(dmabuf_alloc);
 
     if (!mem) {
-        GST_ERROR_OBJECT(self, "Failed to wrap DMA-buf fd as GstMemory");
-        close(out_fd);
+        GST_ERROR_OBJECT(self, "gst_dmabuf_allocator_alloc(fd=%d) failed", dup_fd);
+        close(dup_fd);
         goto qbuf_return;
     }
 
-    buffer = gst_buffer_new();
+    GstBuffer *buffer = gst_buffer_new();
     gst_buffer_append_memory(buffer, mem);
 
     /* Set timestamps */
@@ -1550,38 +1621,52 @@ retry:
                                     self->width, self->height,
                                     2, offsets, strides);
 
+    /*
+     * Attach dispose callback: when downstream unrefs this GstBuffer,
+     * we re-QBUF the V4L2 buffer so vdin1 can reuse it.
+     */
+    PathBBufContext *ctx = g_new(PathBBufContext, 1);
+    ctx->self = GST_STREAMBOX_SRC(gst_object_ref(self));
+    ctx->buf_index = idx;
+    gst_mini_object_set_qdata(GST_MINI_OBJECT(buffer),
+                               g_quark_from_static_string("pathb-ctx"),
+                               ctx, path_b_buf_release);
+
     self->frame_count++;
 
     if (self->frame_count == 1 || self->frame_count % 300 == 0) {
-        GST_INFO_OBJECT(self, "Path B frame %lu: %ux%u NV21 (%u bytes)",
+        GST_INFO_OBJECT(self, "Path B frame %lu: %ux%u NV21 zero-copy fd=%d",
                          (unsigned long)self->frame_count,
-                         self->width, self->height, bytesused);
+                         self->width, self->height,
+                         self->vdin1_bufs[idx].dma_fd);
     }
 
+    *buf = buffer;
+    return GST_FLOW_OK;
+
 qbuf_return:
-    /* QBUF -- return buffer to vdin1 */
+    /* Error path: re-QBUF immediately and return error */
     {
         struct v4l2_buffer qbuf;
         struct v4l2_plane qplanes[1];
         memset(&qbuf, 0, sizeof(qbuf));
         memset(&qplanes, 0, sizeof(qplanes));
         qbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-        qbuf.memory = V4L2_MEMORY_MMAP;
+        qbuf.memory = V4L2_MEMORY_DMABUF;
         qbuf.index = idx;
         qbuf.m.planes = qplanes;
         qbuf.length = 1;
+        qplanes[0].m.fd = self->vdin1_bufs[idx].dma_fd;
+        qplanes[0].length = self->vdin1_bufs[idx].size;
 
         if (xioctl(self->vdin1_fd, VIDIOC_QBUF, &qbuf) < 0) {
             GST_ERROR_OBJECT(self, "VIDIOC_QBUF(%u) failed: %s",
                              idx, strerror(errno));
+        } else {
+            self->vdin1_bufs[idx].queued = TRUE;
         }
     }
-
-    if (!buffer)
-        return GST_FLOW_ERROR;
-
-    *buf = buffer;
-    return GST_FLOW_OK;
+    return GST_FLOW_ERROR;
 }
 
 /* ====================================================================

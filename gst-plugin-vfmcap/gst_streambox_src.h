@@ -58,8 +58,9 @@ typedef enum {
 #define STREAMBOX_VDIN1_MAX_BUFFERS 8
 
 typedef struct {
-    void    *start;     /* mmap'd address */
-    size_t   length;    /* mmap'd length */
+    int      dma_fd;    /* DMA-buf fd (owned by us, passed to vdin1 via QBUF) */
+    size_t   size;      /* allocation size */
+    gboolean queued;    /* TRUE if currently queued to vdin1 */
 } StreamboxVdin1Buffer;
 
 /* ---------- Instance structure ---------- */
@@ -97,10 +98,12 @@ struct _GstStreamboxSrc
 
     /* ---- Path B (vdin1) state ---- */
     int       vdin1_fd;            /* /dev/video71 fd */
+    int       heap_cma_fd;         /* /dev/dma_heap/heap-codecmm fd (CMA for vdin1) */
     StreamboxVdin1Buffer vdin1_bufs[STREAMBOX_VDIN1_MAX_BUFFERS];
     guint     vdin1_n_bufs;        /* Actual number of allocated buffers */
     guint32   vdin1_pixfmt;        /* Current pixel format from vdin1 */
     guint     vdin1_num_planes;    /* Number of planes (from G_FMT) */
+    guint32   vdin1_sizeimage;     /* Driver's sizeimage (includes alignment padding) */
     guint     vdin1_prev_width;    /* For format-change detection via G_FMT polling */
     guint     vdin1_prev_height;
     guint32   vdin1_prev_pixfmt;

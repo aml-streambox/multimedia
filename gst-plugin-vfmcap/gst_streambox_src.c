@@ -447,6 +447,21 @@ vdin1_streamoff(GstStreamboxSrc *self)
     GST_INFO_OBJECT(self, "vdin1: STREAMOFF");
 }
 
+/* ---------- decide_allocation ----------
+ * We manage our own DMA-buf allocation in create_path_a/create_path_b,
+ * so we don't need basesrc to set up a bufferpool.  Returning TRUE
+ * without configuring a pool tells basesrc to skip pool activation.
+ */
+static gboolean
+gst_streambox_src_decide_allocation(GstBaseSrc *src, GstQuery *query)
+{
+    /* Remove any pools proposed by downstream — we allocate ourselves */
+    while (gst_query_get_n_allocation_pools(query) > 0)
+        gst_query_remove_nth_allocation_pool(query, 0);
+
+    return TRUE;
+}
+
 /* ---------- Class init ---------- */
 
 static void
@@ -521,6 +536,7 @@ gst_streambox_src_class_init(GstStreamboxSrcClass *klass)
     basesrc_class->unlock_stop = GST_DEBUG_FUNCPTR(gst_streambox_src_unlock_stop);
     basesrc_class->get_caps = GST_DEBUG_FUNCPTR(gst_streambox_src_get_caps);
     basesrc_class->fixate = GST_DEBUG_FUNCPTR(gst_streambox_src_fixate);
+    basesrc_class->decide_allocation = GST_DEBUG_FUNCPTR(gst_streambox_src_decide_allocation);
 
     pushsrc_class->create = GST_DEBUG_FUNCPTR(gst_streambox_src_create);
 }
@@ -1245,6 +1261,11 @@ stop_path_b(GstStreamboxSrc *self)
         close(self->vdin1_fd);
         self->vdin1_fd = -1;
     }
+
+    if (self->heap_fd >= 0) {
+        close(self->heap_fd);
+        self->heap_fd = -1;
+    }
 }
 
 /*
@@ -1454,9 +1475,11 @@ retry:
     }
 
     /*
-     * Wrap frame data in a GstBuffer.
-     * vdin1 uses MMAP, so we need to copy the data into a GstBuffer
-     * since we must QBUF the V4L2 buffer back promptly.
+     * Wrap frame data in a DMA-buf backed GstBuffer.
+     * vdin1 uses MMAP, so we copy data into a DMA-buf (allocated from
+     * /dev/dma_heap/system) since we must QBUF the V4L2 buffer back
+     * promptly. The downstream encoder (amlvenc) requires DMA-buf input
+     * for zero-copy access by the hardware encoder.
      *
      * The vdin1 driver's sizeimage (and sometimes bytesused) can be
      * slightly larger than the actual NV21 frame data (W*H*1.5).
@@ -1471,24 +1494,41 @@ retry:
         bytesused = actual_size;
     }
 
-    GstBuffer *buffer = gst_buffer_new_allocate(NULL, bytesused, NULL);
-    if (!buffer) {
-        GST_ERROR_OBJECT(self, "Failed to allocate GstBuffer (%u bytes)",
+    GstBuffer *buffer = NULL;
+
+    /* Allocate DMA-buf for output */
+    int out_fd = alloc_output_dmabuf(self, bytesused);
+    if (out_fd < 0) {
+        GST_ERROR_OBJECT(self, "Failed to allocate output DMA-buf (%u bytes)",
                          bytesused);
         goto qbuf_return;
     }
 
-    /* Copy frame data */
-    GstMapInfo map;
-    if (gst_buffer_map(buffer, &map, GST_MAP_WRITE)) {
-        memcpy(map.data, self->vdin1_bufs[idx].start, bytesused);
-        gst_buffer_unmap(buffer, &map);
-    } else {
-        GST_ERROR_OBJECT(self, "Failed to map GstBuffer");
-        gst_buffer_unref(buffer);
-        buffer = NULL;
+    /* mmap DMA-buf for CPU write, copy frame data, then munmap */
+    void *dma_ptr = mmap(NULL, bytesused, PROT_WRITE, MAP_SHARED, out_fd, 0);
+    if (dma_ptr == MAP_FAILED) {
+        GST_ERROR_OBJECT(self, "Failed to mmap DMA-buf fd=%d: %s",
+                         out_fd, strerror(errno));
+        close(out_fd);
+        out_fd = -1;
         goto qbuf_return;
     }
+    memcpy(dma_ptr, self->vdin1_bufs[idx].start, bytesused);
+    munmap(dma_ptr, bytesused);
+
+    /* Wrap DMA-buf fd in GstBuffer */
+    GstAllocator *dmabuf_alloc = gst_dmabuf_allocator_new();
+    GstMemory *mem = gst_dmabuf_allocator_alloc(dmabuf_alloc, out_fd, bytesused);
+    gst_object_unref(dmabuf_alloc);
+
+    if (!mem) {
+        GST_ERROR_OBJECT(self, "Failed to wrap DMA-buf fd as GstMemory");
+        close(out_fd);
+        goto qbuf_return;
+    }
+
+    buffer = gst_buffer_new();
+    gst_buffer_append_memory(buffer, mem);
 
     /* Set timestamps */
     GST_BUFFER_PTS(buffer) = (guint64)v4l2_buf.timestamp.tv_sec * GST_SECOND +

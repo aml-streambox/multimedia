@@ -196,9 +196,14 @@ static GstFlowReturn create_path_b(GstStreamboxSrc *self, GstBuffer **buf);
 static gboolean p010_pool_init(GstStreamboxSrc *self, guint32 buf_size);
 static void     p010_pool_cleanup(GstStreamboxSrc *self);
 
-/* ---------- DMA-heap allocation (Path A) ---------- */
+/* ---------- DMA-heap allocation ---------- */
 
-static int
+/*
+ * Allocate from /dev/dma_heap/system-uncached (scatter-gather, non-contiguous).
+ * NOTE: NOT suitable for encoder hardware input — use alloc_cma_dmabuf instead.
+ * Kept for potential future non-encoder DMA-buf use cases.
+ */
+static int __attribute__((unused))
 alloc_output_dmabuf(GstStreamboxSrc *self, guint32 size)
 {
     if (self->heap_fd < 0) {
@@ -1892,10 +1897,11 @@ create_path_a(GstStreamboxSrc *self, GstBuffer **buf)
         }
     }
 
-    /* Allocate output DMA-buf */
-    int out_fd = alloc_output_dmabuf(self, self->out_buf_size);
+    /* Allocate output DMA-buf from CMA heap (encoder hardware requires
+     * physically contiguous memory — system-uncached is scatter-gather) */
+    int out_fd = alloc_cma_dmabuf(self, self->out_buf_size);
     if (out_fd < 0) {
-        GST_ERROR_OBJECT(self, "Failed to allocate output DMA-buf");
+        GST_ERROR_OBJECT(self, "Failed to allocate CMA output DMA-buf");
         vfmcap_release_frame(self->cap_ctx, &frame);
         return GST_FLOW_ERROR;
     }
@@ -2375,7 +2381,7 @@ p010_pool_init(GstStreamboxSrc *self, guint32 buf_size)
     self->p010_out_count = 0;
 
     for (guint i = 0; i < P010_OUT_POOL_SIZE; i++) {
-        int fd = alloc_output_dmabuf(self, buf_size);
+        int fd = alloc_cma_dmabuf(self, buf_size);
         if (fd < 0) {
             GST_ERROR_OBJECT(self, "P010 pool: failed to allocate buf %u/%u",
                              i, P010_OUT_POOL_SIZE);

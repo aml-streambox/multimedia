@@ -29,7 +29,10 @@
 //   v0 = (lo >> 20) & 0x3FF
 //   y1 = (lo >> 30) | (hi << 2)
 //
-// P010 output: 10-bit value left-justified in 16 bits (val << 6).
+// P010 output: Wave521 MSB byte-swap format.
+// Standard P010 uses val << 6 (MSB-aligned in LE 16-bit).
+// Wave521 encoder expects 10-bit value byte-swapped in 16-bit word:
+//   wave_swap(val) = ((val & 0xFF) << 8) | ((val >> 8) & 0x3)
 // Y plane: two 16-bit values per uint32. UV plane: half height, U+V interleaved.
 //
 // Workgroup: 128 threads x 1 row, each thread processes 1 pixel pair.
@@ -130,6 +133,14 @@ void read_pair_global(uint pair_idx, out uint lo, out uint hi) {
     }
 }
 
+// Wave521 byte-swap format (matches amlvenc's working GLES/Vulkan shader).
+// Input: 10-bit value (0..1023)
+// Output: 16-bit byte-swapped representation:
+//   ((val & 0xFF) << 8) | ((val >> 8) & 0x3)
+uint wave_swap(uint val) {
+    return ((val & 0xFFu) << 8) | ((val >> 8) & 0x3u);
+}
+
 void main() {
     uint row = gl_WorkGroupID.y;
     uint lid = gl_LocalInvocationID.x;
@@ -164,11 +175,11 @@ void main() {
     uint y0, u0, y1, v0;
     decode_pair(lo, hi, y0, u0, y1, v0);
 
-    // P010 Y plane: left-justify 10-bit in 16-bit, two values per uint32
-    uint y0_p010 = y0 << 6;
-    uint y1_p010 = y1 << 6;
+    // Y plane: Wave521 byte-swap format, two 16-bit values per uint32
+    uint y0_ws = wave_swap(y0);
+    uint y1_ws = wave_swap(y1);
     uint pair_idx = row * params.pairs_per_row + global_pair;
-    y_output.data[pair_idx] = y0_p010 | (y1_p010 << 16);
+    y_output.data[pair_idx] = y0_ws | (y1_ws << 16);
 
     // UV plane: only even rows, vertical 2-tap average with next row
     // 4:2:2 input -> 4:2:0 output
@@ -184,9 +195,11 @@ void main() {
         uint u_avg = (u0 + nu0 + 1u) >> 1;
         uint v_avg = (v0 + nv0 + 1u) >> 1;
 
-        // P010 UV: left-justify, U then V packed in one uint32
+        // UV plane: Wave521 byte-swap format, U then V packed in one uint32
         uint uv_row = row >> 1;
         uint uv_idx = uv_row * params.pairs_per_row + global_pair;
-        uv_output.data[uv_idx] = (u_avg << 6) | ((v_avg << 6) << 16);
+        uint u_ws = wave_swap(u_avg);
+        uint v_ws = wave_swap(v_avg);
+        uv_output.data[uv_idx] = u_ws | (v_ws << 16);
     }
 }

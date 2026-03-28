@@ -1380,6 +1380,10 @@ gst_streambox_src_init(GstStreamboxSrc *self)
     self->cap_ctx = NULL;
     self->heap_fd = -1;
     self->out_buf_size = 0;
+    self->patha_out_slot = 0;
+    self->patha_out_count = 0;
+    for (guint i = 0; i < PATHA_OUT_POOL_SIZE; i++)
+        self->patha_out_fds[i] = -1;
 
     /* Path B */
     self->vdin1_fd = -1;
@@ -1784,6 +1788,32 @@ start_path_a(GstStreamboxSrc *self)
                                    ? VFMCAP_FMT_P010 : VFMCAP_FMT_NV12;
     self->out_buf_size = vfmcap_output_size(self->width, self->height, sdk_fmt);
 
+    /* Pre-allocate a small rotating pool of CMA output buffers.
+     * The encoder's kernel DMA-buf import caches fd→phys_addr mappings;
+     * if the same fd number is recycled (because we alloc/close each frame),
+     * the encoder hardware reads stale physical memory. Using a pool ensures
+     * each frame submission uses a distinct fd number. */
+    self->patha_out_slot = 0;
+    self->patha_out_count = 0;
+    for (guint i = 0; i < PATHA_OUT_POOL_SIZE; i++) {
+        int fd = alloc_cma_dmabuf(self, self->out_buf_size);
+        if (fd < 0) {
+            GST_ERROR_OBJECT(self, "Path A pool: failed to allocate buf %u/%u",
+                             i, PATHA_OUT_POOL_SIZE);
+            /* Cleanup what we allocated */
+            for (guint j = 0; j < i; j++) {
+                close(self->patha_out_fds[j]);
+                self->patha_out_fds[j] = -1;
+            }
+            vfmcap_stop(self->cap_ctx);
+            vfmcap_close(self->cap_ctx);
+            self->cap_ctx = NULL;
+            return FALSE;
+        }
+        self->patha_out_fds[i] = fd;
+        self->patha_out_count++;
+    }
+
     self->streaming = TRUE;
     self->sig_state = GST_STREAMBOX_STATE_STREAMING;
 
@@ -1802,6 +1832,16 @@ stop_path_a(GstStreamboxSrc *self)
         vfmcap_close(self->cap_ctx);
         self->cap_ctx = NULL;
     }
+
+    /* Free Path A output pool */
+    for (guint i = 0; i < self->patha_out_count; i++) {
+        if (self->patha_out_fds[i] >= 0) {
+            close(self->patha_out_fds[i]);
+            self->patha_out_fds[i] = -1;
+        }
+    }
+    self->patha_out_count = 0;
+    self->patha_out_slot = 0;
 
     if (self->heap_fd >= 0) {
         close(self->heap_fd);
@@ -1897,14 +1937,12 @@ create_path_a(GstStreamboxSrc *self, GstBuffer **buf)
         }
     }
 
-    /* Allocate output DMA-buf from CMA heap (encoder hardware requires
-     * physically contiguous memory — system-uncached is scatter-gather) */
-    int out_fd = alloc_cma_dmabuf(self, self->out_buf_size);
-    if (out_fd < 0) {
-        GST_ERROR_OBJECT(self, "Failed to allocate CMA output DMA-buf");
-        vfmcap_release_frame(self->cap_ctx, &frame);
-        return GST_FLOW_ERROR;
-    }
+    /* Get the next pool buffer (round-robin).
+     * The pool ensures each frame gets a distinct fd number, avoiding the
+     * encoder's kernel DMA-buf fd→phys caching that causes stale reads. */
+    guint slot = self->patha_out_slot;
+    self->patha_out_slot = (slot + 1) % self->patha_out_count;
+    int out_fd = self->patha_out_fds[slot];
 
     /* GPU convert: AMLY -> NV12 or P010 */
     vfmcap_output_fmt_t sdk_fmt = (self->output_fmt == GST_STREAMBOX_OUTPUT_P010)
@@ -1921,19 +1959,27 @@ create_path_a(GstStreamboxSrc *self, GstBuffer **buf)
     if (ret != VFMCAP_OK) {
         GST_ERROR_OBJECT(self, "GPU conversion failed: %s",
                          vfmcap_last_error(self->cap_ctx));
-        close(out_fd);
         return GST_FLOW_ERROR;
     }
 
-    /* Wrap output DMA-buf in GstBuffer */
+    /* Wrap a dup'd fd in GstBuffer — pool retains the original fd.
+     * gst_dmabuf_allocator_alloc takes ownership of its fd arg and will
+     * close it when the GstMemory is freed, so we must dup(). */
+    int dup_fd = dup(out_fd);
+    if (dup_fd < 0) {
+        GST_ERROR_OBJECT(self, "dup(out_fd=%d) failed: %s",
+                         out_fd, strerror(errno));
+        return GST_FLOW_ERROR;
+    }
+
     GstAllocator *dmabuf_alloc = gst_dmabuf_allocator_new();
-    GstMemory *mem = gst_dmabuf_allocator_alloc(dmabuf_alloc, out_fd,
+    GstMemory *mem = gst_dmabuf_allocator_alloc(dmabuf_alloc, dup_fd,
                                                  self->out_buf_size);
     gst_object_unref(dmabuf_alloc);
 
     if (!mem) {
         GST_ERROR_OBJECT(self, "Failed to wrap DMA-buf fd as GstMemory");
-        close(out_fd);
+        close(dup_fd);
         return GST_FLOW_ERROR;
     }
 

@@ -111,6 +111,14 @@ struct _GstStreamboxSrc
     int       heap_fd;             /* /dev/dma_heap/system-uncached fd */
     guint32   out_buf_size;        /* Output buffer size for current fmt */
 
+    /* Path A output CMA buffer pool — avoids fd recycling that confuses
+     * the encoder's kernel DMA-buf import cache. Rotate through N buffers
+     * so each frame submission uses a distinct fd number. */
+#define PATHA_OUT_POOL_SIZE 4
+    int       patha_out_fds[4];    /* pre-allocated CMA output DMA-buf fds */
+    guint     patha_out_slot;      /* round-robin index */
+    guint     patha_out_count;     /* number allocated (0 if pool not init'd) */
+
     /* ---- Path B (vdin1) state ---- */
     int       vdin1_fd;            /* /dev/video71 fd */
     int       heap_cma_fd;         /* /dev/dma_heap/heap-codecmm fd (CMA for vdin1) */

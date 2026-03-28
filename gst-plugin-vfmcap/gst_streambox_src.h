@@ -134,17 +134,26 @@ struct _GstStreamboxSrc
     VkQueue                 vk_compute_queue;
     guint32                 vk_queue_family;
     VkCommandPool           vk_command_pool;
-    VkCommandBuffer         vk_command_buffer;
-    VkFence                 vk_fence;
+    VkCommandBuffer         vk_cmd[2];             /* double-buffered command buffers */
+    VkFence                 vk_fences[2];           /* double-buffered fences */
+    guint                   vk_slot;                /* current slot (0 or 1) */
     VkDescriptorPool        vk_descriptor_pool;
     VkDescriptorSetLayout   vk_descriptor_set_layout;
-    VkDescriptorSet         vk_descriptor_set;
+    VkDescriptorSet         vk_descriptor_sets[2];  /* one per slot for double-buffering */
     VkPipelineLayout        vk_pipeline_layout;
     VkPipeline              vk_pipeline_p010;
     VkShaderModule          vk_shader_p010;
     VkPhysicalDeviceMemoryProperties vk_memory_props;
     gboolean                vk_initialized;
     guint64                 vk_frame_count;
+
+    /* Async GPU pipeline state (double-buffered, 1-frame delay) */
+    gboolean  vk_async_pending;        /* TRUE if GPU work is in-flight on prev slot */
+    gint      vk_async_out_pool_idx;   /* P010 pool index of async GPU output */
+    guint     vk_async_vdin1_idx;      /* vdin1 buf index being read by async GPU */
+    int       vk_async_in_fd;          /* DMA-buf fd of vdin1 buf (for DMA_BUF_SYNC end) */
+    guint64   vk_async_pts;            /* PTS of the async frame (to attach to output) */
+    guint64   vk_async_duration;       /* duration of the async frame */
 
     /* DMA-buf caches for Vulkan */
     Vdin1VkCacheEntry       vk_input_cache[VDIN1_VK_DMABUF_CACHE_SIZE];
@@ -153,6 +162,17 @@ struct _GstStreamboxSrc
 
     int                     vk_pending_in_fd;
     gboolean                vk_has_pending;
+
+    /* Output DMA-buf pool for 10-bit path (avoids per-frame alloc) */
+#define P010_OUT_POOL_SIZE  4
+    int       p010_out_fds[4];         /* pre-allocated output DMA-buf fds */
+    gboolean  p010_out_free[4];        /* TRUE = available for use */
+    guint32   p010_out_size;           /* size of each buffer */
+    guint     p010_out_count;          /* number allocated (0 if pool not init'd) */
+    GMutex    p010_out_lock;           /* protects free[] */
+
+    /* Expanded Vulkan output cache (one entry per pool slot) */
+    Vdin1VkCacheEntry       vk_output_pool_cache[4];
 
     /* ---- Flushing / unlock ---- */
     gboolean  flushing;            /* Set by unlock() to break out of blocking */

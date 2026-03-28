@@ -33,6 +33,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <poll.h>
+#include <time.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -52,6 +53,16 @@
 
 GST_DEBUG_CATEGORY_STATIC(gst_streambox_src_debug);
 #define GST_CAT_DEFAULT gst_streambox_src_debug
+
+/* ---------- Timing helpers ---------- */
+
+static inline guint64
+_get_time_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (guint64)ts.tv_sec * 1000000ULL + (guint64)ts.tv_nsec / 1000ULL;
+}
 
 /* ---------- Constants ---------- */
 
@@ -180,6 +191,10 @@ static void     stop_path_a(GstStreamboxSrc *self);
 static void     stop_path_b(GstStreamboxSrc *self);
 static GstFlowReturn create_path_a(GstStreamboxSrc *self, GstBuffer **buf);
 static GstFlowReturn create_path_b(GstStreamboxSrc *self, GstBuffer **buf);
+
+/* Forward declarations for P010 output pool */
+static gboolean p010_pool_init(GstStreamboxSrc *self, guint32 buf_size);
+static void     p010_pool_cleanup(GstStreamboxSrc *self);
 
 /* ---------- DMA-heap allocation (Path A) ---------- */
 
@@ -413,42 +428,6 @@ vdin1_vk_input_cache_get(GstStreamboxSrc *self, int fd, VkDeviceSize size)
     return slot;
 }
 
-/* Get or create cached output DMA-buf import. Returns TRUE on success. */
-static gboolean
-vdin1_vk_output_cache_get(GstStreamboxSrc *self, int fd, VkDeviceSize size)
-{
-    if (self->vk_output_cache.valid &&
-        self->vk_output_cache.fd == fd &&
-        self->vk_output_cache.size == size) {
-        return TRUE;
-    }
-
-    if (self->vk_output_cache.valid) {
-        vdin1_vk_cache_entry_destroy(self, &self->vk_output_cache);
-    }
-
-    int fd_dup = dup(fd);
-    if (fd_dup < 0) {
-        GST_ERROR_OBJECT(self, "dup(output fd %d) failed: %s", fd, strerror(errno));
-        return FALSE;
-    }
-
-    VkBuffer buffer;
-    VkDeviceMemory memory;
-    if (!vdin1_vk_import_dmabuf(self, fd_dup, size, &buffer, &memory)) {
-        return FALSE;
-    }
-
-    self->vk_output_cache.fd = fd;
-    self->vk_output_cache.fd_dup = fd_dup;
-    self->vk_output_cache.buffer = buffer;
-    self->vk_output_cache.memory = memory;
-    self->vk_output_cache.size = size;
-    self->vk_output_cache.valid = 1;
-
-    return TRUE;
-}
-
 /* ---------- Vulkan init ---------- */
 
 static gboolean
@@ -567,35 +546,38 @@ vdin1_vk_init(GstStreamboxSrc *self)
                                   &self->vk_command_pool);
     VK_CHECK_GST(self, result, "vkCreateCommandPool");
 
-    /* Command buffer */
+    /* Command buffers (2 for double-buffered async pipeline) */
     VkCommandBufferAllocateInfo cmd_alloc = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
         .commandPool = self->vk_command_pool,
         .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-        .commandBufferCount = 1,
+        .commandBufferCount = 2,
     };
 
     result = vkAllocateCommandBuffers(self->vk_device, &cmd_alloc,
-                                       &self->vk_command_buffer);
-    VK_CHECK_GST(self, result, "vkAllocateCommandBuffers");
+                                       self->vk_cmd);
+    VK_CHECK_GST(self, result, "vkAllocateCommandBuffers(2)");
 
-    /* Fence (start signaled for first reset) */
+    /* Fences (2, start signaled for first reset) */
     VkFenceCreateInfo fence_info = {
         .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
         .flags = VK_FENCE_CREATE_SIGNALED_BIT,
     };
 
-    result = vkCreateFence(self->vk_device, &fence_info, NULL, &self->vk_fence);
-    VK_CHECK_GST(self, result, "vkCreateFence");
+    for (int fi = 0; fi < 2; fi++) {
+        result = vkCreateFence(self->vk_device, &fence_info, NULL, &self->vk_fences[fi]);
+        VK_CHECK_GST(self, result, "vkCreateFence");
+    }
+    self->vk_slot = 0;
 
-    /* Descriptor pool: 3 storage buffers */
+    /* Descriptor pool: 3 storage buffers x 2 sets (double-buffered) */
     VkDescriptorPoolSize desc_pool_sizes[] = {
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6 },
     };
 
     VkDescriptorPoolCreateInfo desc_pool_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .maxSets = 1,
+        .maxSets = 2,
         .poolSizeCount = 1,
         .pPoolSizes = desc_pool_sizes,
     };
@@ -624,17 +606,21 @@ vdin1_vk_init(GstStreamboxSrc *self)
                                           &self->vk_descriptor_set_layout);
     VK_CHECK_GST(self, result, "vkCreateDescriptorSetLayout");
 
-    /* Descriptor set */
+    /* Descriptor sets (2 for double-buffered pipeline) */
+    VkDescriptorSetLayout layouts[2] = {
+        self->vk_descriptor_set_layout,
+        self->vk_descriptor_set_layout,
+    };
     VkDescriptorSetAllocateInfo desc_alloc = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
         .descriptorPool = self->vk_descriptor_pool,
-        .descriptorSetCount = 1,
-        .pSetLayouts = &self->vk_descriptor_set_layout,
+        .descriptorSetCount = 2,
+        .pSetLayouts = layouts,
     };
 
     result = vkAllocateDescriptorSets(self->vk_device, &desc_alloc,
-                                       &self->vk_descriptor_set);
-    VK_CHECK_GST(self, result, "vkAllocateDescriptorSets");
+                                       self->vk_descriptor_sets);
+    VK_CHECK_GST(self, result, "vkAllocateDescriptorSets(2)");
 
     /* Pipeline layout: push constants = { width, height, pairs_per_row, reserved } */
     VkPushConstantRange push_constant = {
@@ -690,6 +676,12 @@ vdin1_vk_init(GstStreamboxSrc *self)
     self->vk_pending_in_fd = -1;
     self->vk_has_pending = FALSE;
     self->vk_frame_count = 0;
+    self->vk_async_pending = FALSE;
+    self->vk_async_out_pool_idx = -1;
+    self->vk_async_vdin1_idx = 0;
+    self->vk_async_in_fd = -1;
+    self->vk_async_pts = 0;
+    self->vk_async_duration = 0;
 
     for (gint i = 0; i < VDIN1_VK_DMABUF_CACHE_SIZE; i++) {
         self->vk_input_cache[i].valid = 0;
@@ -702,14 +694,25 @@ vdin1_vk_init(GstStreamboxSrc *self)
     return TRUE;
 }
 
-/* ---------- Vulkan synchronous convert ---------- */
+/* ---------- Vulkan async submit (non-blocking) ---------- */
 
+/*
+ * Record and submit GPU work for AMLY->P010 conversion on the given slot.
+ * Returns immediately after vkQueueSubmit — does NOT wait for the fence.
+ * Caller must later call vdin1_vk_wait_async() before reusing this slot.
+ */
 static gboolean
-vdin1_vk_convert(GstStreamboxSrc *self, int in_fd, int out_fd,
-                  guint32 width, guint32 height)
+vdin1_vk_submit_async(GstStreamboxSrc *self, int in_fd, guint out_pool_idx,
+                       guint32 width, guint32 height, guint slot)
 {
     if (!self->vk_initialized) {
         GST_ERROR_OBJECT(self, "Vulkan not initialized");
+        return FALSE;
+    }
+
+    if (out_pool_idx >= self->p010_out_count ||
+        !self->vk_output_pool_cache[out_pool_idx].valid) {
+        GST_ERROR_OBJECT(self, "Invalid output pool index %u", out_pool_idx);
         return FALSE;
     }
 
@@ -719,7 +722,6 @@ vdin1_vk_convert(GstStreamboxSrc *self, int in_fd, int out_fd,
     VkDeviceSize input_size = (VkDeviceSize)width * height * 5 / 2;  /* AMLY: 20 bpp */
     VkDeviceSize y_plane_size = (VkDeviceSize)width * height * 2;    /* P010 Y: 16-bit */
     VkDeviceSize uv_plane_size = (VkDeviceSize)width * height;       /* P010 UV: 16-bit, half height */
-    VkDeviceSize output_size = y_plane_size + uv_plane_size;
 
     /* Import input DMA-buf (cached) */
     gint in_idx = vdin1_vk_input_cache_get(self, in_fd, input_size);
@@ -732,37 +734,34 @@ vdin1_vk_convert(GstStreamboxSrc *self, int in_fd, int out_fd,
     ioctl(in_fd, DMA_BUF_IOCTL_SYNC, &sync_start);
 
     VkBuffer in_buffer = self->vk_input_cache[in_idx].buffer;
+    VkBuffer out_buffer = self->vk_output_pool_cache[out_pool_idx].buffer;
 
-    /* Import output DMA-buf (cached) */
-    if (!vdin1_vk_output_cache_get(self, out_fd, output_size))
-        goto sync_end;
+    VkCommandBuffer cmd = self->vk_cmd[slot];
+    VkFence fence = self->vk_fences[slot];
+    VkDescriptorSet desc_set = self->vk_descriptor_sets[slot];
 
-    VkBuffer out_buffer = self->vk_output_cache.buffer;
-
-    /* Wait for previous fence before resetting command pool */
-    if (self->vk_frame_count == 0) {
-        vkResetFences(self->vk_device, 1, &self->vk_fence);
-    }
+    /* Reset fence */
+    vkResetFences(self->vk_device, 1, &fence);
 
     /* Record command buffer */
-    result = vkResetCommandPool(self->vk_device, self->vk_command_pool, 0);
-    if (result != VK_SUCCESS) {
-        GST_ERROR_OBJECT(self, "vkResetCommandPool failed: %d", result);
-        goto sync_end;
-    }
-
     VkCommandBufferBeginInfo begin_info = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     };
 
-    result = vkBeginCommandBuffer(self->vk_command_buffer, &begin_info);
+    result = vkResetCommandBuffer(cmd, 0);
     if (result != VK_SUCCESS) {
-        GST_ERROR_OBJECT(self, "vkBeginCommandBuffer failed: %d", result);
+        GST_ERROR_OBJECT(self, "vkResetCommandBuffer[%u] failed: %d", slot, result);
         goto sync_end;
     }
 
-    /* Update descriptors */
+    result = vkBeginCommandBuffer(cmd, &begin_info);
+    if (result != VK_SUCCESS) {
+        GST_ERROR_OBJECT(self, "vkBeginCommandBuffer[%u] failed: %d", slot, result);
+        goto sync_end;
+    }
+
+    /* Update descriptors for this slot */
     VkDescriptorBufferInfo buffer_infos[] = {
         { in_buffer, 0, input_size },
         { out_buffer, 0, y_plane_size },
@@ -771,17 +770,17 @@ vdin1_vk_convert(GstStreamboxSrc *self, int in_fd, int out_fd,
 
     VkWriteDescriptorSet writes[] = {
         { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-          .dstSet = self->vk_descriptor_set, .dstBinding = 0,
+          .dstSet = desc_set, .dstBinding = 0,
           .descriptorCount = 1,
           .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
           .pBufferInfo = &buffer_infos[0] },
         { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-          .dstSet = self->vk_descriptor_set, .dstBinding = 1,
+          .dstSet = desc_set, .dstBinding = 1,
           .descriptorCount = 1,
           .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
           .pBufferInfo = &buffer_infos[1] },
         { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-          .dstSet = self->vk_descriptor_set, .dstBinding = 2,
+          .dstSet = desc_set, .dstBinding = 2,
           .descriptorCount = 1,
           .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
           .pBufferInfo = &buffer_infos[2] },
@@ -790,22 +789,22 @@ vdin1_vk_convert(GstStreamboxSrc *self, int in_fd, int out_fd,
     vkUpdateDescriptorSets(self->vk_device, 3, writes, 0, NULL);
 
     /* Bind pipeline and descriptors */
-    vkCmdBindPipeline(self->vk_command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                       self->vk_pipeline_p010);
-    vkCmdBindDescriptorSets(self->vk_command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                             self->vk_pipeline_layout, 0, 1,
-                            &self->vk_descriptor_set, 0, NULL);
+                            &desc_set, 0, NULL);
 
     /* Push constants: { width, height, pairs_per_row, reserved } */
     uint32_t pairs_per_row = width / 2;
     uint32_t push_data[] = { width, height, pairs_per_row, 0u };
-    vkCmdPushConstants(self->vk_command_buffer, self->vk_pipeline_layout,
+    vkCmdPushConstants(cmd, self->vk_pipeline_layout,
                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_data), push_data);
 
     /* Dispatch: local_size=(128,1,1), groups_x = ceil(pairs_per_row/128), groups_y = height */
     uint32_t groups_x = (pairs_per_row + 127) / 128;
     uint32_t groups_y = height;
-    vkCmdDispatch(self->vk_command_buffer, groups_x, groups_y, 1);
+    vkCmdDispatch(cmd, groups_x, groups_y, 1);
 
     /* Memory barrier */
     VkMemoryBarrier barrier = {
@@ -814,34 +813,57 @@ vdin1_vk_convert(GstStreamboxSrc *self, int in_fd, int out_fd,
         .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_HOST_READ_BIT,
     };
 
-    vkCmdPipelineBarrier(self->vk_command_buffer,
+    vkCmdPipelineBarrier(cmd,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          VK_PIPELINE_STAGE_HOST_BIT |
                          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                          0, 1, &barrier, 0, NULL, 0, NULL);
 
-    result = vkEndCommandBuffer(self->vk_command_buffer);
+    result = vkEndCommandBuffer(cmd);
     if (result != VK_SUCCESS) {
-        GST_ERROR_OBJECT(self, "vkEndCommandBuffer failed: %d", result);
+        GST_ERROR_OBJECT(self, "vkEndCommandBuffer[%u] failed: %d", slot, result);
         goto sync_end;
     }
 
-    /* Submit */
+    /* Submit (non-blocking) */
     VkSubmitInfo submit_info = {
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .commandBufferCount = 1,
-        .pCommandBuffers = &self->vk_command_buffer,
+        .pCommandBuffers = &cmd,
     };
 
-    result = vkQueueSubmit(self->vk_compute_queue, 1, &submit_info, self->vk_fence);
+    result = vkQueueSubmit(self->vk_compute_queue, 1, &submit_info, fence);
     if (result != VK_SUCCESS) {
-        GST_ERROR_OBJECT(self, "vkQueueSubmit failed: %d", result);
+        GST_ERROR_OBJECT(self, "vkQueueSubmit[%u] failed: %d", slot, result);
         goto sync_end;
     }
 
+    return TRUE;
+
+sync_end:
+    {
+        struct dma_buf_sync sync_end_s = {
+            .flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ
+        };
+        ioctl(in_fd, DMA_BUF_IOCTL_SYNC, &sync_end_s);
+    }
+    return FALSE;
+}
+
+/* ---------- Vulkan async wait (blocking) ---------- */
+
+/*
+ * Wait for previously submitted GPU work on the given slot to complete.
+ * Also releases DMA_BUF_SYNC on the input fd.
+ */
+static gboolean
+vdin1_vk_wait_async(GstStreamboxSrc *self, guint slot, int in_fd)
+{
+    VkFence fence = self->vk_fences[slot];
+
     /* Wait for completion (5 second timeout) */
-    result = vkWaitForFences(self->vk_device, 1, &self->vk_fence,
-                              VK_TRUE, 5000000000ULL);
+    VkResult result = vkWaitForFences(self->vk_device, 1, &fence,
+                                       VK_TRUE, 5000000000ULL);
 
     /* Release DMA-buf read access */
     struct dma_buf_sync sync_end_s = {
@@ -850,24 +872,45 @@ vdin1_vk_convert(GstStreamboxSrc *self, int in_fd, int out_fd,
     ioctl(in_fd, DMA_BUF_IOCTL_SYNC, &sync_end_s);
 
     if (result != VK_SUCCESS) {
-        GST_ERROR_OBJECT(self, "vkWaitForFences failed: %d (frame %lu)",
-                         result, (unsigned long)self->vk_frame_count);
+        GST_ERROR_OBJECT(self, "vkWaitForFences[%u] failed: %d (frame %lu)",
+                         slot, result, (unsigned long)self->vk_frame_count);
         return FALSE;
     }
 
-    vkResetFences(self->vk_device, 1, &self->vk_fence);
-    self->vk_frame_count++;
-
     return TRUE;
+}
 
-sync_end:
-    {
-        struct dma_buf_sync sync_end_s2 = {
-            .flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ
-        };
-        ioctl(in_fd, DMA_BUF_IOCTL_SYNC, &sync_end_s2);
+/* ---------- Vulkan synchronous convert (for priming frame) ---------- */
+
+static gboolean
+vdin1_vk_convert_sync(GstStreamboxSrc *self, int in_fd, guint out_pool_idx,
+                       guint32 width, guint32 height)
+{
+    guint slot = self->vk_slot;
+
+    guint64 t0 = _get_time_us();
+
+    if (!vdin1_vk_submit_async(self, in_fd, out_pool_idx, width, height, slot))
+        return FALSE;
+
+    guint64 t1 = _get_time_us();
+
+    if (!vdin1_vk_wait_async(self, slot, in_fd))
+        return FALSE;
+
+    guint64 t2 = _get_time_us();
+
+    if (self->vk_frame_count < 10 || self->vk_frame_count % 100 == 0) {
+        GST_LOG_OBJECT(self,
+            "VK TIMING frame %lu (sync): submit=%luus fence_wait=%luus TOTAL=%luus",
+            (unsigned long)self->vk_frame_count,
+            (unsigned long)(t1 - t0),
+            (unsigned long)(t2 - t1),
+            (unsigned long)(t2 - t0));
     }
-    return FALSE;
+
+    self->vk_frame_count++;
+    return TRUE;
 }
 
 /* ---------- Vulkan cleanup ---------- */
@@ -886,8 +929,11 @@ vdin1_vk_cleanup(GstStreamboxSrc *self)
 
     vdin1_vk_cache_entry_destroy(self, &self->vk_output_cache);
 
-    if (self->vk_fence != VK_NULL_HANDLE)
-        vkDestroyFence(self->vk_device, self->vk_fence, NULL);
+    for (int fi = 0; fi < 2; fi++) {
+        if (self->vk_fences[fi] != VK_NULL_HANDLE)
+            vkDestroyFence(self->vk_device, self->vk_fences[fi], NULL);
+        self->vk_fences[fi] = VK_NULL_HANDLE;
+    }
     if (self->vk_pipeline_p010 != VK_NULL_HANDLE)
         vkDestroyPipeline(self->vk_device, self->vk_pipeline_p010, NULL);
     if (self->vk_pipeline_layout != VK_NULL_HANDLE)
@@ -909,7 +955,6 @@ vdin1_vk_cleanup(GstStreamboxSrc *self)
     self->vk_instance = VK_NULL_HANDLE;
     self->vk_device = VK_NULL_HANDLE;
     self->vk_physical_device = VK_NULL_HANDLE;
-    self->vk_fence = VK_NULL_HANDLE;
     self->vk_pipeline_p010 = VK_NULL_HANDLE;
     self->vk_pipeline_layout = VK_NULL_HANDLE;
     self->vk_shader_p010 = VK_NULL_HANDLE;
@@ -917,6 +962,7 @@ vdin1_vk_cleanup(GstStreamboxSrc *self)
     self->vk_descriptor_pool = VK_NULL_HANDLE;
     self->vk_command_pool = VK_NULL_HANDLE;
     self->vk_initialized = FALSE;
+    self->vk_async_pending = FALSE;
 
     GST_INFO_OBJECT(self, "Vulkan cleanup complete (%lu frames converted)",
                      (unsigned long)self->vk_frame_count);
@@ -1356,11 +1402,15 @@ gst_streambox_src_init(GstStreamboxSrc *self)
     self->vk_compute_queue = VK_NULL_HANDLE;
     self->vk_queue_family = 0;
     self->vk_command_pool = VK_NULL_HANDLE;
-    self->vk_command_buffer = VK_NULL_HANDLE;
-    self->vk_fence = VK_NULL_HANDLE;
+    self->vk_cmd[0] = VK_NULL_HANDLE;
+    self->vk_cmd[1] = VK_NULL_HANDLE;
+    self->vk_fences[0] = VK_NULL_HANDLE;
+    self->vk_fences[1] = VK_NULL_HANDLE;
+    self->vk_slot = 0;
     self->vk_descriptor_pool = VK_NULL_HANDLE;
     self->vk_descriptor_set_layout = VK_NULL_HANDLE;
-    self->vk_descriptor_set = VK_NULL_HANDLE;
+    self->vk_descriptor_sets[0] = VK_NULL_HANDLE;
+    self->vk_descriptor_sets[1] = VK_NULL_HANDLE;
     self->vk_pipeline_layout = VK_NULL_HANDLE;
     self->vk_pipeline_p010 = VK_NULL_HANDLE;
     self->vk_shader_p010 = VK_NULL_HANDLE;
@@ -1371,6 +1421,23 @@ gst_streambox_src_init(GstStreamboxSrc *self)
     self->vk_output_cache.fd = -1;
     self->vk_pending_in_fd = -1;
     self->vk_has_pending = FALSE;
+    self->vk_async_pending = FALSE;
+    self->vk_async_out_pool_idx = -1;
+    self->vk_async_vdin1_idx = 0;
+    self->vk_async_in_fd = -1;
+    self->vk_async_pts = 0;
+    self->vk_async_duration = 0;
+
+    /* P010 output pool */
+    self->p010_out_count = 0;
+    self->p010_out_size = 0;
+    g_mutex_init(&self->p010_out_lock);
+    for (guint i = 0; i < P010_OUT_POOL_SIZE; i++) {
+        self->p010_out_fds[i] = -1;
+        self->p010_out_free[i] = FALSE;
+        self->vk_output_pool_cache[i].valid = 0;
+        self->vk_output_pool_cache[i].fd = -1;
+    }
 
     /* Flush pipe */
     self->flushing = FALSE;
@@ -2026,6 +2093,16 @@ start_path_b(GstStreamboxSrc *self)
             vdin1_streamoff(self);
             goto fail;
         }
+
+        /* Pre-allocate P010 output buffer pool and import into Vulkan */
+        guint32 p010_size = self->width * self->height * 3;  /* Y + UV */
+        if (!p010_pool_init(self, p010_size)) {
+            GST_ELEMENT_ERROR(self, RESOURCE, FAILED,
+                              ("Failed to allocate P010 output buffer pool"),
+                              (NULL));
+            vdin1_streamoff(self);
+            goto fail;
+        }
     }
 
     self->streaming = TRUE;
@@ -2040,6 +2117,7 @@ start_path_b(GstStreamboxSrc *self)
     return TRUE;
 
 fail:
+    p010_pool_cleanup(self);
     vdin1_vk_cleanup(self);
     vdin1_free_dmabufs(self);
     close(self->vdin1_fd);
@@ -2050,6 +2128,44 @@ fail:
 static void
 stop_path_b(GstStreamboxSrc *self)
 {
+    /* Drain any pending async GPU work before cleanup */
+    if (self->vk_async_pending && self->vk_initialized) {
+        guint prev_slot = 1 - self->vk_slot;
+        GST_INFO_OBJECT(self, "Draining pending async GPU work on slot %u", prev_slot);
+        vdin1_vk_wait_async(self, prev_slot, self->vk_async_in_fd);
+
+        /* Re-QBUF the vdin1 buffer that was held */
+        guint idx = self->vk_async_vdin1_idx;
+        if (self->vdin1_fd >= 0 && idx < self->vdin1_n_bufs) {
+            struct v4l2_buffer qbuf;
+            struct v4l2_plane qplanes[1];
+            memset(&qbuf, 0, sizeof(qbuf));
+            memset(&qplanes, 0, sizeof(qplanes));
+            qbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+            qbuf.memory = V4L2_MEMORY_DMABUF;
+            qbuf.index = idx;
+            qbuf.m.planes = qplanes;
+            qbuf.length = 1;
+            qplanes[0].m.fd = self->vdin1_bufs[idx].dma_fd;
+            qplanes[0].length = self->vdin1_bufs[idx].size;
+            xioctl(self->vdin1_fd, VIDIOC_QBUF, &qbuf);
+        }
+
+        /* Return output buffer to pool */
+        if (self->vk_async_out_pool_idx >= 0 &&
+            (guint)self->vk_async_out_pool_idx < self->p010_out_count) {
+            g_mutex_lock(&self->p010_out_lock);
+            self->p010_out_free[self->vk_async_out_pool_idx] = TRUE;
+            g_mutex_unlock(&self->p010_out_lock);
+        }
+
+        self->vk_async_pending = FALSE;
+    }
+
+    /* Clean up P010 output pool (must be before Vulkan cleanup since pool
+     * entries hold Vulkan objects) */
+    p010_pool_cleanup(self);
+
     /* Clean up Vulkan before releasing DMA-bufs */
     vdin1_vk_cleanup(self);
 
@@ -2224,6 +2340,115 @@ path_b_buf_release(gpointer data)
     g_free(ctx);
 }
 
+/*
+ * P010 output buffer pool: pre-allocated DMA-bufs with Vulkan imports
+ * to avoid per-frame allocation and Vulkan object creation overhead.
+ */
+
+typedef struct {
+    GstStreamboxSrc *self;
+    guint            pool_index;   /* index into p010_out_fds[] */
+} P010BufContext;
+
+static void
+p010_buf_release(gpointer data)
+{
+    P010BufContext *ctx = (P010BufContext *)data;
+    GstStreamboxSrc *self = ctx->self;
+    guint idx = ctx->pool_index;
+
+    if (idx < self->p010_out_count) {
+        g_mutex_lock(&self->p010_out_lock);
+        self->p010_out_free[idx] = TRUE;
+        g_mutex_unlock(&self->p010_out_lock);
+    }
+
+    gst_object_unref(self);
+    g_free(ctx);
+}
+
+/* Allocate P010 output DMA-buf pool and pre-import into Vulkan */
+static gboolean
+p010_pool_init(GstStreamboxSrc *self, guint32 buf_size)
+{
+    self->p010_out_size = buf_size;
+    self->p010_out_count = 0;
+
+    for (guint i = 0; i < P010_OUT_POOL_SIZE; i++) {
+        int fd = alloc_output_dmabuf(self, buf_size);
+        if (fd < 0) {
+            GST_ERROR_OBJECT(self, "P010 pool: failed to allocate buf %u/%u",
+                             i, P010_OUT_POOL_SIZE);
+            return FALSE;
+        }
+
+        self->p010_out_fds[i] = fd;
+        self->p010_out_free[i] = TRUE;
+        self->p010_out_count = i + 1;
+
+        /* Pre-import into Vulkan */
+        int fd_dup = dup(fd);
+        if (fd_dup < 0) {
+            GST_ERROR_OBJECT(self, "P010 pool: dup(fd=%d) failed: %s",
+                             fd, strerror(errno));
+            return FALSE;
+        }
+
+        VkBuffer buffer;
+        VkDeviceMemory memory;
+        if (!vdin1_vk_import_dmabuf(self, fd_dup, buf_size, &buffer, &memory)) {
+            GST_ERROR_OBJECT(self, "P010 pool: Vulkan import failed for buf %u", i);
+            return FALSE;
+        }
+
+        self->vk_output_pool_cache[i].fd = fd;
+        self->vk_output_pool_cache[i].fd_dup = fd_dup;
+        self->vk_output_pool_cache[i].buffer = buffer;
+        self->vk_output_pool_cache[i].memory = memory;
+        self->vk_output_pool_cache[i].size = buf_size;
+        self->vk_output_pool_cache[i].valid = 1;
+    }
+
+    GST_INFO_OBJECT(self, "P010 output pool: %u x %u bytes allocated + Vulkan imported",
+                     P010_OUT_POOL_SIZE, buf_size);
+    return TRUE;
+}
+
+static void
+p010_pool_cleanup(GstStreamboxSrc *self)
+{
+    for (guint i = 0; i < self->p010_out_count; i++) {
+        /* Destroy Vulkan objects */
+        if (self->vk_output_pool_cache[i].valid) {
+            vdin1_vk_cache_entry_destroy(self, &self->vk_output_pool_cache[i]);
+        }
+        /* Close DMA-buf fd */
+        if (self->p010_out_fds[i] >= 0) {
+            close(self->p010_out_fds[i]);
+            self->p010_out_fds[i] = -1;
+        }
+        self->p010_out_free[i] = FALSE;
+    }
+    self->p010_out_count = 0;
+    self->p010_out_size = 0;
+}
+
+/* Get a free P010 output buffer from the pool. Returns index or -1. */
+static gint
+p010_pool_acquire(GstStreamboxSrc *self)
+{
+    g_mutex_lock(&self->p010_out_lock);
+    for (guint i = 0; i < self->p010_out_count; i++) {
+        if (self->p010_out_free[i]) {
+            self->p010_out_free[i] = FALSE;
+            g_mutex_unlock(&self->p010_out_lock);
+            return (gint)i;
+        }
+    }
+    g_mutex_unlock(&self->p010_out_lock);
+    return -1;
+}
+
 static GstFlowReturn
 create_path_b(GstStreamboxSrc *self, GstBuffer **buf)
 {
@@ -2332,97 +2557,506 @@ retry:
 
     if (self->vdin1_10bit) {
         /*
-         * 10-bit path: AMLY -> P010 via Vulkan GPU conversion.
+         * 10-bit path: AMLY -> P010 via double-buffered async Vulkan GPU.
          *
-         * vdin1 captured into a CMA DMA-buf in AMLY (40-bit packed YUV422 10-bit).
-         * We allocate an output DMA-buf from system-uncached heap for the P010 result,
-         * run the Vulkan compute shader to convert, then re-QBUF the vdin1 buffer
-         * immediately (since the output buffer is different from the input).
-         * The output DMA-buf fd is wrapped in a GstBuffer for downstream.
+         * Double-buffered pipeline with 1-frame lookahead:
+         *
+         * Frame 0 (priming, !vk_async_pending):
+         *   1. Sync convert current frame -> wrap as GstBuffer (to return)
+         *   2. Re-QBUF current vdin1 buf (GPU done reading)
+         *   3. Poll + DQBUF a SECOND frame (may block ~16ms)
+         *   4. Acquire pool buf, submit async GPU for second frame
+         *   5. Save async state, set vk_async_pending = TRUE
+         *   6. Return frame 0's GstBuffer
+         *
+         * Frame N (N>=1, vk_async_pending):
+         *   1. Wait prev GPU fence (should be ~instant: GPU ran during encode)
+         *   2. Re-QBUF prev vdin1 buf (GPU done reading)
+         *   3. Wrap prev GPU output as GstBuffer (this is what we return)
+         *   4. Current DQBUF'd frame -> acquire pool -> submit async GPU
+         *   5. Save async state, return prev frame's GstBuffer
+         *
+         * Overlap: GPU converts frame N while encoder encodes frame N-1.
+         * Throughput: max(GPU, encode) ~13ms instead of sum ~24ms -> 60fps.
          */
-        guint32 p010_size = self->width * self->height * 3;  /* Y=w*h*2 + UV=w*h*1 */
 
-        int out_fd = alloc_output_dmabuf(self, p010_size);
-        if (out_fd < 0) {
-            GST_ERROR_OBJECT(self, "Failed to allocate P010 output DMA-buf (%u bytes)",
-                             p010_size);
-            goto qbuf_return;
-        }
+        if (!self->vk_async_pending) {
+            /* === FRAME 0: Prime the pipeline === */
+            guint64 t_prime_start = _get_time_us();
 
-        /* Run Vulkan AMLY -> P010 conversion */
-        if (!vdin1_vk_convert(self, self->vdin1_bufs[idx].dma_fd, out_fd,
-                              self->width, self->height)) {
-            GST_ERROR_OBJECT(self, "Vulkan AMLY->P010 conversion failed");
-            close(out_fd);
-            goto qbuf_return;
-        }
-
-        /* Re-QBUF the vdin1 capture buffer immediately — we're done reading it */
-        {
-            struct v4l2_buffer qbuf;
-            struct v4l2_plane qplanes[1];
-            memset(&qbuf, 0, sizeof(qbuf));
-            memset(&qplanes, 0, sizeof(qplanes));
-            qbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-            qbuf.memory = V4L2_MEMORY_DMABUF;
-            qbuf.index = idx;
-            qbuf.m.planes = qplanes;
-            qbuf.length = 1;
-            qplanes[0].m.fd = self->vdin1_bufs[idx].dma_fd;
-            qplanes[0].length = self->vdin1_bufs[idx].size;
-
-            if (xioctl(self->vdin1_fd, VIDIOC_QBUF, &qbuf) < 0) {
-                GST_WARNING_OBJECT(self, "re-QBUF(%u) after convert failed: %s",
-                                   idx, strerror(errno));
-            } else {
-                self->vdin1_bufs[idx].queued = TRUE;
+            /* --- Step 1: Sync convert current frame --- */
+            gint out_idx = p010_pool_acquire(self);
+            if (out_idx < 0) {
+                GST_WARNING_OBJECT(self, "P010 pool exhausted (priming)");
+                goto qbuf_return;
             }
-        }
 
-        /* Wrap output DMA-buf fd in GstBuffer */
-        GstAllocator *dmabuf_alloc = gst_dmabuf_allocator_new();
-        GstMemory *mem = gst_dmabuf_allocator_alloc(dmabuf_alloc, out_fd, p010_size);
-        gst_object_unref(dmabuf_alloc);
+            if (!vdin1_vk_convert_sync(self, self->vdin1_bufs[idx].dma_fd,
+                                        (guint)out_idx, self->width, self->height)) {
+                GST_ERROR_OBJECT(self, "Vulkan sync convert failed (priming)");
+                g_mutex_lock(&self->p010_out_lock);
+                self->p010_out_free[out_idx] = TRUE;
+                g_mutex_unlock(&self->p010_out_lock);
+                goto qbuf_return;
+            }
 
-        if (!mem) {
-            GST_ERROR_OBJECT(self, "gst_dmabuf_allocator_alloc(fd=%d) failed", out_fd);
-            close(out_fd);
-            return GST_FLOW_ERROR;
-        }
+            guint64 t_sync_done = _get_time_us();
 
-        GstBuffer *buffer = gst_buffer_new();
-        gst_buffer_append_memory(buffer, mem);
+            /* --- Step 2: Re-QBUF current vdin1 buf (GPU is done reading) --- */
+            {
+                struct v4l2_buffer qbuf;
+                struct v4l2_plane qplanes[1];
+                memset(&qbuf, 0, sizeof(qbuf));
+                memset(&qplanes, 0, sizeof(qplanes));
+                qbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+                qbuf.memory = V4L2_MEMORY_DMABUF;
+                qbuf.index = idx;
+                qbuf.m.planes = qplanes;
+                qbuf.length = 1;
+                qplanes[0].m.fd = self->vdin1_bufs[idx].dma_fd;
+                qplanes[0].length = self->vdin1_bufs[idx].size;
 
-        /* Set timestamps */
-        GST_BUFFER_PTS(buffer) = (guint64)v4l2_buf.timestamp.tv_sec * GST_SECOND +
+                if (xioctl(self->vdin1_fd, VIDIOC_QBUF, &qbuf) < 0) {
+                    GST_WARNING_OBJECT(self, "re-QBUF(%u) after priming: %s",
+                                       idx, strerror(errno));
+                } else {
+                    self->vdin1_bufs[idx].queued = TRUE;
+                }
+            }
+
+            /* --- Step 3: Wrap sync result as GstBuffer (we return this) --- */
+            int prime_out_fd = self->p010_out_fds[out_idx];
+            int prime_dup_fd = dup(prime_out_fd);
+            if (prime_dup_fd < 0) {
+                GST_ERROR_OBJECT(self, "dup(out_fd=%d) failed: %s",
+                                 prime_out_fd, strerror(errno));
+                g_mutex_lock(&self->p010_out_lock);
+                self->p010_out_free[out_idx] = TRUE;
+                g_mutex_unlock(&self->p010_out_lock);
+                return GST_FLOW_ERROR;
+            }
+
+            GstAllocator *dmabuf_alloc_p = gst_dmabuf_allocator_new();
+            GstMemory *mem_p = gst_dmabuf_allocator_alloc(dmabuf_alloc_p, prime_dup_fd,
+                                                           self->p010_out_size);
+            gst_object_unref(dmabuf_alloc_p);
+
+            if (!mem_p) {
+                GST_ERROR_OBJECT(self, "dmabuf alloc failed (priming)");
+                close(prime_dup_fd);
+                g_mutex_lock(&self->p010_out_lock);
+                self->p010_out_free[out_idx] = TRUE;
+                g_mutex_unlock(&self->p010_out_lock);
+                return GST_FLOW_ERROR;
+            }
+
+            GstBuffer *prime_buffer = gst_buffer_new();
+            gst_buffer_append_memory(prime_buffer, mem_p);
+
+            GST_BUFFER_PTS(prime_buffer) = (guint64)v4l2_buf.timestamp.tv_sec * GST_SECOND +
+                                            (guint64)v4l2_buf.timestamp.tv_usec * GST_USECOND;
+            GST_BUFFER_DURATION(prime_buffer) = gst_util_uint64_scale_int(GST_SECOND,
+                                                                           self->fps_d,
+                                                                           self->fps_n);
+
+            {
+                gsize p_offsets[GST_VIDEO_MAX_PLANES] = { 0, };
+                gint p_strides[GST_VIDEO_MAX_PLANES] = { 0, };
+                p_strides[0] = self->width * 2;
+                p_strides[1] = self->width * 2;
+                p_offsets[0] = 0;
+                p_offsets[1] = (gsize)self->width * self->height * 2;
+
+                gst_buffer_add_video_meta_full(prime_buffer, GST_VIDEO_FRAME_FLAG_NONE,
+                                                GST_VIDEO_FORMAT_P010_10LE,
+                                                self->width, self->height,
+                                                2, p_offsets, p_strides);
+            }
+
+            P010BufContext *pctx_p = g_new(P010BufContext, 1);
+            pctx_p->self = GST_STREAMBOX_SRC(gst_object_ref(self));
+            pctx_p->pool_index = (guint)out_idx;
+            gst_mini_object_set_qdata(GST_MINI_OBJECT(prime_buffer),
+                                       g_quark_from_static_string("p010-pool-ctx"),
+                                       pctx_p, p010_buf_release);
+
+            self->frame_count++;
+            self->vk_frame_count++;
+
+            guint64 t_wrap_done = _get_time_us();
+
+            /* --- Step 4: DQBUF a SECOND frame to bootstrap async pipeline --- */
+            {
+                guint dq2_timeout_count = 0;
+            prime_dqbuf_retry:
+                if (self->flushing) {
+                    *buf = prime_buffer;
+                    return GST_FLOW_OK;  /* Return what we have */
+                }
+
+                struct pollfd pfds2[2];
+                pfds2[0].fd = self->vdin1_fd;
+                pfds2[0].events = POLLIN;
+                pfds2[1].fd = self->flush_pipefd[0];
+                pfds2[1].events = POLLIN;
+
+                int pret2 = poll(pfds2, 2, 1000);
+                if (pret2 < 0) {
+                    if (errno == EINTR) goto prime_dqbuf_retry;
+                    GST_WARNING_OBJECT(self, "priming: poll for frame 1 failed: %s",
+                                       strerror(errno));
+                    /* Return frame 0 without async bootstrap */
+                    *buf = prime_buffer;
+                    return GST_FLOW_OK;
+                }
+                if (self->flushing || (pfds2[1].revents & POLLIN)) {
+                    *buf = prime_buffer;
+                    return GST_FLOW_OK;
+                }
+                if (pret2 == 0) {
+                    dq2_timeout_count++;
+                    if (dq2_timeout_count >= 3) {
+                        GST_WARNING_OBJECT(self,
+                            "priming: no second frame after 3s, running sync");
+                        *buf = prime_buffer;
+                        return GST_FLOW_OK;
+                    }
+                    goto prime_dqbuf_retry;
+                }
+
+                struct v4l2_buffer v4l2_buf2;
+                struct v4l2_plane planes2[1];
+                memset(&v4l2_buf2, 0, sizeof(v4l2_buf2));
+                memset(&planes2, 0, sizeof(planes2));
+                v4l2_buf2.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+                v4l2_buf2.memory = V4L2_MEMORY_DMABUF;
+                v4l2_buf2.m.planes = planes2;
+                v4l2_buf2.length = 1;
+
+                if (xioctl(self->vdin1_fd, VIDIOC_DQBUF, &v4l2_buf2) < 0) {
+                    if (errno == EAGAIN) goto prime_dqbuf_retry;
+                    GST_WARNING_OBJECT(self,
+                        "priming: DQBUF frame 1 failed: %s", strerror(errno));
+                    *buf = prime_buffer;
+                    return GST_FLOW_OK;
+                }
+
+                guint idx2 = v4l2_buf2.index;
+                if (idx2 >= self->vdin1_n_bufs || self->vdin1_bufs[idx2].dma_fd < 0) {
+                    GST_WARNING_OBJECT(self, "priming: DQBUF2 invalid index %u", idx2);
+                    *buf = prime_buffer;
+                    return GST_FLOW_OK;
+                }
+                self->vdin1_bufs[idx2].queued = FALSE;
+
+                /* --- Step 5: Acquire pool buf + submit async for frame 1 --- */
+                gint out_idx2 = p010_pool_acquire(self);
+                if (out_idx2 < 0) {
+                    GST_WARNING_OBJECT(self,
+                        "priming: P010 pool exhausted for frame 1, re-QBUF + sync fallback");
+                    /* Re-QBUF frame 1 and fall back to sync mode */
+                    struct v4l2_buffer qb2;
+                    struct v4l2_plane qp2[1];
+                    memset(&qb2, 0, sizeof(qb2));
+                    memset(&qp2, 0, sizeof(qp2));
+                    qb2.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+                    qb2.memory = V4L2_MEMORY_DMABUF;
+                    qb2.index = idx2;
+                    qb2.m.planes = qp2;
+                    qb2.length = 1;
+                    qp2[0].m.fd = self->vdin1_bufs[idx2].dma_fd;
+                    qp2[0].length = self->vdin1_bufs[idx2].size;
+                    xioctl(self->vdin1_fd, VIDIOC_QBUF, &qb2);
+                    self->vdin1_bufs[idx2].queued = TRUE;
+                    *buf = prime_buffer;
+                    return GST_FLOW_OK;
+                }
+
+                guint async_slot = self->vk_slot;
+                if (!vdin1_vk_submit_async(self, self->vdin1_bufs[idx2].dma_fd,
+                                            (guint)out_idx2,
+                                            self->width, self->height, async_slot)) {
+                    GST_WARNING_OBJECT(self,
+                        "priming: async submit for frame 1 failed, sync fallback");
+                    g_mutex_lock(&self->p010_out_lock);
+                    self->p010_out_free[out_idx2] = TRUE;
+                    g_mutex_unlock(&self->p010_out_lock);
+                    /* Re-QBUF frame 1 */
+                    struct v4l2_buffer qb2;
+                    struct v4l2_plane qp2[1];
+                    memset(&qb2, 0, sizeof(qb2));
+                    memset(&qp2, 0, sizeof(qp2));
+                    qb2.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+                    qb2.memory = V4L2_MEMORY_DMABUF;
+                    qb2.index = idx2;
+                    qb2.m.planes = qp2;
+                    qb2.length = 1;
+                    qp2[0].m.fd = self->vdin1_bufs[idx2].dma_fd;
+                    qp2[0].length = self->vdin1_bufs[idx2].size;
+                    xioctl(self->vdin1_fd, VIDIOC_QBUF, &qb2);
+                    self->vdin1_bufs[idx2].queued = TRUE;
+                    *buf = prime_buffer;
+                    return GST_FLOW_OK;
+                }
+
+                /* Async submitted! Save state for next create() call */
+                self->vk_async_pending = TRUE;
+                self->vk_async_out_pool_idx = out_idx2;
+                self->vk_async_vdin1_idx = idx2;
+                self->vk_async_in_fd = self->vdin1_bufs[idx2].dma_fd;
+                self->vk_async_pts = (guint64)v4l2_buf2.timestamp.tv_sec * GST_SECOND +
+                                      (guint64)v4l2_buf2.timestamp.tv_usec * GST_USECOND;
+                self->vk_async_duration = gst_util_uint64_scale_int(GST_SECOND,
+                                                                     self->fps_d,
+                                                                     self->fps_n);
+                self->vk_slot = 1 - self->vk_slot;  /* Flip slot */
+            }
+
+            guint64 t_prime_end = _get_time_us();
+            GST_LOG_OBJECT(self,
+                "PATH_B ASYNC frame %lu (priming): sync_gpu=%luus wrap=%luus "
+                "dqbuf2+submit=%luus TOTAL=%luus async_pending=%d",
+                (unsigned long)self->frame_count,
+                (unsigned long)(t_sync_done - t_prime_start),
+                (unsigned long)(t_wrap_done - t_sync_done),
+                (unsigned long)(t_prime_end - t_wrap_done),
+                (unsigned long)(t_prime_end - t_prime_start),
+                self->vk_async_pending);
+
+            *buf = prime_buffer;
+            return GST_FLOW_OK;
+
+        } else {
+            /* === FRAME N (N>=1): Double-buffered async pipeline === */
+            guint64 t0 = _get_time_us();
+
+            /*
+             * Step 1: Wait for PREVIOUS frame's GPU to finish.
+             * The encoder was processing frame N-2's output while the GPU
+             * converted frame N-1. By now (~13ms later) the GPU should be
+             * done (~11ms), so this wait should be near-instant.
+             */
+            guint prev_slot = 1 - self->vk_slot;
+            if (!vdin1_vk_wait_async(self, prev_slot, self->vk_async_in_fd)) {
+                GST_ERROR_OBJECT(self, "Async GPU wait failed for slot %u", prev_slot);
+                /* Recovery: return pending output to pool, re-QBUF held vdin1 buf */
+                g_mutex_lock(&self->p010_out_lock);
+                self->p010_out_free[self->vk_async_out_pool_idx] = TRUE;
+                g_mutex_unlock(&self->p010_out_lock);
+                {
+                    guint pidx = self->vk_async_vdin1_idx;
+                    struct v4l2_buffer qb;
+                    struct v4l2_plane qp[1];
+                    memset(&qb, 0, sizeof(qb));
+                    memset(&qp, 0, sizeof(qp));
+                    qb.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+                    qb.memory = V4L2_MEMORY_DMABUF;
+                    qb.index = pidx;
+                    qb.m.planes = qp;
+                    qb.length = 1;
+                    qp[0].m.fd = self->vdin1_bufs[pidx].dma_fd;
+                    qp[0].length = self->vdin1_bufs[pidx].size;
+                    xioctl(self->vdin1_fd, VIDIOC_QBUF, &qb);
+                    self->vdin1_bufs[pidx].queued = TRUE;
+                }
+                self->vk_async_pending = FALSE;
+                goto qbuf_return;
+            }
+
+            guint64 t1 = _get_time_us();
+
+            /*
+             * Step 2: Re-QBUF the PREVIOUS vdin1 buffer (GPU done reading it).
+             */
+            {
+                guint pidx = self->vk_async_vdin1_idx;
+                struct v4l2_buffer qbuf;
+                struct v4l2_plane qplanes[1];
+                memset(&qbuf, 0, sizeof(qbuf));
+                memset(&qplanes, 0, sizeof(qplanes));
+                qbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+                qbuf.memory = V4L2_MEMORY_DMABUF;
+                qbuf.index = pidx;
+                qbuf.m.planes = qplanes;
+                qbuf.length = 1;
+                qplanes[0].m.fd = self->vdin1_bufs[pidx].dma_fd;
+                qplanes[0].length = self->vdin1_bufs[pidx].size;
+
+                if (xioctl(self->vdin1_fd, VIDIOC_QBUF, &qbuf) < 0) {
+                    GST_WARNING_OBJECT(self, "re-QBUF(%u) after async wait: %s",
+                                       pidx, strerror(errno));
+                } else {
+                    self->vdin1_bufs[pidx].queued = TRUE;
+                }
+            }
+
+            /*
+             * Step 3: Wrap PREVIOUS frame's GPU output as GstBuffer.
+             * This is the buffer we will return to downstream.
+             */
+            gint prev_out_idx = self->vk_async_out_pool_idx;
+            int prev_out_fd = self->p010_out_fds[prev_out_idx];
+
+            int prev_dup_fd = dup(prev_out_fd);
+            if (prev_dup_fd < 0) {
+                GST_ERROR_OBJECT(self, "dup(prev_out_fd=%d) failed: %s",
+                                 prev_out_fd, strerror(errno));
+                g_mutex_lock(&self->p010_out_lock);
+                self->p010_out_free[prev_out_idx] = TRUE;
+                g_mutex_unlock(&self->p010_out_lock);
+                self->vk_async_pending = FALSE;
+                goto qbuf_return;
+            }
+
+            GstAllocator *dmabuf_alloc = gst_dmabuf_allocator_new();
+            GstMemory *prev_mem = gst_dmabuf_allocator_alloc(dmabuf_alloc,
+                                                              prev_dup_fd,
+                                                              self->p010_out_size);
+            gst_object_unref(dmabuf_alloc);
+
+            if (!prev_mem) {
+                GST_ERROR_OBJECT(self, "dmabuf alloc failed (async wrap)");
+                close(prev_dup_fd);
+                g_mutex_lock(&self->p010_out_lock);
+                self->p010_out_free[prev_out_idx] = TRUE;
+                g_mutex_unlock(&self->p010_out_lock);
+                self->vk_async_pending = FALSE;
+                goto qbuf_return;
+            }
+
+            GstBuffer *prev_buffer = gst_buffer_new();
+            gst_buffer_append_memory(prev_buffer, prev_mem);
+
+            GST_BUFFER_PTS(prev_buffer) = self->vk_async_pts;
+            GST_BUFFER_DURATION(prev_buffer) = self->vk_async_duration;
+
+            {
+                gsize a_offsets[GST_VIDEO_MAX_PLANES] = { 0, };
+                gint a_strides[GST_VIDEO_MAX_PLANES] = { 0, };
+                a_strides[0] = self->width * 2;
+                a_strides[1] = self->width * 2;
+                a_offsets[0] = 0;
+                a_offsets[1] = (gsize)self->width * self->height * 2;
+
+                gst_buffer_add_video_meta_full(prev_buffer, GST_VIDEO_FRAME_FLAG_NONE,
+                                                GST_VIDEO_FORMAT_P010_10LE,
+                                                self->width, self->height,
+                                                2, a_offsets, a_strides);
+            }
+
+            P010BufContext *pctx = g_new(P010BufContext, 1);
+            pctx->self = GST_STREAMBOX_SRC(gst_object_ref(self));
+            pctx->pool_index = (guint)prev_out_idx;
+            gst_mini_object_set_qdata(GST_MINI_OBJECT(prev_buffer),
+                                       g_quark_from_static_string("p010-pool-ctx"),
+                                       pctx, p010_buf_release);
+
+            self->frame_count++;
+            self->vk_frame_count++;
+
+            guint64 t2 = _get_time_us();
+
+            /*
+             * Step 4: Acquire output pool buffer for the NEW (current) frame.
+             */
+            gint new_out_idx = p010_pool_acquire(self);
+            if (new_out_idx < 0) {
+                GST_WARNING_OBJECT(self,
+                    "P010 pool exhausted (async), returning prev frame without overlap");
+                /* Can't pipeline this time. Re-QBUF current vdin1 buf. */
+                self->vk_async_pending = FALSE;
+                struct v4l2_buffer qb_cur;
+                struct v4l2_plane qp_cur[1];
+                memset(&qb_cur, 0, sizeof(qb_cur));
+                memset(&qp_cur, 0, sizeof(qp_cur));
+                qb_cur.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+                qb_cur.memory = V4L2_MEMORY_DMABUF;
+                qb_cur.index = idx;
+                qb_cur.m.planes = qp_cur;
+                qb_cur.length = 1;
+                qp_cur[0].m.fd = self->vdin1_bufs[idx].dma_fd;
+                qp_cur[0].length = self->vdin1_bufs[idx].size;
+                if (xioctl(self->vdin1_fd, VIDIOC_QBUF, &qb_cur) < 0) {
+                    GST_WARNING_OBJECT(self, "re-QBUF(%u) pool-exhausted: %s",
+                                       idx, strerror(errno));
+                } else {
+                    self->vdin1_bufs[idx].queued = TRUE;
+                }
+                *buf = prev_buffer;
+                return GST_FLOW_OK;
+            }
+
+            /*
+             * Step 5: Submit async GPU for the NEW (current) frame.
+             * Non-blocking: GPU will run while downstream encodes prev_buffer.
+             */
+            guint cur_slot = self->vk_slot;
+            if (!vdin1_vk_submit_async(self, self->vdin1_bufs[idx].dma_fd,
+                                        (guint)new_out_idx,
+                                        self->width, self->height, cur_slot)) {
+                GST_ERROR_OBJECT(self, "Vulkan async submit failed");
+                g_mutex_lock(&self->p010_out_lock);
+                self->p010_out_free[new_out_idx] = TRUE;
+                g_mutex_unlock(&self->p010_out_lock);
+                self->vk_async_pending = FALSE;
+                /* Re-QBUF current vdin1 buf, still return prev frame */
+                struct v4l2_buffer qb_cur;
+                struct v4l2_plane qp_cur[1];
+                memset(&qb_cur, 0, sizeof(qb_cur));
+                memset(&qp_cur, 0, sizeof(qp_cur));
+                qb_cur.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+                qb_cur.memory = V4L2_MEMORY_DMABUF;
+                qb_cur.index = idx;
+                qb_cur.m.planes = qp_cur;
+                qb_cur.length = 1;
+                qp_cur[0].m.fd = self->vdin1_bufs[idx].dma_fd;
+                qp_cur[0].length = self->vdin1_bufs[idx].size;
+                if (xioctl(self->vdin1_fd, VIDIOC_QBUF, &qb_cur) < 0) {
+                    GST_WARNING_OBJECT(self, "re-QBUF(%u) submit-fail: %s",
+                                       idx, strerror(errno));
+                } else {
+                    self->vdin1_bufs[idx].queued = TRUE;
+                }
+                *buf = prev_buffer;
+                return GST_FLOW_OK;
+            }
+
+            guint64 t3 = _get_time_us();
+
+            /* Save async state for next create() call */
+            self->vk_async_pending = TRUE;
+            self->vk_async_out_pool_idx = new_out_idx;
+            self->vk_async_vdin1_idx = idx;
+            self->vk_async_in_fd = self->vdin1_bufs[idx].dma_fd;
+            self->vk_async_pts = (guint64)v4l2_buf.timestamp.tv_sec * GST_SECOND +
                                   (guint64)v4l2_buf.timestamp.tv_usec * GST_USECOND;
-        GST_BUFFER_DURATION(buffer) = gst_util_uint64_scale_int(GST_SECOND,
+            self->vk_async_duration = gst_util_uint64_scale_int(GST_SECOND,
                                                                  self->fps_d,
                                                                  self->fps_n);
+            self->vk_slot = 1 - self->vk_slot;  /* Flip slot */
 
-        /* Add video meta for P010 */
-        gsize offsets[GST_VIDEO_MAX_PLANES] = { 0, };
-        gint strides[GST_VIDEO_MAX_PLANES] = { 0, };
-        strides[0] = self->width * 2;       /* P010 Y stride: 16-bit per pixel */
-        strides[1] = self->width * 2;       /* P010 UV stride: 16-bit per component, interleaved */
-        offsets[0] = 0;
-        offsets[1] = (gsize)self->width * self->height * 2;  /* UV plane after Y plane */
+            /* Timing report */
+            if (self->frame_count <= 10 || self->frame_count % 100 == 0) {
+                GST_LOG_OBJECT(self,
+                    "PATH_B ASYNC frame %lu: gpu_wait=%luus wrap=%luus "
+                    "pool+submit=%luus TOTAL=%luus",
+                    (unsigned long)self->frame_count,
+                    (unsigned long)(t1 - t0),
+                    (unsigned long)(t2 - t1),
+                    (unsigned long)(t3 - t2),
+                    (unsigned long)(t3 - t0));
+            }
 
-        gst_buffer_add_video_meta_full(buffer, GST_VIDEO_FRAME_FLAG_NONE,
-                                        GST_VIDEO_FORMAT_P010_10LE,
-                                        self->width, self->height,
-                                        2, offsets, strides);
+            if (self->frame_count == 1 || self->frame_count % 300 == 0) {
+                GST_INFO_OBJECT(self,
+                    "Path B frame %lu: %ux%u P010 async pool[%d] (submitted pool[%d])",
+                    (unsigned long)self->frame_count,
+                    self->width, self->height, prev_out_idx, new_out_idx);
+            }
 
-        self->frame_count++;
-
-        if (self->frame_count == 1 || self->frame_count % 300 == 0) {
-            GST_INFO_OBJECT(self, "Path B frame %lu: %ux%u P010 (AMLY->Vulkan) out_fd=%d",
-                             (unsigned long)self->frame_count,
-                             self->width, self->height, out_fd);
+            *buf = prev_buffer;
+            return GST_FLOW_OK;
         }
-
-        *buf = buffer;
-        return GST_FLOW_OK;
 
     } else {
         /*

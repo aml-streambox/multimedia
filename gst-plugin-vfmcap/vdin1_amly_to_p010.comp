@@ -1,0 +1,186 @@
+#version 450
+
+// vdin1 AMLY (40-bit packed YUV422 10-bit, little-endian) to P010 conversion
+//
+// vdin1 in V4L2 mode writes with WORDS_SWAP=0 + WR_ENDIAN=1 (little endian).
+// NO bswap64 correction needed — data is in native LE byte order.
+//
+// 40-bit packed format per pixel pair:
+//   Logical: [U0(10)][Y0(10)][V0(10)][Y1(10)] = 40 bits
+//
+// In little-endian memory (byte 0 = LSB of the 40-bit word):
+//   Byte 0: Y1[7:0]
+//   Byte 1: V0[5:0] | Y1[9:8]
+//   Byte 2: Y0[3:0] | V0[9:6]
+//   Byte 3: U0[1:0] | Y0[9:4]
+//   Byte 4: U0[9:2]
+//
+// When loaded as LE uint32 (lo = bytes 0-3):
+//   lo[9:0]   = Y1[9:0]
+//   lo[19:10] = V0[9:0]
+//   lo[29:20] = Y0[9:0]
+//   lo[31:30] = U0[1:0]
+//   hi (byte 4) = U0[9:2]
+//
+// Extraction (no bswap needed):
+//   y1 = lo & 0x3FF
+//   v0 = (lo >> 10) & 0x3FF
+//   y0 = (lo >> 20) & 0x3FF
+//   u0 = (lo >> 30) | (hi << 2)
+//
+// P010 output: 10-bit value left-justified in 16 bits (val << 6).
+// Y plane: two 16-bit values per uint32. UV plane: half height, U+V interleaved.
+//
+// Workgroup: 128 threads x 1 row, each thread processes 1 pixel pair.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer InputBuffer {
+    uint data[];
+} input_buffer;
+
+layout(set = 0, binding = 1, std430) writeonly buffer YOutputBuffer {
+    uint data[];
+} y_output;
+
+layout(set = 0, binding = 2, std430) writeonly buffer UVOutputBuffer {
+    uint data[];
+} uv_output;
+
+layout(push_constant) uniform Params {
+    uint width;
+    uint height;
+    uint pairs_per_row;  // width / 2
+    uint reserved;       // unused, for alignment
+} params;
+
+// Tile: 128 pairs * 5 bytes = 640 bytes
+// Words needed: (640 + 3) / 4 + 2 = 163 (add guard words)
+#define TILE_PAIRS 128u
+#define TILE_BYTES (TILE_PAIRS * 5u)
+#define TILE_WORDS ((TILE_BYTES + 3u + 8u) / 4u + 1u)  // 164
+
+shared uint tile[TILE_WORDS];
+
+// Direct tile load — no bswap needed for vdin1 LE mode.
+// Just copy uint32 words from global to shared memory.
+void load_tile(uint base_word_idx, uint n_words) {
+    uint lid = gl_LocalInvocationID.x;
+
+    // 128 threads, each loads 1-2 words
+    for (uint i = lid; i < n_words; i += 128u) {
+        tile[i] = input_buffer.data[base_word_idx + i];
+    }
+    barrier();
+}
+
+// Extract 40 contiguous bits from tile[] starting at byte offset.
+// Returns {lo, hi} where lo has bits 0..31 and hi has bits 32..39.
+void extract_pair(uint local_pair, uint byte_offset_base,
+                  out uint lo, out uint hi) {
+    uint byte_off = byte_offset_base + local_pair * 5u;
+    uint widx = byte_off >> 2;
+    uint shift = (byte_off & 3u) << 3;  // 0, 8, 16, or 24
+
+    uint w0 = tile[widx];
+    uint w1 = tile[widx + 1u];
+
+    if (shift == 0u) {
+        lo = w0;
+        hi = w1 & 0xFFu;
+    } else {
+        uint w2 = tile[widx + 2u];
+        lo = (w0 >> shift) | (w1 << (32u - shift));
+        hi = ((w1 >> shift) | (w2 << (32u - shift))) & 0xFFu;
+    }
+}
+
+// Decode AMLY LE pixel pair — no bswap needed
+void decode_pair(uint lo, uint hi,
+                 out uint y0, out uint u0, out uint y1, out uint v0) {
+    y1 = lo & 0x3FFu;
+    v0 = (lo >> 10) & 0x3FFu;
+    y0 = (lo >> 20) & 0x3FFu;
+    u0 = (lo >> 30) | (hi << 2);
+}
+
+// Read a pair directly from global memory (for next-row UV averaging).
+// No bswap correction needed.
+void read_pair_global(uint pair_idx, out uint lo, out uint hi) {
+    uint byte_offset = pair_idx * 5u;
+    uint word_idx = byte_offset >> 2;
+    uint shift = (byte_offset & 3u) << 3;
+
+    uint w0 = input_buffer.data[word_idx];
+    uint w1 = input_buffer.data[word_idx + 1u];
+
+    if (shift == 0u) {
+        lo = w0;
+        hi = w1 & 0xFFu;
+    } else {
+        uint w2 = input_buffer.data[word_idx + 2u];
+        lo = (w0 >> shift) | (w1 << (32u - shift));
+        hi = ((w1 >> shift) | (w2 << (32u - shift))) & 0xFFu;
+    }
+}
+
+void main() {
+    uint row = gl_WorkGroupID.y;
+    uint lid = gl_LocalInvocationID.x;
+
+    if (row >= params.height) return;
+
+    // Tile boundaries
+    uint tile_start = gl_WorkGroupID.x * TILE_PAIRS;
+    uint tile_pairs = min(TILE_PAIRS, params.pairs_per_row - tile_start);
+
+    // Byte/word range for tile load
+    uint row_byte_start = row * params.pairs_per_row * 5u;
+    uint tile_byte_start = row_byte_start + tile_start * 5u;
+    uint base_word_idx = tile_byte_start >> 2;
+    uint tile_byte_offset = tile_byte_start & 3u;
+
+    uint tile_bytes_needed = tile_byte_offset + tile_pairs * 5u;
+    uint n_words = (tile_bytes_needed + 3u) / 4u + 2u;
+    if (n_words > TILE_WORDS) n_words = TILE_WORDS;
+
+    // Load tile into shared memory (direct copy, no bswap)
+    load_tile(base_word_idx, n_words);
+
+    // Bounds check
+    uint global_pair = tile_start + lid;
+    if (lid >= tile_pairs) return;
+
+    // Extract and decode 40-bit pair
+    uint lo, hi;
+    extract_pair(lid, tile_byte_offset, lo, hi);
+
+    uint y0, u0, y1, v0;
+    decode_pair(lo, hi, y0, u0, y1, v0);
+
+    // P010 Y plane: left-justify 10-bit in 16-bit, two values per uint32
+    uint y0_p010 = y0 << 6;
+    uint y1_p010 = y1 << 6;
+    uint pair_idx = row * params.pairs_per_row + global_pair;
+    y_output.data[pair_idx] = y0_p010 | (y1_p010 << 16);
+
+    // UV plane: only even rows, vertical 2-tap average with next row
+    // 4:2:2 input -> 4:2:0 output
+    if ((row & 1u) == 0u && (row + 1u) < params.height) {
+        uint next_pair_idx = pair_idx + params.pairs_per_row;
+        uint nlo, nhi;
+        read_pair_global(next_pair_idx, nlo, nhi);
+
+        uint ny0, nu0, ny1, nv0;
+        decode_pair(nlo, nhi, ny0, nu0, ny1, nv0);
+
+        // Average with rounding
+        uint u_avg = (u0 + nu0 + 1u) >> 1;
+        uint v_avg = (v0 + nv0 + 1u) >> 1;
+
+        // P010 UV: left-justify, U then V packed in one uint32
+        uint uv_row = row >> 1;
+        uint uv_idx = uv_row * params.pairs_per_row + global_pair;
+        uv_output.data[uv_idx] = (u_avg << 6) | ((v_avg << 6) << 16);
+    }
+}

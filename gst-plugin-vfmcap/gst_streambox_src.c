@@ -35,6 +35,7 @@
 #include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <linux/dma-heap.h>
 #include <linux/videodev2.h>
 
@@ -43,7 +44,11 @@
 #include <gst/video/video.h>
 #include <gst/allocators/gstdmabuf.h>
 
+#include <vulkan/vulkan.h>
+#include <linux/dma-buf.h>
+
 #include "gst_streambox_src.h"
+#include "vdin1_amly_to_p010_spv.h"
 
 GST_DEBUG_CATEGORY_STATIC(gst_streambox_src_debug);
 #define GST_CAT_DEFAULT gst_streambox_src_debug
@@ -238,6 +243,685 @@ alloc_cma_dmabuf(GstStreamboxSrc *self, guint32 size)
     return alloc.fd;
 }
 
+/* ====================================================================
+ * VULKAN COMPUTE: AMLY -> P010 for Path B 10-bit
+ *
+ * vdin1 outputs AMLY (40-bit packed YUV422 10-bit, little-endian).
+ * We use a Vulkan compute shader to convert to P010 (semi-planar 10-bit).
+ * Modeled closely after libvfmcap's vfmcap_vulkan.c but integrated
+ * directly into the GStreamer plugin with per-instance state.
+ * ==================================================================== */
+
+/* Vulkan error check macro using GST_ERROR_OBJECT */
+#define VK_CHECK_GST(self, result, msg) do { \
+    if ((result) != VK_SUCCESS) { \
+        GST_ERROR_OBJECT(self, "%s: VkResult=%d", msg, (int)(result)); \
+        return FALSE; \
+    } \
+} while(0)
+
+/* ---------- Vulkan helpers ---------- */
+
+static gint
+vdin1_vk_find_memory_type(GstStreamboxSrc *self, uint32_t type_filter,
+                           VkMemoryPropertyFlags props)
+{
+    for (uint32_t i = 0; i < self->vk_memory_props.memoryTypeCount; i++) {
+        if ((type_filter & (1 << i)) &&
+            (self->vk_memory_props.memoryTypes[i].propertyFlags & props) == props) {
+            return (gint)i;
+        }
+    }
+    return -1;
+}
+
+/* Import a DMA-buf fd into Vulkan. fd is consumed on success. */
+static gboolean
+vdin1_vk_import_dmabuf(GstStreamboxSrc *self, int fd, VkDeviceSize size,
+                        VkBuffer *buffer, VkDeviceMemory *memory)
+{
+    VkExternalMemoryBufferCreateInfo ext_mem_info = {
+        .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+    };
+
+    VkBufferCreateInfo buffer_info = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .pNext = &ext_mem_info,
+        .size = size,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+
+    VkResult result = vkCreateBuffer(self->vk_device, &buffer_info, NULL, buffer);
+    if (result != VK_SUCCESS) {
+        GST_ERROR_OBJECT(self, "vkCreateBuffer failed: %d", result);
+        close(fd);
+        return FALSE;
+    }
+
+    VkMemoryRequirements mem_reqs;
+    vkGetBufferMemoryRequirements(self->vk_device, *buffer, &mem_reqs);
+
+    VkImportMemoryFdInfoKHR import_info = {
+        .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
+        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+        .fd = fd,
+    };
+
+    VkDeviceSize alloc_size = mem_reqs.size;
+    struct stat fd_stat;
+    if (fstat(fd, &fd_stat) == 0 && (VkDeviceSize)fd_stat.st_size > alloc_size) {
+        alloc_size = fd_stat.st_size;
+    }
+
+    gint mem_type = vdin1_vk_find_memory_type(self, mem_reqs.memoryTypeBits, 0);
+    if (mem_type < 0) {
+        GST_ERROR_OBJECT(self, "No suitable memory type for DMA-buf import");
+        vkDestroyBuffer(self->vk_device, *buffer, NULL);
+        return FALSE;
+    }
+
+    VkMemoryAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .pNext = &import_info,
+        .allocationSize = alloc_size,
+        .memoryTypeIndex = (uint32_t)mem_type,
+    };
+
+    result = vkAllocateMemory(self->vk_device, &alloc_info, NULL, memory);
+    if (result != VK_SUCCESS) {
+        GST_ERROR_OBJECT(self, "vkAllocateMemory(DMA-buf) failed: %d", result);
+        vkDestroyBuffer(self->vk_device, *buffer, NULL);
+        return FALSE;
+    }
+
+    result = vkBindBufferMemory(self->vk_device, *buffer, *memory, 0);
+    if (result != VK_SUCCESS) {
+        GST_ERROR_OBJECT(self, "vkBindBufferMemory failed: %d", result);
+        vkFreeMemory(self->vk_device, *memory, NULL);
+        vkDestroyBuffer(self->vk_device, *buffer, NULL);
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+/* ---------- DMA-buf cache for Vulkan ---------- */
+
+static void
+vdin1_vk_cache_entry_destroy(GstStreamboxSrc *self, Vdin1VkCacheEntry *entry)
+{
+    if (!entry->valid) return;
+    vkDestroyBuffer(self->vk_device, entry->buffer, NULL);
+    vkFreeMemory(self->vk_device, entry->memory, NULL);
+    entry->valid = 0;
+    entry->fd = -1;
+    entry->fd_dup = -1;
+}
+
+/* Get or create cached input DMA-buf import. Returns cache index or -1. */
+static gint
+vdin1_vk_input_cache_get(GstStreamboxSrc *self, int fd, VkDeviceSize size)
+{
+    /* Search existing */
+    for (gint i = 0; i < self->vk_input_cache_count; i++) {
+        if (self->vk_input_cache[i].valid &&
+            self->vk_input_cache[i].fd == fd &&
+            self->vk_input_cache[i].size == size) {
+            self->vk_input_cache[i].last_used = self->vk_frame_count;
+            return i;
+        }
+    }
+
+    /* Find or evict slot */
+    gint slot = -1;
+    if (self->vk_input_cache_count < VDIN1_VK_DMABUF_CACHE_SIZE) {
+        slot = self->vk_input_cache_count++;
+    } else {
+        guint64 oldest = G_MAXUINT64;
+        for (gint i = 0; i < VDIN1_VK_DMABUF_CACHE_SIZE; i++) {
+            if (self->vk_input_cache[i].last_used < oldest) {
+                oldest = self->vk_input_cache[i].last_used;
+                slot = i;
+            }
+        }
+        vdin1_vk_cache_entry_destroy(self, &self->vk_input_cache[slot]);
+    }
+
+    /* dup fd because vkAllocateMemory consumes it */
+    int fd_dup = dup(fd);
+    if (fd_dup < 0) {
+        GST_ERROR_OBJECT(self, "dup(input fd %d) failed: %s", fd, strerror(errno));
+        return -1;
+    }
+
+    VkBuffer buffer;
+    VkDeviceMemory memory;
+    if (!vdin1_vk_import_dmabuf(self, fd_dup, size, &buffer, &memory)) {
+        return -1;
+    }
+
+    self->vk_input_cache[slot].fd = fd;
+    self->vk_input_cache[slot].fd_dup = fd_dup;
+    self->vk_input_cache[slot].buffer = buffer;
+    self->vk_input_cache[slot].memory = memory;
+    self->vk_input_cache[slot].size = size;
+    self->vk_input_cache[slot].valid = 1;
+    self->vk_input_cache[slot].last_used = self->vk_frame_count;
+
+    return slot;
+}
+
+/* Get or create cached output DMA-buf import. Returns TRUE on success. */
+static gboolean
+vdin1_vk_output_cache_get(GstStreamboxSrc *self, int fd, VkDeviceSize size)
+{
+    if (self->vk_output_cache.valid &&
+        self->vk_output_cache.fd == fd &&
+        self->vk_output_cache.size == size) {
+        return TRUE;
+    }
+
+    if (self->vk_output_cache.valid) {
+        vdin1_vk_cache_entry_destroy(self, &self->vk_output_cache);
+    }
+
+    int fd_dup = dup(fd);
+    if (fd_dup < 0) {
+        GST_ERROR_OBJECT(self, "dup(output fd %d) failed: %s", fd, strerror(errno));
+        return FALSE;
+    }
+
+    VkBuffer buffer;
+    VkDeviceMemory memory;
+    if (!vdin1_vk_import_dmabuf(self, fd_dup, size, &buffer, &memory)) {
+        return FALSE;
+    }
+
+    self->vk_output_cache.fd = fd;
+    self->vk_output_cache.fd_dup = fd_dup;
+    self->vk_output_cache.buffer = buffer;
+    self->vk_output_cache.memory = memory;
+    self->vk_output_cache.size = size;
+    self->vk_output_cache.valid = 1;
+
+    return TRUE;
+}
+
+/* ---------- Vulkan init ---------- */
+
+static gboolean
+vdin1_vk_init(GstStreamboxSrc *self)
+{
+    if (self->vk_initialized)
+        return TRUE;
+
+    VkResult result;
+
+    /* Instance */
+    VkApplicationInfo app_info = {
+        .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+        .pApplicationName = "StreamboxSrcVdin1",
+        .applicationVersion = VK_MAKE_VERSION(1, 0, 0),
+        .pEngineName = "VulkanCompute",
+        .engineVersion = VK_MAKE_VERSION(1, 0, 0),
+        .apiVersion = VK_API_VERSION_1_2,
+    };
+
+    const char *inst_exts[] = {
+        VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME,
+        VK_KHR_EXTERNAL_SEMAPHORE_CAPABILITIES_EXTENSION_NAME,
+    };
+
+    VkInstanceCreateInfo instance_info = {
+        .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+        .pApplicationInfo = &app_info,
+        .enabledExtensionCount = 2,
+        .ppEnabledExtensionNames = inst_exts,
+    };
+
+    result = vkCreateInstance(&instance_info, NULL, &self->vk_instance);
+    VK_CHECK_GST(self, result, "vkCreateInstance");
+
+    /* Physical device selection — find compute queue */
+    uint32_t dev_count = 0;
+    vkEnumeratePhysicalDevices(self->vk_instance, &dev_count, NULL);
+    if (dev_count == 0) {
+        GST_ERROR_OBJECT(self, "No Vulkan physical devices found");
+        return FALSE;
+    }
+
+    VkPhysicalDevice *devices = g_new(VkPhysicalDevice, dev_count);
+    vkEnumeratePhysicalDevices(self->vk_instance, &dev_count, devices);
+
+    self->vk_physical_device = VK_NULL_HANDLE;
+    for (uint32_t i = 0; i < dev_count; i++) {
+        uint32_t qf_count = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(devices[i], &qf_count, NULL);
+        VkQueueFamilyProperties *qf_props = g_new(VkQueueFamilyProperties, qf_count);
+        vkGetPhysicalDeviceQueueFamilyProperties(devices[i], &qf_count, qf_props);
+
+        for (uint32_t j = 0; j < qf_count; j++) {
+            if (qf_props[j].queueFlags & VK_QUEUE_COMPUTE_BIT) {
+                self->vk_physical_device = devices[i];
+                self->vk_queue_family = j;
+                break;
+            }
+        }
+        g_free(qf_props);
+        if (self->vk_physical_device != VK_NULL_HANDLE)
+            break;
+    }
+    g_free(devices);
+
+    if (self->vk_physical_device == VK_NULL_HANDLE) {
+        GST_ERROR_OBJECT(self, "No Vulkan device with compute support");
+        return FALSE;
+    }
+
+    vkGetPhysicalDeviceMemoryProperties(self->vk_physical_device,
+                                         &self->vk_memory_props);
+
+    /* Logical device */
+    float priority = 1.0f;
+    VkDeviceQueueCreateInfo queue_info = {
+        .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+        .queueFamilyIndex = self->vk_queue_family,
+        .queueCount = 1,
+        .pQueuePriorities = &priority,
+    };
+
+    const char *dev_exts[] = {
+        VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
+        VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
+        VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME,
+        VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
+        VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME,
+    };
+
+    VkDeviceCreateInfo device_info = {
+        .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+        .queueCreateInfoCount = 1,
+        .pQueueCreateInfos = &queue_info,
+        .enabledExtensionCount = 5,
+        .ppEnabledExtensionNames = dev_exts,
+    };
+
+    result = vkCreateDevice(self->vk_physical_device, &device_info, NULL,
+                            &self->vk_device);
+    VK_CHECK_GST(self, result, "vkCreateDevice");
+
+    vkGetDeviceQueue(self->vk_device, self->vk_queue_family, 0,
+                     &self->vk_compute_queue);
+
+    /* Command pool */
+    VkCommandPoolCreateInfo pool_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .queueFamilyIndex = self->vk_queue_family,
+        .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT |
+                 VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
+    };
+
+    result = vkCreateCommandPool(self->vk_device, &pool_info, NULL,
+                                  &self->vk_command_pool);
+    VK_CHECK_GST(self, result, "vkCreateCommandPool");
+
+    /* Command buffer */
+    VkCommandBufferAllocateInfo cmd_alloc = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = self->vk_command_pool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1,
+    };
+
+    result = vkAllocateCommandBuffers(self->vk_device, &cmd_alloc,
+                                       &self->vk_command_buffer);
+    VK_CHECK_GST(self, result, "vkAllocateCommandBuffers");
+
+    /* Fence (start signaled for first reset) */
+    VkFenceCreateInfo fence_info = {
+        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+        .flags = VK_FENCE_CREATE_SIGNALED_BIT,
+    };
+
+    result = vkCreateFence(self->vk_device, &fence_info, NULL, &self->vk_fence);
+    VK_CHECK_GST(self, result, "vkCreateFence");
+
+    /* Descriptor pool: 3 storage buffers */
+    VkDescriptorPoolSize desc_pool_sizes[] = {
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 },
+    };
+
+    VkDescriptorPoolCreateInfo desc_pool_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 1,
+        .poolSizeCount = 1,
+        .pPoolSizes = desc_pool_sizes,
+    };
+
+    result = vkCreateDescriptorPool(self->vk_device, &desc_pool_info, NULL,
+                                     &self->vk_descriptor_pool);
+    VK_CHECK_GST(self, result, "vkCreateDescriptorPool");
+
+    /* Descriptor set layout: 3 storage buffers (input, Y-out, UV-out) */
+    VkDescriptorSetLayoutBinding bindings[] = {
+        { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+          .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT },
+        { .binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+          .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT },
+        { .binding = 2, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+          .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT },
+    };
+
+    VkDescriptorSetLayoutCreateInfo layout_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 3,
+        .pBindings = bindings,
+    };
+
+    result = vkCreateDescriptorSetLayout(self->vk_device, &layout_info, NULL,
+                                          &self->vk_descriptor_set_layout);
+    VK_CHECK_GST(self, result, "vkCreateDescriptorSetLayout");
+
+    /* Descriptor set */
+    VkDescriptorSetAllocateInfo desc_alloc = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = self->vk_descriptor_pool,
+        .descriptorSetCount = 1,
+        .pSetLayouts = &self->vk_descriptor_set_layout,
+    };
+
+    result = vkAllocateDescriptorSets(self->vk_device, &desc_alloc,
+                                       &self->vk_descriptor_set);
+    VK_CHECK_GST(self, result, "vkAllocateDescriptorSets");
+
+    /* Pipeline layout: push constants = { width, height, pairs_per_row, reserved } */
+    VkPushConstantRange push_constant = {
+        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        .offset = 0,
+        .size = sizeof(uint32_t) * 4,
+    };
+
+    VkPipelineLayoutCreateInfo pl_layout_info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1,
+        .pSetLayouts = &self->vk_descriptor_set_layout,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &push_constant,
+    };
+
+    result = vkCreatePipelineLayout(self->vk_device, &pl_layout_info, NULL,
+                                     &self->vk_pipeline_layout);
+    VK_CHECK_GST(self, result, "vkCreatePipelineLayout");
+
+    /* Load P010 shader */
+    VkShaderModuleCreateInfo shader_info = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = sizeof(vdin1_amly_to_p010_spv),
+        .pCode = (const uint32_t *)vdin1_amly_to_p010_spv,
+    };
+
+    result = vkCreateShaderModule(self->vk_device, &shader_info, NULL,
+                                   &self->vk_shader_p010);
+    VK_CHECK_GST(self, result, "vkCreateShaderModule(P010)");
+
+    /* Create P010 compute pipeline */
+    VkComputePipelineCreateInfo pipeline_info = {
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+            .module = self->vk_shader_p010,
+            .pName = "main",
+        },
+        .layout = self->vk_pipeline_layout,
+    };
+
+    result = vkCreateComputePipelines(self->vk_device, VK_NULL_HANDLE, 1,
+                                       &pipeline_info, NULL,
+                                       &self->vk_pipeline_p010);
+    VK_CHECK_GST(self, result, "vkCreateComputePipelines(P010)");
+
+    /* Init caches */
+    self->vk_input_cache_count = 0;
+    self->vk_output_cache.valid = 0;
+    self->vk_output_cache.fd = -1;
+    self->vk_pending_in_fd = -1;
+    self->vk_has_pending = FALSE;
+    self->vk_frame_count = 0;
+
+    for (gint i = 0; i < VDIN1_VK_DMABUF_CACHE_SIZE; i++) {
+        self->vk_input_cache[i].valid = 0;
+        self->vk_input_cache[i].fd = -1;
+    }
+
+    self->vk_initialized = TRUE;
+
+    GST_INFO_OBJECT(self, "Vulkan P010 pipeline initialized for vdin1 10-bit");
+    return TRUE;
+}
+
+/* ---------- Vulkan synchronous convert ---------- */
+
+static gboolean
+vdin1_vk_convert(GstStreamboxSrc *self, int in_fd, int out_fd,
+                  guint32 width, guint32 height)
+{
+    if (!self->vk_initialized) {
+        GST_ERROR_OBJECT(self, "Vulkan not initialized");
+        return FALSE;
+    }
+
+    VkResult result;
+
+    /* Calculate buffer sizes */
+    VkDeviceSize input_size = (VkDeviceSize)width * height * 5 / 2;  /* AMLY: 20 bpp */
+    VkDeviceSize y_plane_size = (VkDeviceSize)width * height * 2;    /* P010 Y: 16-bit */
+    VkDeviceSize uv_plane_size = (VkDeviceSize)width * height;       /* P010 UV: 16-bit, half height */
+    VkDeviceSize output_size = y_plane_size + uv_plane_size;
+
+    /* Import input DMA-buf (cached) */
+    gint in_idx = vdin1_vk_input_cache_get(self, in_fd, input_size);
+    if (in_idx < 0) return FALSE;
+
+    /* DMA_BUF_SYNC start read */
+    struct dma_buf_sync sync_start = {
+        .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ
+    };
+    ioctl(in_fd, DMA_BUF_IOCTL_SYNC, &sync_start);
+
+    VkBuffer in_buffer = self->vk_input_cache[in_idx].buffer;
+
+    /* Import output DMA-buf (cached) */
+    if (!vdin1_vk_output_cache_get(self, out_fd, output_size))
+        goto sync_end;
+
+    VkBuffer out_buffer = self->vk_output_cache.buffer;
+
+    /* Wait for previous fence before resetting command pool */
+    if (self->vk_frame_count == 0) {
+        vkResetFences(self->vk_device, 1, &self->vk_fence);
+    }
+
+    /* Record command buffer */
+    result = vkResetCommandPool(self->vk_device, self->vk_command_pool, 0);
+    if (result != VK_SUCCESS) {
+        GST_ERROR_OBJECT(self, "vkResetCommandPool failed: %d", result);
+        goto sync_end;
+    }
+
+    VkCommandBufferBeginInfo begin_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+
+    result = vkBeginCommandBuffer(self->vk_command_buffer, &begin_info);
+    if (result != VK_SUCCESS) {
+        GST_ERROR_OBJECT(self, "vkBeginCommandBuffer failed: %d", result);
+        goto sync_end;
+    }
+
+    /* Update descriptors */
+    VkDescriptorBufferInfo buffer_infos[] = {
+        { in_buffer, 0, input_size },
+        { out_buffer, 0, y_plane_size },
+        { out_buffer, y_plane_size, uv_plane_size },
+    };
+
+    VkWriteDescriptorSet writes[] = {
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+          .dstSet = self->vk_descriptor_set, .dstBinding = 0,
+          .descriptorCount = 1,
+          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+          .pBufferInfo = &buffer_infos[0] },
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+          .dstSet = self->vk_descriptor_set, .dstBinding = 1,
+          .descriptorCount = 1,
+          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+          .pBufferInfo = &buffer_infos[1] },
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+          .dstSet = self->vk_descriptor_set, .dstBinding = 2,
+          .descriptorCount = 1,
+          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+          .pBufferInfo = &buffer_infos[2] },
+    };
+
+    vkUpdateDescriptorSets(self->vk_device, 3, writes, 0, NULL);
+
+    /* Bind pipeline and descriptors */
+    vkCmdBindPipeline(self->vk_command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                      self->vk_pipeline_p010);
+    vkCmdBindDescriptorSets(self->vk_command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            self->vk_pipeline_layout, 0, 1,
+                            &self->vk_descriptor_set, 0, NULL);
+
+    /* Push constants: { width, height, pairs_per_row, reserved } */
+    uint32_t pairs_per_row = width / 2;
+    uint32_t push_data[] = { width, height, pairs_per_row, 0u };
+    vkCmdPushConstants(self->vk_command_buffer, self->vk_pipeline_layout,
+                       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_data), push_data);
+
+    /* Dispatch: local_size=(128,1,1), groups_x = ceil(pairs_per_row/128), groups_y = height */
+    uint32_t groups_x = (pairs_per_row + 127) / 128;
+    uint32_t groups_y = height;
+    vkCmdDispatch(self->vk_command_buffer, groups_x, groups_y, 1);
+
+    /* Memory barrier */
+    VkMemoryBarrier barrier = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_HOST_READ_BIT,
+    };
+
+    vkCmdPipelineBarrier(self->vk_command_buffer,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_HOST_BIT |
+                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                         0, 1, &barrier, 0, NULL, 0, NULL);
+
+    result = vkEndCommandBuffer(self->vk_command_buffer);
+    if (result != VK_SUCCESS) {
+        GST_ERROR_OBJECT(self, "vkEndCommandBuffer failed: %d", result);
+        goto sync_end;
+    }
+
+    /* Submit */
+    VkSubmitInfo submit_info = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &self->vk_command_buffer,
+    };
+
+    result = vkQueueSubmit(self->vk_compute_queue, 1, &submit_info, self->vk_fence);
+    if (result != VK_SUCCESS) {
+        GST_ERROR_OBJECT(self, "vkQueueSubmit failed: %d", result);
+        goto sync_end;
+    }
+
+    /* Wait for completion (5 second timeout) */
+    result = vkWaitForFences(self->vk_device, 1, &self->vk_fence,
+                              VK_TRUE, 5000000000ULL);
+
+    /* Release DMA-buf read access */
+    struct dma_buf_sync sync_end_s = {
+        .flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ
+    };
+    ioctl(in_fd, DMA_BUF_IOCTL_SYNC, &sync_end_s);
+
+    if (result != VK_SUCCESS) {
+        GST_ERROR_OBJECT(self, "vkWaitForFences failed: %d (frame %lu)",
+                         result, (unsigned long)self->vk_frame_count);
+        return FALSE;
+    }
+
+    vkResetFences(self->vk_device, 1, &self->vk_fence);
+    self->vk_frame_count++;
+
+    return TRUE;
+
+sync_end:
+    {
+        struct dma_buf_sync sync_end_s2 = {
+            .flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ
+        };
+        ioctl(in_fd, DMA_BUF_IOCTL_SYNC, &sync_end_s2);
+    }
+    return FALSE;
+}
+
+/* ---------- Vulkan cleanup ---------- */
+
+static void
+vdin1_vk_cleanup(GstStreamboxSrc *self)
+{
+    if (!self->vk_initialized) return;
+
+    vkDeviceWaitIdle(self->vk_device);
+
+    for (gint i = 0; i < self->vk_input_cache_count; i++) {
+        vdin1_vk_cache_entry_destroy(self, &self->vk_input_cache[i]);
+    }
+    self->vk_input_cache_count = 0;
+
+    vdin1_vk_cache_entry_destroy(self, &self->vk_output_cache);
+
+    if (self->vk_fence != VK_NULL_HANDLE)
+        vkDestroyFence(self->vk_device, self->vk_fence, NULL);
+    if (self->vk_pipeline_p010 != VK_NULL_HANDLE)
+        vkDestroyPipeline(self->vk_device, self->vk_pipeline_p010, NULL);
+    if (self->vk_pipeline_layout != VK_NULL_HANDLE)
+        vkDestroyPipelineLayout(self->vk_device, self->vk_pipeline_layout, NULL);
+    if (self->vk_shader_p010 != VK_NULL_HANDLE)
+        vkDestroyShaderModule(self->vk_device, self->vk_shader_p010, NULL);
+    if (self->vk_descriptor_set_layout != VK_NULL_HANDLE)
+        vkDestroyDescriptorSetLayout(self->vk_device,
+                                      self->vk_descriptor_set_layout, NULL);
+    if (self->vk_descriptor_pool != VK_NULL_HANDLE)
+        vkDestroyDescriptorPool(self->vk_device, self->vk_descriptor_pool, NULL);
+    if (self->vk_command_pool != VK_NULL_HANDLE)
+        vkDestroyCommandPool(self->vk_device, self->vk_command_pool, NULL);
+    if (self->vk_device != VK_NULL_HANDLE)
+        vkDestroyDevice(self->vk_device, NULL);
+    if (self->vk_instance != VK_NULL_HANDLE)
+        vkDestroyInstance(self->vk_instance, NULL);
+
+    self->vk_instance = VK_NULL_HANDLE;
+    self->vk_device = VK_NULL_HANDLE;
+    self->vk_physical_device = VK_NULL_HANDLE;
+    self->vk_fence = VK_NULL_HANDLE;
+    self->vk_pipeline_p010 = VK_NULL_HANDLE;
+    self->vk_pipeline_layout = VK_NULL_HANDLE;
+    self->vk_shader_p010 = VK_NULL_HANDLE;
+    self->vk_descriptor_set_layout = VK_NULL_HANDLE;
+    self->vk_descriptor_pool = VK_NULL_HANDLE;
+    self->vk_command_pool = VK_NULL_HANDLE;
+    self->vk_initialized = FALSE;
+
+    GST_INFO_OBJECT(self, "Vulkan cleanup complete (%lu frames converted)",
+                     (unsigned long)self->vk_frame_count);
+}
+
 /* ---------- V4L2 helpers (Path B) ---------- */
 
 static int
@@ -334,18 +1018,29 @@ vdin1_get_format(GstStreamboxSrc *self, guint *w, guint *h, guint32 *pixfmt,
     return TRUE;
 }
 
-/* Set format on vdin1 via VIDIOC_S_FMT (multi-plane). Request NV21. */
+/*
+ * Set format on vdin1 via VIDIOC_S_FMT (multi-plane).
+ * 8-bit mode: Request NV21 (VPP-processed output).
+ * 10-bit mode (output-format=p010): Request AMLY (40-bit packed YUV422 10-bit).
+ */
+#define V4L2_PIX_FMT_AMLY v4l2_fourcc('A','M','L','Y')
+
 static gboolean
 vdin1_set_format(GstStreamboxSrc *self, guint w, guint h)
 {
+    gboolean want_10bit = (self->output_fmt == GST_STREAMBOX_OUTPUT_P010);
+
     struct v4l2_format fmt;
     memset(&fmt, 0, sizeof(fmt));
     fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
     fmt.fmt.pix_mp.width = w;
     fmt.fmt.pix_mp.height = h;
-    fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV21;
+    fmt.fmt.pix_mp.pixelformat = want_10bit ? V4L2_PIX_FMT_AMLY : V4L2_PIX_FMT_NV21;
     fmt.fmt.pix_mp.num_planes = 1;
     fmt.fmt.pix_mp.field = V4L2_FIELD_NONE;
+
+    GST_INFO_OBJECT(self, "vdin1: requesting %s format %ux%u",
+                     want_10bit ? "AMLY (10-bit)" : "NV21 (8-bit)", w, h);
 
     if (xioctl(self->vdin1_fd, VIDIOC_S_FMT, &fmt) < 0) {
         GST_ERROR_OBJECT(self, "VIDIOC_S_FMT failed: %s", strerror(errno));
@@ -363,13 +1058,35 @@ vdin1_set_format(GstStreamboxSrc *self, guint w, guint h)
     fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
     if (xioctl(self->vdin1_fd, VIDIOC_G_FMT, &fmt) == 0) {
         self->vdin1_sizeimage = fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
-        GST_INFO_OBJECT(self, "vdin1: sizeimage=%u (actual NV21=%u, padding=%u)",
-                        self->vdin1_sizeimage,
-                        self->width * self->height * 3 / 2,
-                        self->vdin1_sizeimage - self->width * self->height * 3 / 2);
     } else {
-        /* Fallback */
-        self->vdin1_sizeimage = self->width * self->height * 3 / 2;
+        /* Fallback based on format */
+        if (want_10bit)
+            self->vdin1_sizeimage = w * h * 5 / 2;  /* AMLY: 20 bpp */
+        else
+            self->vdin1_sizeimage = w * h * 3 / 2;  /* NV21: 12 bpp */
+    }
+
+    /* Check if we actually got AMLY when we asked for 10-bit */
+    self->vdin1_10bit = (self->vdin1_pixfmt == V4L2_PIX_FMT_AMLY);
+
+    if (want_10bit && !self->vdin1_10bit) {
+        GST_WARNING_OBJECT(self, "Requested AMLY but got pixfmt=0x%08x, "
+                           "falling back to 8-bit mode", self->vdin1_pixfmt);
+    }
+
+    if (self->vdin1_10bit) {
+        self->vdin1_amly_sizeimage = self->vdin1_sizeimage;
+        GST_INFO_OBJECT(self, "vdin1: AMLY 10-bit sizeimage=%u "
+                         "(expected=%u, bytesperline=%u)",
+                         self->vdin1_sizeimage,
+                         self->width * self->height * 5 / 2,
+                         self->width * 5 / 2);
+    } else {
+        self->vdin1_amly_sizeimage = 0;
+        GST_INFO_OBJECT(self, "vdin1: NV21 sizeimage=%u (actual NV21=%u, padding=%u)",
+                         self->vdin1_sizeimage,
+                         self->width * self->height * 3 / 2,
+                         self->vdin1_sizeimage - self->width * self->height * 3 / 2);
     }
 
     return TRUE;
@@ -538,7 +1255,9 @@ gst_streambox_src_class_init(GstStreamboxSrcClass *klass)
 
     g_object_class_install_property(gobject_class, PROP_OUTPUT_FORMAT,
         g_param_spec_enum("output-format", "Output Format",
-            "Output pixel format (Path A only: NV12 or P010)",
+            "Output pixel format: NV12/NV21 (8-bit) or P010 (10-bit). "
+            "Path A: GPU converts AMLY->NV12 or P010. "
+            "Path B: NV21 zero-copy (8-bit) or GPU converts AMLY->P010 (10-bit).",
             GST_TYPE_STREAMBOX_OUTPUT_FORMAT,
             DEFAULT_OUTPUT_FMT,
             G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
@@ -627,6 +1346,31 @@ gst_streambox_src_init(GstStreamboxSrc *self)
         self->vdin1_bufs[i].size = 0;
         self->vdin1_bufs[i].queued = FALSE;
     }
+
+    /* Path B Vulkan */
+    self->vdin1_10bit = FALSE;
+    self->vdin1_amly_sizeimage = 0;
+    self->vk_instance = VK_NULL_HANDLE;
+    self->vk_physical_device = VK_NULL_HANDLE;
+    self->vk_device = VK_NULL_HANDLE;
+    self->vk_compute_queue = VK_NULL_HANDLE;
+    self->vk_queue_family = 0;
+    self->vk_command_pool = VK_NULL_HANDLE;
+    self->vk_command_buffer = VK_NULL_HANDLE;
+    self->vk_fence = VK_NULL_HANDLE;
+    self->vk_descriptor_pool = VK_NULL_HANDLE;
+    self->vk_descriptor_set_layout = VK_NULL_HANDLE;
+    self->vk_descriptor_set = VK_NULL_HANDLE;
+    self->vk_pipeline_layout = VK_NULL_HANDLE;
+    self->vk_pipeline_p010 = VK_NULL_HANDLE;
+    self->vk_shader_p010 = VK_NULL_HANDLE;
+    self->vk_initialized = FALSE;
+    self->vk_frame_count = 0;
+    self->vk_input_cache_count = 0;
+    self->vk_output_cache.valid = 0;
+    self->vk_output_cache.fd = -1;
+    self->vk_pending_in_fd = -1;
+    self->vk_has_pending = FALSE;
 
     /* Flush pipe */
     self->flushing = FALSE;
@@ -836,7 +1580,7 @@ static const gchar *
 get_caps_format_string(GstStreamboxSrc *self)
 {
     if (self->source_mode == GST_STREAMBOX_SOURCE_VDIN1) {
-        return "NV21";
+        return self->vdin1_10bit ? "P010_10LE" : "NV21";
     }
     /* Path A */
     return (self->output_fmt == GST_STREAMBOX_OUTPUT_P010)
@@ -1273,17 +2017,30 @@ start_path_b(GstStreamboxSrc *self)
     if (!vdin1_streamon(self))
         goto fail;
 
+    /* Initialize Vulkan for 10-bit AMLY->P010 conversion */
+    if (self->vdin1_10bit) {
+        if (!vdin1_vk_init(self)) {
+            GST_ELEMENT_ERROR(self, RESOURCE, FAILED,
+                              ("Failed to initialize Vulkan for P010 conversion"),
+                              (NULL));
+            vdin1_streamoff(self);
+            goto fail;
+        }
+    }
+
     self->streaming = TRUE;
     self->sig_state = GST_STREAMBOX_STATE_STREAMING;
     self->fps_n = 60;
     self->fps_d = 1;
 
-    GST_INFO_OBJECT(self, "Path B started: %ux%u NV21 (source %ux%u, %u bufs)",
-                     self->width, self->height, src_w, src_h,
-                     self->vdin1_n_bufs);
+    GST_INFO_OBJECT(self, "Path B started: %ux%u %s (source %ux%u, %u bufs)",
+                     self->width, self->height,
+                     self->vdin1_10bit ? "AMLY->P010" : "NV21",
+                     src_w, src_h, self->vdin1_n_bufs);
     return TRUE;
 
 fail:
+    vdin1_vk_cleanup(self);
     vdin1_free_dmabufs(self);
     close(self->vdin1_fd);
     self->vdin1_fd = -1;
@@ -1293,6 +2050,9 @@ fail:
 static void
 stop_path_b(GstStreamboxSrc *self)
 {
+    /* Clean up Vulkan before releasing DMA-bufs */
+    vdin1_vk_cleanup(self);
+
     if (self->vdin1_fd >= 0) {
         vdin1_streamoff(self);
 
@@ -1570,79 +2330,175 @@ retry:
 
     self->vdin1_bufs[idx].queued = FALSE;
 
-    /*
-     * Zero-copy DMA-buf path.
-     * vdin1 wrote directly into our pre-allocated DMA-buf via DMABUF mode.
-     * We dup() the fd and wrap it with gst_dmabuf_allocator_alloc().
-     * The original fd stays owned by us for re-QBUF.
-     * When the GstBuffer is freed by downstream, the dispose callback
-     * re-QBUFs the buffer back to vdin1.
-     */
-    guint32 actual_size = self->width * self->height * 3 / 2;
+    if (self->vdin1_10bit) {
+        /*
+         * 10-bit path: AMLY -> P010 via Vulkan GPU conversion.
+         *
+         * vdin1 captured into a CMA DMA-buf in AMLY (40-bit packed YUV422 10-bit).
+         * We allocate an output DMA-buf from system-uncached heap for the P010 result,
+         * run the Vulkan compute shader to convert, then re-QBUF the vdin1 buffer
+         * immediately (since the output buffer is different from the input).
+         * The output DMA-buf fd is wrapped in a GstBuffer for downstream.
+         */
+        guint32 p010_size = self->width * self->height * 3;  /* Y=w*h*2 + UV=w*h*1 */
 
-    int dup_fd = dup(self->vdin1_bufs[idx].dma_fd);
-    if (dup_fd < 0) {
-        GST_ERROR_OBJECT(self, "dup(fd=%d) failed: %s",
-                         self->vdin1_bufs[idx].dma_fd, strerror(errno));
-        /* Re-QBUF immediately since we can't use this buffer */
-        goto qbuf_return;
+        int out_fd = alloc_output_dmabuf(self, p010_size);
+        if (out_fd < 0) {
+            GST_ERROR_OBJECT(self, "Failed to allocate P010 output DMA-buf (%u bytes)",
+                             p010_size);
+            goto qbuf_return;
+        }
+
+        /* Run Vulkan AMLY -> P010 conversion */
+        if (!vdin1_vk_convert(self, self->vdin1_bufs[idx].dma_fd, out_fd,
+                              self->width, self->height)) {
+            GST_ERROR_OBJECT(self, "Vulkan AMLY->P010 conversion failed");
+            close(out_fd);
+            goto qbuf_return;
+        }
+
+        /* Re-QBUF the vdin1 capture buffer immediately — we're done reading it */
+        {
+            struct v4l2_buffer qbuf;
+            struct v4l2_plane qplanes[1];
+            memset(&qbuf, 0, sizeof(qbuf));
+            memset(&qplanes, 0, sizeof(qplanes));
+            qbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+            qbuf.memory = V4L2_MEMORY_DMABUF;
+            qbuf.index = idx;
+            qbuf.m.planes = qplanes;
+            qbuf.length = 1;
+            qplanes[0].m.fd = self->vdin1_bufs[idx].dma_fd;
+            qplanes[0].length = self->vdin1_bufs[idx].size;
+
+            if (xioctl(self->vdin1_fd, VIDIOC_QBUF, &qbuf) < 0) {
+                GST_WARNING_OBJECT(self, "re-QBUF(%u) after convert failed: %s",
+                                   idx, strerror(errno));
+            } else {
+                self->vdin1_bufs[idx].queued = TRUE;
+            }
+        }
+
+        /* Wrap output DMA-buf fd in GstBuffer */
+        GstAllocator *dmabuf_alloc = gst_dmabuf_allocator_new();
+        GstMemory *mem = gst_dmabuf_allocator_alloc(dmabuf_alloc, out_fd, p010_size);
+        gst_object_unref(dmabuf_alloc);
+
+        if (!mem) {
+            GST_ERROR_OBJECT(self, "gst_dmabuf_allocator_alloc(fd=%d) failed", out_fd);
+            close(out_fd);
+            return GST_FLOW_ERROR;
+        }
+
+        GstBuffer *buffer = gst_buffer_new();
+        gst_buffer_append_memory(buffer, mem);
+
+        /* Set timestamps */
+        GST_BUFFER_PTS(buffer) = (guint64)v4l2_buf.timestamp.tv_sec * GST_SECOND +
+                                  (guint64)v4l2_buf.timestamp.tv_usec * GST_USECOND;
+        GST_BUFFER_DURATION(buffer) = gst_util_uint64_scale_int(GST_SECOND,
+                                                                 self->fps_d,
+                                                                 self->fps_n);
+
+        /* Add video meta for P010 */
+        gsize offsets[GST_VIDEO_MAX_PLANES] = { 0, };
+        gint strides[GST_VIDEO_MAX_PLANES] = { 0, };
+        strides[0] = self->width * 2;       /* P010 Y stride: 16-bit per pixel */
+        strides[1] = self->width * 2;       /* P010 UV stride: 16-bit per component, interleaved */
+        offsets[0] = 0;
+        offsets[1] = (gsize)self->width * self->height * 2;  /* UV plane after Y plane */
+
+        gst_buffer_add_video_meta_full(buffer, GST_VIDEO_FRAME_FLAG_NONE,
+                                        GST_VIDEO_FORMAT_P010_10LE,
+                                        self->width, self->height,
+                                        2, offsets, strides);
+
+        self->frame_count++;
+
+        if (self->frame_count == 1 || self->frame_count % 300 == 0) {
+            GST_INFO_OBJECT(self, "Path B frame %lu: %ux%u P010 (AMLY->Vulkan) out_fd=%d",
+                             (unsigned long)self->frame_count,
+                             self->width, self->height, out_fd);
+        }
+
+        *buf = buffer;
+        return GST_FLOW_OK;
+
+    } else {
+        /*
+         * 8-bit path: NV21 zero-copy passthrough.
+         *
+         * vdin1 wrote directly into our pre-allocated CMA DMA-buf via DMABUF mode.
+         * We dup() the fd and wrap it with gst_dmabuf_allocator_alloc().
+         * The original fd stays owned by us for re-QBUF.
+         * When the GstBuffer is freed by downstream, the dispose callback
+         * re-QBUFs the buffer back to vdin1.
+         */
+        guint32 actual_size = self->width * self->height * 3 / 2;
+
+        int dup_fd = dup(self->vdin1_bufs[idx].dma_fd);
+        if (dup_fd < 0) {
+            GST_ERROR_OBJECT(self, "dup(fd=%d) failed: %s",
+                             self->vdin1_bufs[idx].dma_fd, strerror(errno));
+            goto qbuf_return;
+        }
+
+        GstAllocator *dmabuf_alloc = gst_dmabuf_allocator_new();
+        GstMemory *mem = gst_dmabuf_allocator_alloc(dmabuf_alloc, dup_fd, actual_size);
+        gst_object_unref(dmabuf_alloc);
+
+        if (!mem) {
+            GST_ERROR_OBJECT(self, "gst_dmabuf_allocator_alloc(fd=%d) failed", dup_fd);
+            close(dup_fd);
+            goto qbuf_return;
+        }
+
+        GstBuffer *buffer = gst_buffer_new();
+        gst_buffer_append_memory(buffer, mem);
+
+        /* Set timestamps */
+        GST_BUFFER_PTS(buffer) = (guint64)v4l2_buf.timestamp.tv_sec * GST_SECOND +
+                                  (guint64)v4l2_buf.timestamp.tv_usec * GST_USECOND;
+        GST_BUFFER_DURATION(buffer) = gst_util_uint64_scale_int(GST_SECOND,
+                                                                 self->fps_d,
+                                                                 self->fps_n);
+
+        /* Add video meta for NV21 */
+        gsize offsets[GST_VIDEO_MAX_PLANES] = { 0, };
+        gint strides[GST_VIDEO_MAX_PLANES] = { 0, };
+        strides[0] = self->width;
+        strides[1] = self->width;
+        offsets[0] = 0;
+        offsets[1] = (gsize)self->width * self->height;
+
+        gst_buffer_add_video_meta_full(buffer, GST_VIDEO_FRAME_FLAG_NONE,
+                                        GST_VIDEO_FORMAT_NV21,
+                                        self->width, self->height,
+                                        2, offsets, strides);
+
+        /*
+         * Attach dispose callback: when downstream unrefs this GstBuffer,
+         * we re-QBUF the V4L2 buffer so vdin1 can reuse it.
+         */
+        PathBBufContext *ctx = g_new(PathBBufContext, 1);
+        ctx->self = GST_STREAMBOX_SRC(gst_object_ref(self));
+        ctx->buf_index = idx;
+        gst_mini_object_set_qdata(GST_MINI_OBJECT(buffer),
+                                   g_quark_from_static_string("pathb-ctx"),
+                                   ctx, path_b_buf_release);
+
+        self->frame_count++;
+
+        if (self->frame_count == 1 || self->frame_count % 300 == 0) {
+            GST_INFO_OBJECT(self, "Path B frame %lu: %ux%u NV21 zero-copy fd=%d",
+                             (unsigned long)self->frame_count,
+                             self->width, self->height,
+                             self->vdin1_bufs[idx].dma_fd);
+        }
+
+        *buf = buffer;
+        return GST_FLOW_OK;
     }
-
-    GstAllocator *dmabuf_alloc = gst_dmabuf_allocator_new();
-    GstMemory *mem = gst_dmabuf_allocator_alloc(dmabuf_alloc, dup_fd, actual_size);
-    gst_object_unref(dmabuf_alloc);
-
-    if (!mem) {
-        GST_ERROR_OBJECT(self, "gst_dmabuf_allocator_alloc(fd=%d) failed", dup_fd);
-        close(dup_fd);
-        goto qbuf_return;
-    }
-
-    GstBuffer *buffer = gst_buffer_new();
-    gst_buffer_append_memory(buffer, mem);
-
-    /* Set timestamps */
-    GST_BUFFER_PTS(buffer) = (guint64)v4l2_buf.timestamp.tv_sec * GST_SECOND +
-                              (guint64)v4l2_buf.timestamp.tv_usec * GST_USECOND;
-    GST_BUFFER_DURATION(buffer) = gst_util_uint64_scale_int(GST_SECOND,
-                                                             self->fps_d,
-                                                             self->fps_n);
-
-    /* Add video meta for NV21 */
-    gsize offsets[GST_VIDEO_MAX_PLANES] = { 0, };
-    gint strides[GST_VIDEO_MAX_PLANES] = { 0, };
-    strides[0] = self->width;
-    strides[1] = self->width;
-    offsets[0] = 0;
-    offsets[1] = (gsize)self->width * self->height;
-
-    gst_buffer_add_video_meta_full(buffer, GST_VIDEO_FRAME_FLAG_NONE,
-                                    GST_VIDEO_FORMAT_NV21,
-                                    self->width, self->height,
-                                    2, offsets, strides);
-
-    /*
-     * Attach dispose callback: when downstream unrefs this GstBuffer,
-     * we re-QBUF the V4L2 buffer so vdin1 can reuse it.
-     */
-    PathBBufContext *ctx = g_new(PathBBufContext, 1);
-    ctx->self = GST_STREAMBOX_SRC(gst_object_ref(self));
-    ctx->buf_index = idx;
-    gst_mini_object_set_qdata(GST_MINI_OBJECT(buffer),
-                               g_quark_from_static_string("pathb-ctx"),
-                               ctx, path_b_buf_release);
-
-    self->frame_count++;
-
-    if (self->frame_count == 1 || self->frame_count % 300 == 0) {
-        GST_INFO_OBJECT(self, "Path B frame %lu: %ux%u NV21 zero-copy fd=%d",
-                         (unsigned long)self->frame_count,
-                         self->width, self->height,
-                         self->vdin1_bufs[idx].dma_fd);
-    }
-
-    *buf = buffer;
-    return GST_FLOW_OK;
 
 qbuf_return:
     /* Error path: re-QBUF immediately and return error */

@@ -18,6 +18,7 @@
 
 #include <gst/gst.h>
 #include <gst/base/gstpushsrc.h>
+#include <vulkan/vulkan.h>
 #include <vfmcap.h>
 
 G_BEGIN_DECLS
@@ -62,6 +63,20 @@ typedef struct {
     size_t   size;      /* allocation size */
     gboolean queued;    /* TRUE if currently queued to vdin1 */
 } StreamboxVdin1Buffer;
+
+/* ---------- Vulkan DMA-buf cache (for Path B 10-bit) ---------- */
+
+#define VDIN1_VK_DMABUF_CACHE_SIZE 8
+
+typedef struct {
+    int             fd;         /* original DMA-buf fd (key) */
+    int             fd_dup;     /* dup'd fd consumed by Vulkan */
+    VkBuffer        buffer;
+    VkDeviceMemory  memory;
+    VkDeviceSize    size;
+    int             valid;
+    guint64         last_used;
+} Vdin1VkCacheEntry;
 
 /* ---------- Instance structure ---------- */
 
@@ -108,6 +123,36 @@ struct _GstStreamboxSrc
     guint     vdin1_prev_height;
     guint32   vdin1_prev_pixfmt;
     guint64   vdin1_fmt_poll_counter; /* Check G_FMT every N frames */
+
+    /* ---- Path B Vulkan (AMLY -> P010, for 10-bit mode) ---- */
+    gboolean  vdin1_10bit;             /* TRUE when output_fmt=P010 on Path B */
+    guint32   vdin1_amly_sizeimage;    /* Driver's sizeimage for AMLY format */
+
+    VkInstance              vk_instance;
+    VkPhysicalDevice        vk_physical_device;
+    VkDevice                vk_device;
+    VkQueue                 vk_compute_queue;
+    guint32                 vk_queue_family;
+    VkCommandPool           vk_command_pool;
+    VkCommandBuffer         vk_command_buffer;
+    VkFence                 vk_fence;
+    VkDescriptorPool        vk_descriptor_pool;
+    VkDescriptorSetLayout   vk_descriptor_set_layout;
+    VkDescriptorSet         vk_descriptor_set;
+    VkPipelineLayout        vk_pipeline_layout;
+    VkPipeline              vk_pipeline_p010;
+    VkShaderModule          vk_shader_p010;
+    VkPhysicalDeviceMemoryProperties vk_memory_props;
+    gboolean                vk_initialized;
+    guint64                 vk_frame_count;
+
+    /* DMA-buf caches for Vulkan */
+    Vdin1VkCacheEntry       vk_input_cache[VDIN1_VK_DMABUF_CACHE_SIZE];
+    gint                    vk_input_cache_count;
+    Vdin1VkCacheEntry       vk_output_cache;  /* single output cache entry */
+
+    int                     vk_pending_in_fd;
+    gboolean                vk_has_pending;
 
     /* ---- Flushing / unlock ---- */
     gboolean  flushing;            /* Set by unlock() to break out of blocking */

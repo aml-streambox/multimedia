@@ -5,28 +5,29 @@
 // vdin1 in V4L2 mode writes with WORDS_SWAP=0 + WR_ENDIAN=1 (little endian).
 // NO bswap64 correction needed — data is in native LE byte order.
 //
-// 40-bit packed format per pixel pair:
-//   Logical: [U0(10)][Y0(10)][V0(10)][Y1(10)] = 40 bits
+// 40-bit packed format per pixel pair (vdin1 VPP loopback):
+//   LE bit layout: [U0(10)][Y0(10)][V0(10)][Y1(10)] = 40 bits
+//   (Y and chroma positions differ from Path A's YUYV order)
 //
 // In little-endian memory (byte 0 = LSB of the 40-bit word):
-//   Byte 0: Y1[7:0]
-//   Byte 1: V0[5:0] | Y1[9:8]
-//   Byte 2: Y0[3:0] | V0[9:6]
-//   Byte 3: U0[1:0] | Y0[9:4]
-//   Byte 4: U0[9:2]
+//   Byte 0: U0[7:0]
+//   Byte 1: Y0[5:0] | U0[9:8]
+//   Byte 2: V0[3:0] | Y0[9:6]
+//   Byte 3: Y1[1:0] | V0[9:4]
+//   Byte 4: Y1[9:2]
 //
 // When loaded as LE uint32 (lo = bytes 0-3):
-//   lo[9:0]   = Y1[9:0]
-//   lo[19:10] = V0[9:0]
-//   lo[29:20] = Y0[9:0]
-//   lo[31:30] = U0[1:0]
-//   hi (byte 4) = U0[9:2]
+//   lo[9:0]   = U0[9:0]
+//   lo[19:10] = Y0[9:0]
+//   lo[29:20] = V0[9:0]
+//   lo[31:30] = Y1[1:0]
+//   hi (byte 4) = Y1[9:2]
 //
 // Extraction (no bswap needed):
-//   y1 = lo & 0x3FF
-//   v0 = (lo >> 10) & 0x3FF
-//   y0 = (lo >> 20) & 0x3FF
-//   u0 = (lo >> 30) | (hi << 2)
+//   u0 = lo & 0x3FF
+//   y0 = (lo >> 10) & 0x3FF
+//   v0 = (lo >> 20) & 0x3FF
+//   y1 = (lo >> 30) | (hi << 2)
 //
 // P010 output: 10-bit value left-justified in 16 bits (val << 6).
 // Y plane: two 16-bit values per uint32. UV plane: half height, U+V interleaved.
@@ -95,13 +96,18 @@ void extract_pair(uint local_pair, uint byte_offset_base,
     }
 }
 
-// Decode AMLY LE pixel pair — no bswap needed
+// Decode AMLY LE pixel pair — no bswap needed.
+// vdin1 VPP loopback field order (LE uint32 bit positions):
+//   bits[9:0]   = U0 (chroma)
+//   bits[19:10] = Y0 (luma)
+//   bits[29:20] = V0 (chroma)
+//   bits[31:30]+hi = Y1 (luma)
 void decode_pair(uint lo, uint hi,
                  out uint y0, out uint u0, out uint y1, out uint v0) {
-    y1 = lo & 0x3FFu;
-    v0 = (lo >> 10) & 0x3FFu;
-    y0 = (lo >> 20) & 0x3FFu;
-    u0 = (lo >> 30) | (hi << 2);
+    u0 = lo & 0x3FFu;
+    y0 = (lo >> 10) & 0x3FFu;
+    v0 = (lo >> 20) & 0x3FFu;
+    y1 = (lo >> 30) | (hi << 2);
 }
 
 // Read a pair directly from global memory (for next-row UV averaging).

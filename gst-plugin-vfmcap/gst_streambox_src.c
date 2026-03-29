@@ -71,8 +71,6 @@ _get_time_us(void)
 #define DEFAULT_NUM_BUFFERS    6
 #define DEFAULT_OUTPUT_FMT     GST_STREAMBOX_OUTPUT_NV12
 #define DEFAULT_SOURCE_MODE    GST_STREAMBOX_SOURCE_VFMCAP
-#define DEFAULT_AUTO_RESTART   TRUE
-#define DEFAULT_SIGNAL_TIMEOUT 5000
 
 #define DMA_HEAP_PATH          "/dev/dma_heap/system-uncached"
 #define DMA_HEAP_CMA_PATH      "/dev/dma_heap/heap-codecmm"
@@ -107,8 +105,6 @@ enum
     PROP_DEVICE,
     PROP_NUM_BUFFERS,
     PROP_OUTPUT_FORMAT,
-    PROP_AUTO_RESTART,
-    PROP_SIGNAL_TIMEOUT,
     PROP_VDIN1_INPUT,
 };
 
@@ -202,6 +198,9 @@ static GstFlowReturn create_path_b(GstStreamboxSrc *self, GstBuffer **buf);
 /* Forward declarations for P010 output pool */
 static gboolean p010_pool_init(GstStreamboxSrc *self, guint32 buf_size);
 static void     p010_pool_cleanup(GstStreamboxSrc *self);
+
+/* Forward declaration for signal change message */
+static void post_signal_change_message(GstStreamboxSrc *self, const gchar *reason);
 
 /* ---------- DMA-heap allocation ---------- */
 
@@ -1320,18 +1319,6 @@ gst_streambox_src_class_init(GstStreamboxSrcClass *klass)
             DEFAULT_OUTPUT_FMT,
             G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
-    g_object_class_install_property(gobject_class, PROP_AUTO_RESTART,
-        g_param_spec_boolean("auto-restart", "Auto Restart",
-            "Auto-restart capture on signal recovery",
-            DEFAULT_AUTO_RESTART,
-            G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
-
-    g_object_class_install_property(gobject_class, PROP_SIGNAL_TIMEOUT,
-        g_param_spec_uint("signal-timeout", "Signal Timeout",
-            "Milliseconds to wait for signal before EOS",
-            500, 30000, DEFAULT_SIGNAL_TIMEOUT,
-            G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
-
     g_object_class_install_property(gobject_class, PROP_VDIN1_INPUT,
         g_param_spec_uint("vdin1-input", "VDIN1 Input Index",
             "V4L2 input index for vdin1 loopback source. "
@@ -1368,8 +1355,6 @@ gst_streambox_src_init(GstStreamboxSrc *self)
     self->device = NULL;  /* auto-detect */
     self->num_buffers = DEFAULT_NUM_BUFFERS;
     self->output_fmt = DEFAULT_OUTPUT_FMT;
-    self->auto_restart = DEFAULT_AUTO_RESTART;
-    self->signal_timeout_ms = DEFAULT_SIGNAL_TIMEOUT;
     self->vdin1_input = VDIN1_INPUT_VPP_POST_BLEND;
 
     self->sig_state = GST_STREAMBOX_STATE_IDLE;
@@ -1489,12 +1474,6 @@ gst_streambox_src_set_property(GObject *object, guint prop_id,
     case PROP_OUTPUT_FORMAT:
         self->output_fmt = g_value_get_enum(value);
         break;
-    case PROP_AUTO_RESTART:
-        self->auto_restart = g_value_get_boolean(value);
-        break;
-    case PROP_SIGNAL_TIMEOUT:
-        self->signal_timeout_ms = g_value_get_uint(value);
-        break;
     case PROP_VDIN1_INPUT:
         self->vdin1_input = g_value_get_uint(value);
         break;
@@ -1528,12 +1507,6 @@ gst_streambox_src_get_property(GObject *object, guint prop_id,
         break;
     case PROP_OUTPUT_FORMAT:
         g_value_set_enum(value, self->output_fmt);
-        break;
-    case PROP_AUTO_RESTART:
-        g_value_set_boolean(value, self->auto_restart);
-        break;
-    case PROP_SIGNAL_TIMEOUT:
-        g_value_set_uint(value, self->signal_timeout_ms);
         break;
     case PROP_VDIN1_INPUT:
         g_value_set_uint(value, self->vdin1_input);
@@ -1883,41 +1856,12 @@ create_path_a(GstStreamboxSrc *self, GstBuffer **buf)
     }
 
     if (ret == VFMCAP_ERR_NOSIG) {
-        GST_WARNING_OBJECT(self, "No signal");
-        if (self->auto_restart) {
-            g_mutex_lock(&self->state_lock);
-            self->sig_state = GST_STREAMBOX_STATE_WAITING;
-            g_mutex_unlock(&self->state_lock);
-            /* Try to wait for signal recovery */
-            GST_INFO_OBJECT(self, "Waiting for signal recovery...");
-            ret = vfmcap_acquire_frame(self->cap_ctx, &frame,
-                                       self->signal_timeout_ms);
-            if (ret == VFMCAP_OK) {
-                GST_INFO_OBJECT(self, "Signal recovered: %ux%u",
-                                frame.width, frame.height);
-                if (frame.width != self->width || frame.height != self->height) {
-                    self->width = frame.width;
-                    self->height = frame.height;
-                    vfmcap_output_fmt_t sdk_fmt =
-                        (self->output_fmt == GST_STREAMBOX_OUTPUT_P010)
-                        ? VFMCAP_FMT_P010 : VFMCAP_FMT_NV12;
-                    self->out_buf_size = vfmcap_output_size(
-                        self->width, self->height, sdk_fmt);
-                    self->caps_set = FALSE;
-                    push_current_caps(self);
-                }
-                g_mutex_lock(&self->state_lock);
-                self->sig_state = GST_STREAMBOX_STATE_STREAMING;
-                g_mutex_unlock(&self->state_lock);
-                /* Fall through to process this frame */
-            } else {
-                GST_WARNING_OBJECT(self, "Signal not recovered within %u ms",
-                                   self->signal_timeout_ms);
-                return GST_FLOW_EOS;
-            }
-        } else {
-            return GST_FLOW_EOS;
-        }
+        GST_WARNING_OBJECT(self, "No signal — posting hdmi-signal-change and exiting");
+        g_mutex_lock(&self->state_lock);
+        self->sig_state = GST_STREAMBOX_STATE_WAITING;
+        g_mutex_unlock(&self->state_lock);
+        post_signal_change_message(self, "signal-lost");
+        return GST_FLOW_EOS;
     }
 
     if (ret != VFMCAP_OK) {
@@ -1928,27 +1872,11 @@ create_path_a(GstStreamboxSrc *self, GstBuffer **buf)
 
     /* Check for resolution change */
     if (frame.width != self->width || frame.height != self->height) {
-        GST_INFO_OBJECT(self, "Resolution changed: %ux%u -> %ux%u",
+        GST_INFO_OBJECT(self, "Resolution changed: %ux%u -> %ux%u — exiting for restart",
                          self->width, self->height, frame.width, frame.height);
-        self->width = frame.width;
-        self->height = frame.height;
-
-        vfmcap_output_fmt_t sdk_fmt = (self->output_fmt == GST_STREAMBOX_OUTPUT_P010)
-                                       ? VFMCAP_FMT_P010 : VFMCAP_FMT_NV12;
-        self->out_buf_size = vfmcap_output_size(self->width, self->height, sdk_fmt);
-        self->caps_set = FALSE;
-
         vfmcap_release_frame(self->cap_ctx, &frame);
-
-        /* Push new caps and continue (don't EOS) */
-        push_current_caps(self);
-
-        /* Re-acquire with new caps */
-        ret = vfmcap_acquire_frame(self->cap_ctx, &frame, 1000);
-        if (ret != VFMCAP_OK) {
-            GST_WARNING_OBJECT(self, "Re-acquire after resolution change failed");
-            return GST_FLOW_ERROR;
-        }
+        post_signal_change_message(self, "signal-changed");
+        return GST_FLOW_EOS;
     }
 
     /* Get the next pool buffer (round-robin).
@@ -2339,86 +2267,6 @@ vdin1_check_format_change(GstStreamboxSrc *self)
 }
 
 /*
- * Reconfigure vdin1 after a format change.
- * Returns TRUE if reconfiguration succeeded and streaming is resumed.
- */
-static gboolean
-vdin1_reconfigure(GstStreamboxSrc *self)
-{
-    GST_INFO_OBJECT(self, "vdin1 reconfiguring...");
-    g_mutex_lock(&self->state_lock);
-    self->sig_state = GST_STREAMBOX_STATE_RECONFIGURE;
-    g_mutex_unlock(&self->state_lock);
-
-    /* Stop streaming */
-    vdin1_streamoff(self);
-
-    /* Free old DMA-bufs and release V4L2 buffers */
-    struct v4l2_requestbuffers req;
-    memset(&req, 0, sizeof(req));
-    req.count = 0;
-    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-    req.memory = V4L2_MEMORY_DMABUF;
-    xioctl(self->vdin1_fd, VIDIOC_REQBUFS, &req);
-    vdin1_free_dmabufs(self);
-
-    /* Small delay to let VPP stabilize after resolution change */
-    g_usleep(100000);  /* 100ms */
-
-    /* Re-select input (S_INPUT resets driver state) */
-    if (!vdin1_set_input(self, self->vdin1_input))
-        return FALSE;
-
-    /* Query new source resolution from HDMI RX */
-    guint src_w = 0, src_h = 0;
-    if (!hdmirx_get_source_resolution(self, &src_w, &src_h)) {
-        /* Fallback: read whatever vdin1 currently reports */
-        guint np = 0;
-        guint32 pf = 0;
-        vdin1_get_format(self, &src_w, &src_h, &pf, &np);
-    }
-
-    if (src_w == 0 || src_h == 0) {
-        GST_WARNING_OBJECT(self, "No resolution during reconfigure -- no signal");
-        g_mutex_lock(&self->state_lock);
-        self->sig_state = GST_STREAMBOX_STATE_WAITING;
-        g_mutex_unlock(&self->state_lock);
-        return FALSE;
-    }
-
-    /* Set format at full source resolution */
-    if (!vdin1_set_format(self, src_w, src_h))
-        return FALSE;
-
-    self->vdin1_prev_width = self->width;
-    self->vdin1_prev_height = self->height;
-    self->vdin1_prev_pixfmt = self->vdin1_pixfmt;
-
-    /* Re-allocate buffers (DMABUF mode) */
-    guint req_count = self->num_buffers;
-    if (req_count > STREAMBOX_VDIN1_MAX_BUFFERS)
-        req_count = STREAMBOX_VDIN1_MAX_BUFFERS;
-    if (!vdin1_reqbufs(self, req_count))
-        return FALSE;
-    if (!vdin1_alloc_dmabufs(self))
-        return FALSE;
-    if (!vdin1_qbuf_all(self))
-        return FALSE;
-    if (!vdin1_streamon(self))
-        return FALSE;
-
-    /* Push new caps downstream */
-    self->caps_set = FALSE;
-
-    g_mutex_lock(&self->state_lock);
-    self->sig_state = GST_STREAMBOX_STATE_STREAMING;
-    g_mutex_unlock(&self->state_lock);
-    GST_INFO_OBJECT(self, "vdin1 reconfigured: %ux%u pixfmt=0x%08x",
-                     self->width, self->height, self->vdin1_pixfmt);
-    return TRUE;
-}
-
-/*
  * Context passed to the GstBuffer dispose callback so we can re-QBUF
  * the V4L2 buffer when downstream is done with it.
  */
@@ -2627,90 +2475,82 @@ handle_signal_event(GstStreamboxSrc *self)
 }
 
 /*
- * Wait for signal recovery using the signal monitor fd.
- * Polls the monitor fd for V4L2_EVENT_SOURCE_CHANGE.
- * Returns TRUE if signal came back (SOURCE_CHANGE with resolution),
- * FALSE if timed out or flushing.
+ * Read current HDMI RX signal info and post a GST_MESSAGE_ELEMENT on the bus
+ * with a GstStructure containing the signal parameters.  The GStreamer Manager
+ * watches for messages named "hdmi-signal-change" and uses the fields to
+ * decide whether and how to restart the pipeline.
  *
- * Also polls the flush pipe so we can break out on EOS/flush.
+ * The `reason` string describes why we're exiting ("signal-lost",
+ * "signal-changed", "format-changed", "timeout").
+ *
+ * Fields posted:
+ *   reason        (string)  — why we're exiting
+ *   width         (uint)    — Hactive from HDMI RX, 0 if no signal
+ *   height        (uint)    — Vactive from HDMI RX, 0 if no signal
+ *   frame-rate    (uint)    — raw value from HDMI RX (e.g. 5992 = 59.92 fps)
+ *   color-space   (string)  — e.g. "0-RGB", "1-YUV422", etc.
+ *   color-depth   (uint)    — 8, 10, or 12
+ *   hdr-eotf      (string)  — e.g. "SMPTE_ST_2048", "SDR", "HLG"
+ *   dolby-vision  (uint)    — 0 or 1
+ *   interlace     (uint)    — 0 or 1
  */
-static gboolean
-wait_for_signal_recovery(GstStreamboxSrc *self)
+static void
+post_signal_change_message(GstStreamboxSrc *self, const gchar *reason)
 {
-    guint total_waited_ms = 0;
-    const guint poll_interval_ms = 500;
+    guint width = 0, height = 0, frame_rate = 0;
+    guint color_depth = 0, dolby_vision = 0, interlace = 0;
+    gchar color_space[64] = "";
+    gchar hdr_eotf[64] = "";
 
-    g_mutex_lock(&self->state_lock);
-    self->sig_state = GST_STREAMBOX_STATE_WAITING;
-    g_mutex_unlock(&self->state_lock);
-
-    GST_INFO_OBJECT(self, "Waiting for signal recovery (timeout=%ums, monitor_fd=%d)...",
-                     self->signal_timeout_ms, self->signal_monitor_fd);
-
-    /* Post a GStreamer message so the application knows */
-    {
-        GError *gerr = g_error_new(GST_RESOURCE_ERROR, GST_RESOURCE_ERROR_BUSY,
-                                    "HDMI signal lost, waiting for recovery");
-        gst_element_post_message(GST_ELEMENT(self),
-            gst_message_new_info(GST_OBJECT(self), gerr,
-                "Signal lost — waiting for HDMI source"));
-        g_error_free(gerr);
-    }
-
-    while (total_waited_ms < self->signal_timeout_ms) {
-        if (self->flushing)
-            return FALSE;
-
-        if (self->signal_monitor_fd >= 0) {
-            /* Event-driven wait: poll monitor fd + flush pipe */
-            struct pollfd pfds[2];
-            pfds[0].fd = self->signal_monitor_fd;
-            pfds[0].events = POLLPRI;  /* V4L2 events arrive as POLLPRI */
-            pfds[1].fd = self->flush_pipefd[0];
-            pfds[1].events = POLLIN;
-
-            int pret = poll(pfds, 2, (int)poll_interval_ms);
-
-            if (pret < 0) {
-                if (errno == EINTR) continue;
-                GST_WARNING_OBJECT(self, "signal recovery poll error: %s", strerror(errno));
-                break;
-            }
-
-            if (pfds[1].revents & POLLIN)
-                return FALSE;  /* Flushing */
-
-            if (pret > 0 && (pfds[0].revents & POLLPRI)) {
-                SignalEventAction act = handle_signal_event(self);
-                if (act == SIGNAL_EVENT_CHANGED) {
-                    GST_INFO_OBJECT(self,
-                        "Signal recovered (SOURCE_CHANGE) after %ums", total_waited_ms);
-                    return TRUE;
-                }
-                /* SIGNAL_EVENT_LOST or NONE — keep waiting */
-            }
-        } else {
-            /* Fallback: crude sleep polling (no monitor fd available) */
-            g_usleep(poll_interval_ms * 1000);
-        }
-
-        total_waited_ms += poll_interval_ms;
-
-        /* Every 2 seconds, also try G_FMT polling as a backup check */
-        if (total_waited_ms % 2000 == 0) {
-            guint w = 0, h = 0, np = 0;
-            guint32 pf = 0;
-            if (vdin1_get_format(self, &w, &h, &pf, &np) && w > 0 && h > 0) {
-                GST_INFO_OBJECT(self,
-                    "Signal recovered (G_FMT shows %ux%u) after %ums",
-                    w, h, total_waited_ms);
-                return TRUE;
+    /* Parse HDMI RX info sysfs */
+    FILE *f = fopen(HDMIRX_INFO_PATH, "r");
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            guint val;
+            if (sscanf(line, "Hactive: %u", &val) == 1) {
+                width = val;
+            } else if (sscanf(line, "Vactive: %u", &val) == 1) {
+                height = val;
+            } else if (sscanf(line, "Frame Rate: %u", &val) == 1) {
+                frame_rate = val;
+            } else if (sscanf(line, "Color Depth: %u", &val) == 1) {
+                color_depth = val;
+            } else if (sscanf(line, "Dolby Vision: %u", &val) == 1) {
+                dolby_vision = val;
+            } else if (sscanf(line, "Interlace: %u", &val) == 1) {
+                interlace = val;
+            } else if (sscanf(line, " Color Space: %63[^\n]", color_space) == 1) {
+                /* already captured */
+            } else if (sscanf(line, " HDR EOTF: %63[^\n]", hdr_eotf) == 1) {
+                /* already captured */
             }
         }
+        fclose(f);
+    } else {
+        GST_WARNING_OBJECT(self, "Cannot read %s for signal change message: %s",
+                           HDMIRX_INFO_PATH, strerror(errno));
     }
 
-    GST_WARNING_OBJECT(self, "Signal not recovered within %ums", self->signal_timeout_ms);
-    return FALSE;
+    GST_INFO_OBJECT(self,
+        "Posting hdmi-signal-change: reason=%s %ux%u@%u depth=%u cs=%s eotf=%s dv=%u",
+        reason, width, height, frame_rate, color_depth,
+        color_space, hdr_eotf, dolby_vision);
+
+    GstStructure *s = gst_structure_new("hdmi-signal-change",
+        "reason",       G_TYPE_STRING, reason,
+        "width",        G_TYPE_UINT,   width,
+        "height",       G_TYPE_UINT,   height,
+        "frame-rate",   G_TYPE_UINT,   frame_rate,
+        "color-space",  G_TYPE_STRING, color_space,
+        "color-depth",  G_TYPE_UINT,   color_depth,
+        "hdr-eotf",     G_TYPE_STRING, hdr_eotf,
+        "dolby-vision", G_TYPE_UINT,   dolby_vision,
+        "interlace",    G_TYPE_UINT,   interlace,
+        NULL);
+
+    gst_element_post_message(GST_ELEMENT(self),
+        gst_message_new_element(GST_OBJECT(self), s));
 }
 
 static GstFlowReturn
@@ -2719,14 +2559,17 @@ create_path_b(GstStreamboxSrc *self, GstBuffer **buf)
     if (self->vdin1_fd < 0)
         return GST_FLOW_ERROR;
 
+    const gchar *clean_exit_reason = NULL;
+
     /* Push caps on first frame */
     if (!self->caps_set)
         push_current_caps(self);
 
     /* Periodically check for format change (G_FMT polling, backup to event-driven) */
     if (vdin1_check_format_change(self)) {
-        GST_INFO_OBJECT(self, "Format change detected via G_FMT polling");
-        goto do_reconfigure;
+        GST_INFO_OBJECT(self, "Format change detected via G_FMT polling — exiting for restart");
+        clean_exit_reason = "format-changed";
+        goto clean_exit;
     }
 
     /*
@@ -2786,9 +2629,11 @@ retry:
             SignalEventAction act = handle_signal_event(self);
             if (act == SIGNAL_EVENT_CHANGED || act == SIGNAL_EVENT_LOST) {
                 GST_INFO_OBJECT(self,
-                    "Signal event during capture: action=%d, triggering reconfigure",
+                    "Signal event during capture: action=%d — exiting for restart",
                     act);
-                goto do_reconfigure;
+                clean_exit_reason = (act == SIGNAL_EVENT_LOST)
+                    ? "signal-lost" : "signal-changed";
+                goto clean_exit;
             }
         }
 
@@ -2799,9 +2644,10 @@ retry:
                                timeout_count, max_timeouts);
             if (timeout_count >= max_timeouts) {
                 GST_WARNING_OBJECT(self,
-                    "vdin1: no frames after %u seconds — signal may be lost",
+                    "vdin1: no frames after %u seconds — signal may be lost, exiting",
                     max_timeouts);
-                goto do_reconfigure;
+                clean_exit_reason = "signal-timeout";
+                goto clean_exit;
             }
             goto retry;
         }
@@ -2810,16 +2656,17 @@ retry:
     /* Normal frame delivery path — fall through to DQBUF below */
     goto do_dqbuf;
 
-do_reconfigure:
+clean_exit:
     /*
-     * Reconfigure vdin1 after signal change (event-driven or timeout-based).
+     * Clean exit on signal change / loss / timeout.
      *
-     * Before reconfiguring, drain any in-flight async GPU work for the
-     * 10-bit path, since the vdin1 buffers will be freed during reconfigure.
+     * Drain any in-flight async GPU work for the 10-bit path so we don't
+     * leave dangling fences or hold vdin1 buffers that stop() will free.
+     * Then post hdmi-signal-change message and return EOS.
      */
     if (self->vdin1_10bit && self->vk_async_pending && self->vk_initialized) {
         guint prev_slot = 1 - self->vk_slot;
-        GST_INFO_OBJECT(self, "Draining async GPU before reconfigure (slot %u)", prev_slot);
+        GST_INFO_OBJECT(self, "Draining async GPU before clean exit (slot %u)", prev_slot);
         vdin1_vk_wait_async(self, prev_slot, self->vk_async_in_fd);
 
         /* Re-QBUF the vdin1 buffer held by async pipeline */
@@ -2851,65 +2698,26 @@ do_reconfigure:
         self->vk_async_pending = FALSE;
     }
 
-    {
-        /*
-         * Save old resolution to detect if P010 pool needs recreation.
-         * The P010 pool buffers are sized for width*height, so if resolution
-         * changes, we must destroy and recreate the pool + Vulkan imports.
-         */
-        guint old_width = self->width;
-        guint old_height = self->height;
+    post_signal_change_message(self, clean_exit_reason ? clean_exit_reason : "unknown");
 
-        if (!vdin1_reconfigure(self)) {
-            if (self->auto_restart) {
-                if (!wait_for_signal_recovery(self))
-                    return GST_FLOW_EOS;
-                /* Signal came back — try reconfigure again */
-                if (!vdin1_reconfigure(self)) {
-                    GST_ERROR_OBJECT(self, "Reconfigure failed after signal recovery");
-                    return GST_FLOW_EOS;
-                }
-            } else {
-                return GST_FLOW_EOS;
-            }
-        }
-
-        g_mutex_lock(&self->state_lock);
-        self->sig_state = GST_STREAMBOX_STATE_STREAMING;
-        g_mutex_unlock(&self->state_lock);
-
-        /* Recreate P010 pool if resolution changed and we're in 10-bit mode */
-        if (self->vdin1_10bit &&
-            (self->width != old_width || self->height != old_height)) {
-            GST_INFO_OBJECT(self,
-                "Resolution changed %ux%u -> %ux%u, recreating P010 output pool",
-                old_width, old_height, self->width, self->height);
-
-            p010_pool_cleanup(self);
-            guint32 p010_size = self->width * self->height * 2 +
-                                self->width * self->height;  /* Y + UV */
-            if (!p010_pool_init(self, p010_size)) {
-                GST_ERROR_OBJECT(self, "Failed to recreate P010 pool after reconfigure");
-                return GST_FLOW_ERROR;
-            }
-        }
-
-        push_current_caps(self);
-
-        /* Post info message about the new format */
-        {
-            GError *gerr2 = g_error_new(GST_RESOURCE_ERROR, GST_RESOURCE_ERROR_SETTINGS,
-                                         "HDMI signal reconfigured: %ux%u",
-                                         self->width, self->height);
-            gst_element_post_message(GST_ELEMENT(self),
-                gst_message_new_info(GST_OBJECT(self), gerr2, "Signal reconfigured"));
-            g_error_free(gerr2);
-        }
-
-        /* Reset timeout counter and restart capture loop */
-        timeout_count = 0;
-        goto retry;
+    /*
+     * Force STREAMOFF before returning EOS.
+     *
+     * When HDMI RX stops supplying frames, VPP has no new data and vdin1
+     * enters an internal wait loop.  If we return GST_FLOW_EOS without
+     * stopping vdin1 first, the subsequent stop() call from GStreamer's
+     * state change may stall in STREAMOFF because the driver is stuck.
+     * By issuing STREAMOFF now (while we're still on the streaming thread),
+     * we ensure the driver is in a clean state before pipeline teardown.
+     *
+     * STREAMOFF is idempotent — stop_path_b() calling it again is harmless.
+     */
+    if (self->vdin1_fd >= 0) {
+        GST_INFO_OBJECT(self, "clean_exit: forcing STREAMOFF on vdin1");
+        vdin1_streamoff(self);
     }
+
+    return GST_FLOW_EOS;
 
 do_dqbuf:
     /* DQBUF (DMABUF mode) */
@@ -3103,7 +2911,7 @@ do_dqbuf:
                     return GST_FLOW_OK;
                 }
                 /* Signal event during priming — return frame 0 and let next
-                 * create() call handle reconfigure via do_reconfigure */
+                 * create() call handle signal change via clean_exit */
                 if (nfds2 == 3 && (pfds2[2].revents & POLLPRI)) {
                     SignalEventAction act2 = handle_signal_event(self);
                     if (act2 == SIGNAL_EVENT_CHANGED || act2 == SIGNAL_EVENT_LOST) {

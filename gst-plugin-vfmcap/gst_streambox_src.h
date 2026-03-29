@@ -89,8 +89,6 @@ struct _GstStreamboxSrc
     gchar    *device;                       /* device path (auto-detected or manual) */
     guint     num_buffers;                  /* V4L2 buffer count */
     GstStreamboxOutputFormat output_fmt;    /* NV12 or P010 (Path A only) */
-    gboolean  auto_restart;                 /* Auto-restart on signal recovery */
-    guint     signal_timeout_ms;            /* Timeout before EOS on signal loss */
     guint     vdin1_input;                  /* V4L2 input index for vdin1 (default 6 = VPP post-blend) */
 
     /* ---- Signal state machine ---- */

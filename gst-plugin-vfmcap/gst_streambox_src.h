@@ -119,6 +119,9 @@ struct _GstStreamboxSrc
     guint     patha_out_slot;      /* round-robin index */
     guint     patha_out_count;     /* number allocated (0 if pool not init'd) */
 
+    /* ---- Signal monitor (vfm_cap event fd, used by Path B) ---- */
+    int       signal_monitor_fd;   /* /dev/video_cap fd for V4L2_EVENT_SOURCE_CHANGE */
+
     /* ---- Path B (vdin1) state ---- */
     int       vdin1_fd;            /* /dev/video71 fd */
     int       heap_cma_fd;         /* /dev/dma_heap/heap-codecmm fd (CMA for vdin1) */

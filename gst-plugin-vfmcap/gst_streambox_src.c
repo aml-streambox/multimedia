@@ -1033,6 +1033,130 @@ hdmirx_get_source_resolution(GstStreamboxSrc *self, guint *w, guint *h)
 }
 
 /*
+ * Read HDMI RX signal info and determine the GStreamer colorimetry string
+ * for the current capture path.
+ *
+ * Parses /sys/class/hdmirx/hdmirx0/info for:
+ *   - Color Space: e.g. "0-RGB", "1-YUV422", "2-YUV444", "3-YUV420"
+ *   - Color Depth: 8, 10, or 12
+ *   - HDR EOTF: e.g. "SDR", "SMPTE_ST_2084" (PQ), "HLG", "HDR10PLUS"
+ *
+ * GStreamer colorimetry format: "range/matrix/transfer/primaries"
+ * where each component can be a GstVideoColorimetry enum name.
+ *
+ * Mapping logic:
+ *   Path A (vfmcap, raw passthrough, no color processing):
+ *     - Always preserves original colorimetry from source
+ *     - HDR PQ source  -> bt2100-pq  (BT.2020 primaries, PQ transfer, BT.2020 matrix)
+ *     - HDR HLG source -> bt2100-hlg (BT.2020 primaries, HLG transfer, BT.2020 matrix)
+ *     - SDR source     -> bt709 or bt601 depending on resolution
+ *
+ *   Path B 8-bit (vdin1, NV21, VPP color-processed):
+ *     - VPP has already done HDR->SDR tone mapping and BT.2020->BT.709 gamut mapping
+ *     - Output is always BT.709/sRGB regardless of input
+ *
+ *   Path B 10-bit (vdin1, AMLY->P010, raw capture before VPP color processing):
+ *     - Same as Path A: preserves original source colorimetry
+ *
+ * Stores result in self->colorimetry[].
+ */
+static void
+hdmirx_detect_colorimetry(GstStreamboxSrc *self)
+{
+    guint color_depth = 8;
+    gchar hdr_eotf[64] = "SDR";
+    gchar color_space[64] = "";
+
+    /* Parse HDMI RX sysfs */
+    FILE *f = fopen(HDMIRX_INFO_PATH, "r");
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            guint val;
+            if (sscanf(line, "Color Depth: %u", &val) == 1) {
+                color_depth = val;
+            } else if (sscanf(line, " HDR EOTF: %63[^\n]", hdr_eotf) == 1) {
+                /* captured */
+            } else if (sscanf(line, " Color Space: %63[^\n]", color_space) == 1) {
+                /* captured */
+            }
+        }
+        fclose(f);
+    } else {
+        GST_WARNING_OBJECT(self, "Cannot read %s for colorimetry detection: %s",
+                           HDMIRX_INFO_PATH, strerror(errno));
+    }
+
+    GST_INFO_OBJECT(self, "HDMI RX signal: color_depth=%u hdr_eotf=%s color_space=%s",
+                     color_depth, hdr_eotf, color_space);
+
+    /*
+     * Determine colorimetry based on capture path and signal info.
+     *
+     * GStreamer colorimetry string format: "range/matrix/transfer/primaries"
+     *
+     * For HDR10 PQ (SMPTE ST 2084):
+     *   bt2100-pq = "full/bt2020/smpte2084/bt2020"
+     *   (GstVideoColorimetry has GST_VIDEO_COLORIMETRY_BT2100_PQ = "bt2100-pq")
+     *
+     * For HLG:
+     *   bt2100-hlg = "full/bt2020/arib-std-b67/bt2020"
+     *   (GstVideoColorimetry has GST_VIDEO_COLORIMETRY_BT2100_HLG = "bt2100-hlg")
+     *
+     * For SDR BT.709:
+     *   bt709 = "limited/bt709/bt709/bt709"
+     *   (GstVideoColorimetry has GST_VIDEO_COLORIMETRY_BT709 = "bt709")
+     *
+     * For SDR BT.601 (SD content):
+     *   smpte240m = "limited/smpte240m/smpte240m/smpte240m" or
+     *   bt601 = "limited/bt601/bt709/bt470bg" -- but bt709 is fine for SD over HDMI
+     */
+
+    if (self->source_mode == GST_STREAMBOX_SOURCE_VDIN1 && !self->vdin1_10bit) {
+        /*
+         * Path B 8-bit: VPP has performed HDR->SDR tone mapping and
+         * BT.2020->BT.709 gamut mapping.  Output is always BT.709/SDR
+         * regardless of the original HDMI source color space.
+         */
+        g_strlcpy(self->colorimetry, "bt709", sizeof(self->colorimetry));
+        GST_INFO_OBJECT(self, "Path B 8-bit: colorimetry=bt709 (VPP color-processed)");
+    } else {
+        /*
+         * Path A (all formats) and Path B 10-bit: raw capture, no color
+         * processing.  Preserve original source colorimetry.
+         */
+        gboolean is_hdr_pq = (g_strstr_len(hdr_eotf, -1, "2084") != NULL ||
+                               g_strstr_len(hdr_eotf, -1, "HDR10") != NULL ||
+                               g_strstr_len(hdr_eotf, -1, "SMPTE_ST_2048") != NULL);
+        gboolean is_hlg = (g_strstr_len(hdr_eotf, -1, "HLG") != NULL);
+
+        if (is_hdr_pq) {
+            /*
+             * HDR10 PQ: BT.2020 primaries, SMPTE ST 2084 (PQ) transfer, BT.2020 matrix.
+             * Use the standard GStreamer "bt2100-pq" colorimetry name which expands to
+             * the full colorimetry needed by H.265 VUI for correct HDR playback.
+             */
+            g_strlcpy(self->colorimetry, "bt2100-pq", sizeof(self->colorimetry));
+            GST_INFO_OBJECT(self, "HDR PQ source: colorimetry=bt2100-pq");
+        } else if (is_hlg) {
+            g_strlcpy(self->colorimetry, "bt2100-hlg", sizeof(self->colorimetry));
+            GST_INFO_OBJECT(self, "HLG source: colorimetry=bt2100-hlg");
+        } else if (color_depth > 8) {
+            /*
+             * 10/12-bit SDR: likely BT.2020 container even without HDR transfer.
+             * Use BT.2020 primaries/matrix with BT.709 transfer (SDR in wide gamut).
+             */
+            g_strlcpy(self->colorimetry, "bt2020", sizeof(self->colorimetry));
+            GST_INFO_OBJECT(self, "10-bit SDR source: colorimetry=bt2020");
+        } else {
+            /* 8-bit SDR: standard BT.709 */
+            g_strlcpy(self->colorimetry, "bt709", sizeof(self->colorimetry));
+            GST_INFO_OBJECT(self, "SDR source: colorimetry=bt709");
+        }
+    }
+}
+
+/*
  * Select V4L2 input on vdin1.
  * For VPP post-blend loopback, use VDIN1_INPUT_VPP_POST_BLEND.
  * This sets the driver's work_mode to V4L and configures the loopback port.
@@ -1367,6 +1491,7 @@ gst_streambox_src_init(GstStreamboxSrc *self)
     self->fps_d = 1;
     self->caps_set = FALSE;
     self->frame_count = 0;
+    self->colorimetry[0] = '\0';
 
     /* Path A */
     self->cap_ctx = NULL;
@@ -1566,6 +1691,7 @@ gst_streambox_src_start(GstBaseSrc *basesrc)
 
     self->frame_count = 0;
     self->caps_set = FALSE;
+    self->colorimetry[0] = '\0';
 
     if (self->source_mode == GST_STREAMBOX_SOURCE_VFMCAP)
         return start_path_a(self);
@@ -1657,6 +1783,18 @@ gst_streambox_src_get_caps(GstBaseSrc *basesrc, GstCaps *filter)
             "height", G_TYPE_INT, (gint)self->height,
             "framerate", GST_TYPE_FRACTION, (gint)self->fps_n, (gint)self->fps_d,
             NULL);
+
+        /* Add colorimetry if detected */
+        if (self->colorimetry[0] != '\0') {
+            GstVideoColorimetry cinfo;
+            if (gst_video_colorimetry_from_string(&cinfo, self->colorimetry)) {
+                gchar *cstr = gst_video_colorimetry_to_string(&cinfo);
+                if (cstr) {
+                    gst_caps_set_simple(caps, "colorimetry", G_TYPE_STRING, cstr, NULL);
+                    g_free(cstr);
+                }
+            }
+        }
     } else {
         caps = gst_pad_get_pad_template_caps(GST_BASE_SRC_PAD(basesrc));
     }
@@ -1710,6 +1848,21 @@ push_current_caps(GstStreamboxSrc *self)
         "framerate", GST_TYPE_FRACTION, (gint)self->fps_n, (gint)self->fps_d,
         NULL);
 
+    /* Add colorimetry if detected from HDMI RX signal */
+    if (self->colorimetry[0] != '\0') {
+        GstVideoColorimetry cinfo;
+        if (gst_video_colorimetry_from_string(&cinfo, self->colorimetry)) {
+            gchar *cstr = gst_video_colorimetry_to_string(&cinfo);
+            if (cstr) {
+                gst_caps_set_simple(caps, "colorimetry", G_TYPE_STRING, cstr, NULL);
+                g_free(cstr);
+            }
+        } else {
+            GST_WARNING_OBJECT(self, "Failed to parse colorimetry '%s'",
+                               self->colorimetry);
+        }
+    }
+
     GST_INFO_OBJECT(self, "Setting caps: %" GST_PTR_FORMAT, caps);
     gst_base_src_set_caps(GST_BASE_SRC(self), caps);
     gst_caps_unref(caps);
@@ -1759,7 +1912,6 @@ start_path_a(GstStreamboxSrc *self)
         GST_ELEMENT_ERROR(self, RESOURCE, FAILED,
                           ("No signal or cannot acquire test frame"),
                           ("%s", vfmcap_last_error(self->cap_ctx)));
-        vfmcap_stop(self->cap_ctx);
         vfmcap_close(self->cap_ctx);
         self->cap_ctx = NULL;
         return FALSE;
@@ -1768,6 +1920,9 @@ start_path_a(GstStreamboxSrc *self)
     vfmcap_output_fmt_t sdk_fmt = (self->output_fmt == GST_STREAMBOX_OUTPUT_P010)
                                    ? VFMCAP_FMT_P010 : VFMCAP_FMT_NV12;
     self->out_buf_size = vfmcap_output_size(self->width, self->height, sdk_fmt);
+
+    /* Detect colorimetry from HDMI RX signal for caps */
+    hdmirx_detect_colorimetry(self);
 
     /* Pre-allocate a small rotating pool of CMA output buffers.
      * The encoder's kernel DMA-buf import caches fd→phys_addr mappings;
@@ -1786,7 +1941,6 @@ start_path_a(GstStreamboxSrc *self)
                 close(self->patha_out_fds[j]);
                 self->patha_out_fds[j] = -1;
             }
-            vfmcap_stop(self->cap_ctx);
             vfmcap_close(self->cap_ctx);
             self->cap_ctx = NULL;
             return FALSE;
@@ -1811,7 +1965,13 @@ static void
 stop_path_a(GstStreamboxSrc *self)
 {
     if (self->cap_ctx) {
-        vfmcap_stop(self->cap_ctx);
+        /* vfmcap_close() handles the full teardown in safe order:
+         *   1. Vulkan cleanup (releases GPU-imported DMA-buf references)
+         *   2. STREAMOFF + REQBUFS(0) (frees kernel CMA buffers)
+         *   3. close(fd)
+         * Do NOT call vfmcap_stop() separately — that would free kernel
+         * CMA buffers before Vulkan has released its imported references,
+         * causing a use-after-free kernel oops on shutdown. */
         vfmcap_close(self->cap_ctx);
         self->cap_ctx = NULL;
     }
@@ -2058,6 +2218,10 @@ start_path_b(GstStreamboxSrc *self)
     self->vdin1_prev_height = self->height;
     self->vdin1_prev_pixfmt = self->vdin1_pixfmt;
     self->vdin1_fmt_poll_counter = 0;
+
+    /* Detect colorimetry from HDMI RX signal for caps.
+     * Must be after vdin1_set_format() which sets vdin1_10bit. */
+    hdmirx_detect_colorimetry(self);
 
     /* Request buffers (DMABUF mode) */
     guint req_count = self->num_buffers;

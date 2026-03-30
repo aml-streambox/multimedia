@@ -267,13 +267,27 @@ void vfmcap_close(vfmcap_ctx_t *ctx)
 {
     if (!ctx) return;
 
-    if (ctx->streaming)
-        vfmcap_stop(ctx);
-
+    /*
+     * Order matters!  Vulkan cleanup MUST happen BEFORE vfmcap_stop().
+     *
+     * vfmcap_stop() calls VIDIOC_REQBUFS(count=0) which tells the kernel
+     * driver to free the CMA buffer allocations.  If the Vulkan pipeline
+     * still holds VkDeviceMemory objects imported from those DMA-buf fds,
+     * the subsequent vkFreeMemory() in vfmcap_vk_cleanup() will try to
+     * unmap pages that have already been freed by the kernel, causing a
+     * use-after-free oops (BUG: 00000000f2000800) and system crash.
+     *
+     * By cleaning up Vulkan first, all GPU-imported references to the
+     * DMA-buf pages are released cleanly while the kernel buffers still
+     * exist.  Then vfmcap_stop() can safely free them.
+     */
     if (ctx->vulkan_init) {
         vfmcap_vk_cleanup();
         ctx->vulkan_init = 0;
     }
+
+    if (ctx->streaming)
+        vfmcap_stop(ctx);
 
     if (ctx->fd >= 0) {
         close(ctx->fd);

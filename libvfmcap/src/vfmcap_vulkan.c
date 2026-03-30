@@ -36,7 +36,7 @@
 #define VFMCAP_VK_DEBUG 0
 #endif
 
-#define DMABUF_CACHE_SIZE 8
+#define DMABUF_CACHE_SIZE 2
 
 #define VK_CHECK(result, msg) do { \
     if (result != VK_SUCCESS) { \
@@ -56,6 +56,7 @@
 typedef struct {
     int             fd;
     int             fd_dup;
+    ino_t           inode;      /* inode of the dma_buf file — unique per export */
     VkBuffer        buffer;
     VkDeviceMemory  memory;
     VkDeviceSize    size;
@@ -178,6 +179,7 @@ static int import_dmabuf(int fd, VkDeviceSize size, VkBuffer *buffer, VkDeviceMe
         snprintf(ctx.last_error, sizeof(ctx.last_error),
                  "vkAllocateMemory failed: %d", result);
         vkDestroyBuffer(ctx.device, *buffer, NULL);
+        close(fd);  /* ownership reverts to app on failure */
         return -1;
     }
 
@@ -205,11 +207,62 @@ static void cache_entry_destroy(DmabufCacheEntry *entry)
     entry->fd_dup = -1;
 }
 
+/**
+ * get_fd_inode() - Get the inode number for a file descriptor.
+ *
+ * Each kernel dma_buf export creates a unique anon inode.  Two fds that
+ * share the same inode refer to the same dma_buf (and therefore the same
+ * physical CMA buffer).  If an fd number is reused after close+reopen,
+ * the inode will differ, letting us detect stale cache entries.
+ */
+static ino_t get_fd_inode(int fd)
+{
+    struct stat st;
+    if (fstat(fd, &st) == 0)
+        return st.st_ino;
+    return 0;
+}
+
 static int input_cache_get(int fd, VkDeviceSize size)
 {
+    ino_t fd_ino = get_fd_inode(fd);
+
     for (int i = 0; i < ctx.input_cache_count; i++) {
         if (ctx.input_cache[i].valid && ctx.input_cache[i].fd == fd &&
             ctx.input_cache[i].size == size) {
+            /*
+             * fd number matches — but does the underlying dma_buf?
+             * After close(fd) + a new GET_DMABUF, the kernel can
+             * reuse the same fd number for a completely different
+             * CMA buffer.  Compare inodes to detect this.
+             */
+            if (fd_ino != 0 && ctx.input_cache[i].inode != 0 &&
+                ctx.input_cache[i].inode != fd_ino) {
+                /* Stale entry — destroy and re-import below */
+                cache_entry_destroy(&ctx.input_cache[i]);
+                /* Fall through to fresh import into this slot */
+                int fd_dup = dup(fd);
+                if (fd_dup < 0) {
+                    snprintf(ctx.last_error, sizeof(ctx.last_error),
+                             "dup(input fd %d) failed: %s", fd, strerror(errno));
+                    return -1;
+                }
+                VkBuffer buffer;
+                VkDeviceMemory memory;
+                if (import_dmabuf(fd_dup, size, &buffer, &memory) != 0) {
+                    return -1;
+                }
+                ctx.input_cache[i].fd = fd;
+                ctx.input_cache[i].fd_dup = fd_dup;
+                ctx.input_cache[i].inode = fd_ino;
+                ctx.input_cache[i].buffer = buffer;
+                ctx.input_cache[i].memory = memory;
+                ctx.input_cache[i].size = size;
+                ctx.input_cache[i].valid = 1;
+                ctx.input_cache[i].last_used = ctx.frame_count;
+                return i;
+            }
+            /* Same inode — genuine cache hit */
             ctx.input_cache[i].last_used = ctx.frame_count;
             return i;
         }
@@ -244,6 +297,7 @@ static int input_cache_get(int fd, VkDeviceSize size)
 
     ctx.input_cache[slot].fd = fd;
     ctx.input_cache[slot].fd_dup = fd_dup;
+    ctx.input_cache[slot].inode = fd_ino;
     ctx.input_cache[slot].buffer = buffer;
     ctx.input_cache[slot].memory = memory;
     ctx.input_cache[slot].size = size;
@@ -257,7 +311,13 @@ static int output_cache_get(int fd, VkDeviceSize size)
 {
     if (ctx.cached_output.valid && ctx.cached_output.fd == fd &&
         ctx.cached_output.size == size) {
-        return 0;
+        /* Validate inode to catch stale entries */
+        ino_t cur_ino = get_fd_inode(fd);
+        if (cur_ino == 0 || ctx.cached_output.inode == 0 ||
+            cur_ino == ctx.cached_output.inode) {
+            return 0;
+        }
+        /* Stale — fall through to re-import */
     }
 
     if (ctx.cached_output.valid) {
@@ -279,6 +339,7 @@ static int output_cache_get(int fd, VkDeviceSize size)
 
     ctx.cached_output.fd = fd;
     ctx.cached_output.fd_dup = fd_dup;
+    ctx.cached_output.inode = get_fd_inode(fd);
     ctx.cached_output.buffer = buffer;
     ctx.cached_output.memory = memory;
     ctx.cached_output.size = size;
@@ -721,6 +782,40 @@ int vfmcap_vk_convert_wait(void)
             .flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ
         };
         ioctl(ctx.pending_in_fd, DMA_BUF_IOCTL_SYNC, &sync_end);
+    }
+
+    /*
+     * Immediately release the Vulkan import for the completed input.
+     *
+     * The cache entry holds a Mali dma_buf reference (via dup'd fd ->
+     * vkAllocateMemory -> dma_buf_get inside Mali).  This keeps the
+     * kernel cap_frame alive even after userspace does close(fd)+QBUF.
+     * The cap_frame pins a CMA buffer that vdin0 cannot reuse until
+     * ALL references are dropped.
+     *
+     * With DMABUF_CACHE_SIZE entries cached, we pin that many extra
+     * CMA buffers.  vdin0 only has VFM_CAP_POOL_SIZE=16 buffers, and
+     * the display path (deinterlace -> amvideo) holds 2-3.  Leaving
+     * too few free buffers causes vdin0 to stall, drop frames, or
+     * reuse a buffer still being written by the HDMI receiver — which
+     * corrupts memory and crashes the kernel.
+     *
+     * By destroying the cache entry here (GPU is idle, fence waited),
+     * vkFreeMemory releases Mali's dma_buf ref.  The CMA buffer can
+     * then be recycled promptly when the caller does release_frame().
+     *
+     * This means every frame does a fresh vkAllocateMemory/vkFreeMemory
+     * cycle, but profiling shows these are <0.5ms each — negligible
+     * compared to the ~6ms GPU shader and ~10ms V4L2 acquire.
+     */
+    if (ctx.pending_in_fd >= 0) {
+        for (int i = 0; i < ctx.input_cache_count; i++) {
+            if (ctx.input_cache[i].valid &&
+                ctx.input_cache[i].fd == ctx.pending_in_fd) {
+                cache_entry_destroy(&ctx.input_cache[i]);
+                break;
+            }
+        }
     }
 
     ctx.has_pending = 0;

@@ -104,6 +104,9 @@ struct _GstStreamboxSrc
     gboolean  caps_set;            /* Whether caps have been pushed */
     guint64   frame_count;
 
+    /* ---- Colorimetry (from HDMI RX signal info) ---- */
+    gchar     colorimetry[64];     /* GStreamer colorimetry string for caps */
+
     /* ---- Path A (vfmcap) state ---- */
     vfmcap_ctx_t *cap_ctx;        /* libvfmcap context */
     int       heap_fd;             /* /dev/dma_heap/system-uncached fd */
@@ -112,8 +115,8 @@ struct _GstStreamboxSrc
     /* Path A output CMA buffer pool — avoids fd recycling that confuses
      * the encoder's kernel DMA-buf import cache. Rotate through N buffers
      * so each frame submission uses a distinct fd number. */
-#define PATHA_OUT_POOL_SIZE 4
-    int       patha_out_fds[4];    /* pre-allocated CMA output DMA-buf fds */
+#define PATHA_OUT_POOL_SIZE 6
+    int       patha_out_fds[PATHA_OUT_POOL_SIZE]; /* pre-allocated CMA output DMA-buf fds */
     guint     patha_out_slot;      /* round-robin index */
     guint     patha_out_count;     /* number allocated (0 if pool not init'd) */
 

@@ -2088,7 +2088,14 @@ create_path_a(GstStreamboxSrc *self, GstBuffer **buf)
     GstBuffer *buffer = gst_buffer_new();
     gst_buffer_append_memory(buffer, mem);
 
-    GST_BUFFER_PTS(buffer) = frame_ts * GST_USECOND;
+    /*
+     * Leave PTS as GST_CLOCK_TIME_NONE so that GstBaseSrc's do-timestamp
+     * logic assigns the pipeline running time.  Setting PTS to the raw
+     * vdin0 monotonic timestamp here would prevent the override and cause
+     * a massive timestamp mismatch with other live sources (e.g. alsasrc)
+     * in muxed pipelines.
+     */
+    GST_BUFFER_PTS(buffer) = GST_CLOCK_TIME_NONE;
     GST_BUFFER_DURATION(buffer) = gst_util_uint64_scale_int(GST_SECOND,
                                                              self->fps_d,
                                                              self->fps_n);
@@ -3008,8 +3015,7 @@ do_dqbuf:
             GstBuffer *prime_buffer = gst_buffer_new();
             gst_buffer_append_memory(prime_buffer, mem_p);
 
-            GST_BUFFER_PTS(prime_buffer) = (guint64)v4l2_buf.timestamp.tv_sec * GST_SECOND +
-                                            (guint64)v4l2_buf.timestamp.tv_usec * GST_USECOND;
+            GST_BUFFER_PTS(prime_buffer) = GST_CLOCK_TIME_NONE;
             GST_BUFFER_DURATION(prime_buffer) = gst_util_uint64_scale_int(GST_SECOND,
                                                                            self->fps_d,
                                                                            self->fps_n);
@@ -3176,8 +3182,7 @@ do_dqbuf:
                 self->vk_async_out_pool_idx = out_idx2;
                 self->vk_async_vdin1_idx = idx2;
                 self->vk_async_in_fd = self->vdin1_bufs[idx2].dma_fd;
-                self->vk_async_pts = (guint64)v4l2_buf2.timestamp.tv_sec * GST_SECOND +
-                                      (guint64)v4l2_buf2.timestamp.tv_usec * GST_USECOND;
+                self->vk_async_pts = GST_CLOCK_TIME_NONE;
                 self->vk_async_duration = gst_util_uint64_scale_int(GST_SECOND,
                                                                      self->fps_d,
                                                                      self->fps_n);
@@ -3299,7 +3304,7 @@ do_dqbuf:
             GstBuffer *prev_buffer = gst_buffer_new();
             gst_buffer_append_memory(prev_buffer, prev_mem);
 
-            GST_BUFFER_PTS(prev_buffer) = self->vk_async_pts;
+            GST_BUFFER_PTS(prev_buffer) = GST_CLOCK_TIME_NONE;
             GST_BUFFER_DURATION(prev_buffer) = self->vk_async_duration;
 
             {
@@ -3400,8 +3405,7 @@ do_dqbuf:
             self->vk_async_out_pool_idx = new_out_idx;
             self->vk_async_vdin1_idx = idx;
             self->vk_async_in_fd = self->vdin1_bufs[idx].dma_fd;
-            self->vk_async_pts = (guint64)v4l2_buf.timestamp.tv_sec * GST_SECOND +
-                                  (guint64)v4l2_buf.timestamp.tv_usec * GST_USECOND;
+            self->vk_async_pts = GST_CLOCK_TIME_NONE;
             self->vk_async_duration = gst_util_uint64_scale_int(GST_SECOND,
                                                                  self->fps_d,
                                                                  self->fps_n);
@@ -3462,9 +3466,8 @@ do_dqbuf:
         GstBuffer *buffer = gst_buffer_new();
         gst_buffer_append_memory(buffer, mem);
 
-        /* Set timestamps */
-        GST_BUFFER_PTS(buffer) = (guint64)v4l2_buf.timestamp.tv_sec * GST_SECOND +
-                                  (guint64)v4l2_buf.timestamp.tv_usec * GST_USECOND;
+        /* Set timestamps — let GstBaseSrc do-timestamp assign running-time PTS */
+        GST_BUFFER_PTS(buffer) = GST_CLOCK_TIME_NONE;
         GST_BUFFER_DURATION(buffer) = gst_util_uint64_scale_int(GST_SECOND,
                                                                  self->fps_d,
                                                                  self->fps_n);

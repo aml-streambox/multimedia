@@ -17,6 +17,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <poll.h>
+#include <time.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <linux/videodev2.h>
@@ -180,6 +181,27 @@ int vfmcap_start(vfmcap_ctx_t *ctx, unsigned int num_buffers)
     sub.type = V4L2_EVENT_SOURCE_CHANGE;
     xioctl(ctx->fd, VIDIOC_SUBSCRIBE_EVENT, &sub);
 
+    /*
+     * Drain any stale events queued before we subscribed.
+     * The kernel may have queued SOURCE_CHANGE events from prior signal
+     * transitions (e.g. HDMI source went to sleep and woke back up).
+     * If we don't drain them, the first poll() in acquire_frame() will
+     * return immediately with POLLPRI, potentially wasting time on
+     * obsolete events.  Belt-and-suspenders: acquire_frame()'s poll loop
+     * also handles this, but draining here keeps the initial acquire fast.
+     */
+    {
+        struct v4l2_event ev;
+        int drained = 0;
+        memset(&ev, 0, sizeof(ev));
+        while (xioctl(ctx->fd, VIDIOC_DQEVENT, &ev) == 0) {
+            drained++;
+            memset(&ev, 0, sizeof(ev));
+        }
+        if (drained > 0)
+            fprintf(stderr, "[vfmcap] Drained %d stale event(s) at start\n", drained);
+    }
+
     /* Request buffers (MMAP - used as flow-control tokens only) */
     struct v4l2_requestbuffers reqbufs;
     memset(&reqbufs, 0, sizeof(reqbufs));
@@ -298,6 +320,15 @@ void vfmcap_close(vfmcap_ctx_t *ctx)
     free(ctx);
 }
 
+/* ---------- Helpers ---------- */
+
+static int64_t now_ms_mono(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 /* ---------- Frame acquisition ---------- */
 
 int vfmcap_acquire_frame(vfmcap_ctx_t *ctx, vfmcap_frame_t *frame, int timeout_ms)
@@ -312,56 +343,76 @@ int vfmcap_acquire_frame(vfmcap_ctx_t *ctx, vfmcap_frame_t *frame, int timeout_m
     memset(frame, 0, sizeof(*frame));
     frame->dmabuf_fd = -1;
 
-    /* Poll for buffer ready */
+    /*
+     * Poll for buffer ready.
+     *
+     * Must loop because poll() can return early due to V4L2 events
+     * (POLLPRI) without POLLIN being set — e.g. a SOURCE_CHANGE event
+     * queued by the kernel when signal transitions occur.  Without the
+     * loop, a stale event would consume the entire timeout in a single
+     * poll() return, causing a false timeout even though vdin0 is
+     * actively delivering frames.
+     */
     if (timeout_ms != 0) {
-        struct pollfd pfd;
-        pfd.fd = ctx->fd;
-        pfd.events = POLLIN | POLLPRI;
-        pfd.revents = 0;
+        int64_t deadline = now_ms_mono() + timeout_ms;
 
-        int ret = poll(&pfd, 1, timeout_ms);
-        if (ret == 0) {
-            return VFMCAP_ERR_TIMEOUT;
-        }
-        if (ret < 0) {
-            if (errno == EINTR) return VFMCAP_ERR_TIMEOUT;
-            snprintf(ctx->last_error, sizeof(ctx->last_error),
-                     "poll() failed: %s", strerror(errno));
-            return VFMCAP_ERR_IOCTL;
-        }
+        for (;;) {
+            int remaining = (int)(deadline - now_ms_mono());
+            if (remaining <= 0)
+                return VFMCAP_ERR_TIMEOUT;
 
-        /* Check for events first */
-        if (pfd.revents & POLLPRI) {
-            struct v4l2_event event;
-            memset(&event, 0, sizeof(event));
-            if (xioctl(ctx->fd, VIDIOC_DQEVENT, &event) == 0) {
-                if (event.type == V4L2_EVENT_SOURCE_CHANGE) {
-                    /* Extract signal info from event data */
-                    struct vfm_cap_signal_info_kern *sig =
-                        (struct vfm_cap_signal_info_kern *)event.u.data;
-                    if (sig->status == 1) { /* NOSIG */
-                        return VFMCAP_ERR_NOSIG;
+            struct pollfd pfd;
+            pfd.fd = ctx->fd;
+            pfd.events = POLLIN | POLLPRI;
+            pfd.revents = 0;
+
+            int ret = poll(&pfd, 1, remaining);
+            if (ret == 0)
+                return VFMCAP_ERR_TIMEOUT;
+            if (ret < 0) {
+                if (errno == EINTR)
+                    continue;  /* re-check deadline and retry */
+                snprintf(ctx->last_error, sizeof(ctx->last_error),
+                         "poll() failed: %s", strerror(errno));
+                return VFMCAP_ERR_IOCTL;
+            }
+
+            /* Handle events (if any) */
+            if (pfd.revents & POLLPRI) {
+                struct v4l2_event event;
+                memset(&event, 0, sizeof(event));
+                while (xioctl(ctx->fd, VIDIOC_DQEVENT, &event) == 0) {
+                    if (event.type == V4L2_EVENT_SOURCE_CHANGE) {
+                        /* Extract signal info from event data */
+                        struct vfm_cap_signal_info_kern *sig =
+                            (struct vfm_cap_signal_info_kern *)event.u.data;
+                        if (sig->status == 1) { /* NOSIG */
+                            return VFMCAP_ERR_NOSIG;
+                        }
+                        /* Signal changed — format may have updated */
+                        struct v4l2_format fmt;
+                        memset(&fmt, 0, sizeof(fmt));
+                        fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+                        if (xioctl(ctx->fd, VIDIOC_G_FMT, &fmt) == 0) {
+                            ctx->width = fmt.fmt.pix_mp.width;
+                            ctx->height = fmt.fmt.pix_mp.height;
+                            ctx->pixelformat = fmt.fmt.pix_mp.pixelformat;
+                            ctx->bytesperline = fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
+                            ctx->sizeimage = fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
+                        }
+                        fprintf(stderr, "[vfmcap] Source changed: %ux%u\n",
+                                ctx->width, ctx->height);
                     }
-                    /* Signal changed — format may have updated */
-                    struct v4l2_format fmt;
-                    memset(&fmt, 0, sizeof(fmt));
-                    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-                    if (xioctl(ctx->fd, VIDIOC_G_FMT, &fmt) == 0) {
-                        ctx->width = fmt.fmt.pix_mp.width;
-                        ctx->height = fmt.fmt.pix_mp.height;
-                        ctx->pixelformat = fmt.fmt.pix_mp.pixelformat;
-                        ctx->bytesperline = fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
-                        ctx->sizeimage = fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
-                    }
-                    fprintf(stderr, "[vfmcap] Source changed: %ux%u\n",
-                            ctx->width, ctx->height);
+                    memset(&event, 0, sizeof(event));
                 }
             }
-        }
 
-        /* No data available after event handling */
-        if (!(pfd.revents & POLLIN))
-            return VFMCAP_ERR_TIMEOUT;
+            /* If data is available, break out to DQBUF */
+            if (pfd.revents & POLLIN)
+                break;
+
+            /* Only event(s) — no data yet. Loop and re-poll with remaining time. */
+        }
     }
 
     /* DQBUF */

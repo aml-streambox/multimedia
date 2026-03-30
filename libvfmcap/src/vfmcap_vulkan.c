@@ -785,28 +785,21 @@ int vfmcap_vk_convert_wait(void)
     }
 
     /*
-     * Immediately release the Vulkan import for the completed input.
+     * Immediately destroy the Vulkan cache entry for the just-completed
+     * input frame so that Mali releases its dma_buf reference (acquired
+     * via dup'd fd -> vkAllocateMemory -> dma_buf_get inside Mali).
      *
-     * The cache entry holds a Mali dma_buf reference (via dup'd fd ->
-     * vkAllocateMemory -> dma_buf_get inside Mali).  This keeps the
-     * kernel cap_frame alive even after userspace does close(fd)+QBUF.
-     * The cap_frame pins a CMA buffer that vdin0 cannot reuse until
-     * ALL references are dropped.
+     * After vkFreeMemory, Mali's actual dma_buf_put is DEFERRED to an
+     * internal worker thread.  If the caller immediately does close(fd)
+     * + QBUF (which drop the userspace and kernel dma_buf refs), the
+     * CMA buffer won't be recycled to vdin0 until Mali's worker runs.
+     * At 60fps this backlog accumulates and eventually exhausts vdin0's
+     * buffer pool.
      *
-     * With DMABUF_CACHE_SIZE entries cached, we pin that many extra
-     * CMA buffers.  vdin0 only has VFM_CAP_POOL_SIZE=16 buffers, and
-     * the display path (deinterlace -> amvideo) holds 2-3.  Leaving
-     * too few free buffers causes vdin0 to stall, drop frames, or
-     * reuse a buffer still being written by the HDMI receiver — which
-     * corrupts memory and crashes the kernel.
-     *
-     * By destroying the cache entry here (GPU is idle, fence waited),
-     * vkFreeMemory releases Mali's dma_buf ref.  The CMA buffer can
-     * then be recycled promptly when the caller does release_frame().
-     *
-     * This means every frame does a fresh vkAllocateMemory/vkFreeMemory
-     * cycle, but profiling shows these are <0.5ms each — negligible
-     * compared to the ~6ms GPU shader and ~10ms V4L2 acquire.
+     * To fix this, after destroying the cache entry we call
+     * vkDeviceWaitIdle() to force Mali to flush all pending internal
+     * work, including the deferred dma_buf_put.  This ensures the CMA
+     * buffer can be recycled as soon as the caller releases the frame.
      */
     if (ctx.pending_in_fd >= 0) {
         for (int i = 0; i < ctx.input_cache_count; i++) {
@@ -816,6 +809,8 @@ int vfmcap_vk_convert_wait(void)
                 break;
             }
         }
+        /* Force Mali to complete deferred dma_buf_put from vkFreeMemory */
+        vkDeviceWaitIdle(ctx.device);
     }
 
     ctx.has_pending = 0;

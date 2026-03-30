@@ -162,7 +162,7 @@ static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE(
         "format = (string) { NV12, P010_10LE, NV21 }, "
         "width = (int) [ 1, 4096 ], "
         "height = (int) [ 1, 2160 ], "
-        "framerate = (fraction) [ 0/1, 120/1 ]"
+        "framerate = (fraction) [ 0/1, 240/1 ]"
     )
 );
 
@@ -1028,6 +1028,62 @@ hdmirx_get_source_resolution(GstStreamboxSrc *self, guint *w, guint *h)
     }
 
     GST_WARNING_OBJECT(self, "Could not parse HDMI RX resolution from %s",
+                       HDMIRX_INFO_PATH);
+    return FALSE;
+}
+
+/*
+ * Read HDMI RX frame rate from sysfs info.
+ * Returns the frame rate as a GStreamer fraction (fps_n/fps_d).
+ * The sysfs "Frame Rate:" value is in hundredths (e.g. 5992 = 59.92 Hz,
+ * 14400 = 144.00 Hz, 24000 = 240.00 Hz).
+ * Returns TRUE if successfully read, FALSE otherwise.
+ */
+static gboolean
+hdmirx_get_source_framerate(GstStreamboxSrc *self, guint *fps_n, guint *fps_d)
+{
+    FILE *f = fopen(HDMIRX_INFO_PATH, "r");
+    if (!f) {
+        GST_WARNING_OBJECT(self, "Cannot open %s for framerate: %s",
+                           HDMIRX_INFO_PATH, strerror(errno));
+        return FALSE;
+    }
+
+    guint frame_rate = 0;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        guint val;
+        if (sscanf(line, "Frame Rate: %u", &val) == 1) {
+            frame_rate = val;
+            break;
+        }
+    }
+    fclose(f);
+
+    if (frame_rate > 0) {
+        /* Convert from hundredths to fraction.
+         * Common values: 5994 -> 60000/1001, 2997 -> 30000/1001,
+         * 6000 -> 60/1, 12000 -> 120/1, 14400 -> 144/1, 24000 -> 240/1
+         */
+        if (frame_rate % 100 == 0) {
+            *fps_n = frame_rate / 100;
+            *fps_d = 1;
+        } else if (frame_rate == 5994 || frame_rate == 2997 ||
+                   frame_rate == 11988 || frame_rate == 23976) {
+            /* NTSC fractional rates */
+            *fps_n = (frame_rate + 6) / 100 * 1000; /* round up: 5994->60000 */
+            *fps_d = 1001;
+        } else {
+            /* Generic: use frame_rate/100 as integer fps */
+            *fps_n = (frame_rate + 50) / 100;
+            *fps_d = 1;
+        }
+        GST_INFO_OBJECT(self, "HDMI RX frame rate: %u (raw) -> %u/%u fps",
+                        frame_rate, *fps_n, *fps_d);
+        return TRUE;
+    }
+
+    GST_WARNING_OBJECT(self, "Could not parse HDMI RX frame rate from %s",
                        HDMIRX_INFO_PATH);
     return FALSE;
 }
@@ -1905,8 +1961,11 @@ start_path_a(GstStreamboxSrc *self)
     if (ret == VFMCAP_OK) {
         self->width = test_frame.width;
         self->height = test_frame.height;
-        self->fps_n = 60;
-        self->fps_d = 1;
+        /* Read actual framerate from HDMI RX, fall back to 60fps */
+        if (!hdmirx_get_source_framerate(self, &self->fps_n, &self->fps_d)) {
+            self->fps_n = 60;
+            self->fps_d = 1;
+        }
         vfmcap_release_frame(self->cap_ctx, &test_frame);
     } else {
         GST_ELEMENT_ERROR(self, RESOURCE, FAILED,
@@ -2309,8 +2368,11 @@ start_path_b(GstStreamboxSrc *self)
     g_mutex_lock(&self->state_lock);
     self->sig_state = GST_STREAMBOX_STATE_STREAMING;
     g_mutex_unlock(&self->state_lock);
-    self->fps_n = 60;
-    self->fps_d = 1;
+    /* Read actual framerate from HDMI RX, fall back to 60fps */
+    if (!hdmirx_get_source_framerate(self, &self->fps_n, &self->fps_d)) {
+        self->fps_n = 60;
+        self->fps_d = 1;
+    }
 
     GST_INFO_OBJECT(self, "Path B started: %ux%u %s (source %ux%u, %u bufs)",
                      self->width, self->height,

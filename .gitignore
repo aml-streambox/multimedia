@@ -2,3 +2,6 @@ gst-aml-plugins/
 gst-aml-plugins1/
 libplayer/src/
 
+# Yocto externalsrc build outputs
+**/oe-logs/
+**/oe-workdir/

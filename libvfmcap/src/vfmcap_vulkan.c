@@ -103,6 +103,7 @@ typedef struct {
 
     /* Pending state for async submit/wait */
     int                     pending_in_fd;
+    int                     pending_out_fd;
     int                     has_pending;
 } VulkanCtx;
 
@@ -381,6 +382,7 @@ int vfmcap_vk_init(uint32_t width, uint32_t height)
     ctx.cached_output.valid = 0;
     ctx.cached_output.fd = -1;
     ctx.pending_in_fd = -1;
+    ctx.pending_out_fd = -1;
     ctx.has_pending = 0;
 
     for (int i = 0; i < DMABUF_CACHE_SIZE; i++) {
@@ -660,9 +662,14 @@ int vfmcap_vk_convert_submit(int in_fd, int out_fd, uint32_t width,
 
     VkBuffer in_buffer = ctx.input_cache[in_idx].buffer;
 
-    /* Cached output import */
+    /* Cached output import + DMA_BUF_SYNC write-access bracket (start) */
     if (output_cache_get(out_fd, output_size) != 0) return -1;
     VkBuffer out_buffer = ctx.cached_output.buffer;
+
+    struct dma_buf_sync out_sync_start = {
+        .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE
+    };
+    ioctl(out_fd, DMA_BUF_IOCTL_SYNC, &out_sync_start);
 
     /* Record command buffer */
     VkCommandBuffer cmd = ctx.command_buffer;
@@ -757,6 +764,7 @@ int vfmcap_vk_convert_submit(int in_fd, int out_fd, uint32_t width,
     VK_CHECK(result, "vkQueueSubmit");
 
     ctx.pending_in_fd = in_fd;
+    ctx.pending_out_fd = out_fd;
     ctx.has_pending = 1;
 
     return 0;
@@ -776,7 +784,7 @@ int vfmcap_vk_convert_wait(void)
     VkResult result = vkWaitForFences(ctx.device, 1, &ctx.fence,
                                       VK_TRUE, 5000000000ULL);
 
-    /* Release DMA-buf read access */
+    /* Release DMA-buf read access on input */
     if (ctx.pending_in_fd >= 0) {
         struct dma_buf_sync sync_end = {
             .flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ
@@ -800,6 +808,11 @@ int vfmcap_vk_convert_wait(void)
      * vkDeviceWaitIdle() to force Mali to flush all pending internal
      * work, including the deferred dma_buf_put.  This ensures the CMA
      * buffer can be recycled as soon as the caller releases the frame.
+     *
+     * This also serves as a strong flush barrier for the output buffer:
+     * vkDeviceWaitIdle drains Mali's L2 cache and write-combine buffers,
+     * ensuring GPU-written data is visible in RAM before we signal
+     * DMA_BUF_SYNC_END to downstream DMA consumers (VPU encoder).
      */
     if (ctx.pending_in_fd >= 0) {
         for (int i = 0; i < ctx.input_cache_count; i++) {
@@ -809,12 +822,39 @@ int vfmcap_vk_convert_wait(void)
                 break;
             }
         }
-        /* Force Mali to complete deferred dma_buf_put from vkFreeMemory */
-        vkDeviceWaitIdle(ctx.device);
+    }
+    /* Force Mali to complete ALL deferred work — including L2/WC flush
+     * for output writes and deferred dma_buf_put from vkFreeMemory */
+    vkDeviceWaitIdle(ctx.device);
+
+    /*
+     * ARM DSB + ISB to ensure all outstanding AXI write transactions
+     * from Mali have committed to the memory controller before we hand
+     * the buffer to the VPU encoder.  On A311D2 (Cortex-A73/A53 +
+     * Mali-G52), the interconnect may still have in-flight write beats
+     * after vkDeviceWaitIdle returns.
+     *
+     * Follow with a 500µs sleep to allow any remaining write buffer
+     * drain through the NoC.  This is a diagnostic measure to isolate
+     * whether the remaining ~1% tearing is an interconnect timing issue.
+     */
+    __sync_synchronize();
+    usleep(500);
+
+    /* Release DMA-buf write access on output AFTER vkDeviceWaitIdle —
+     * this guarantees Mali's write-combine buffers and L2 cache have
+     * been flushed to RAM, so the kernel's cache maintenance (triggered
+     * by SYNC_END) operates on coherent data visible to DMA consumers. */
+    if (ctx.pending_out_fd >= 0) {
+        struct dma_buf_sync sync_end_wr = {
+            .flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE
+        };
+        ioctl(ctx.pending_out_fd, DMA_BUF_IOCTL_SYNC, &sync_end_wr);
     }
 
     ctx.has_pending = 0;
     ctx.pending_in_fd = -1;
+    ctx.pending_out_fd = -1;
 
     if (result != VK_SUCCESS) {
         snprintf(ctx.last_error, sizeof(ctx.last_error),

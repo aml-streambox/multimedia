@@ -1553,10 +1553,12 @@ gst_streambox_src_init(GstStreamboxSrc *self)
     self->cap_ctx = NULL;
     self->heap_fd = -1;
     self->out_buf_size = 0;
-    self->patha_out_slot = 0;
     self->patha_out_count = 0;
-    for (guint i = 0; i < PATHA_OUT_POOL_SIZE; i++)
+    g_mutex_init(&self->patha_out_lock);
+    for (guint i = 0; i < PATHA_OUT_POOL_SIZE; i++) {
         self->patha_out_fds[i] = -1;
+        self->patha_out_free[i] = FALSE;
+    }
 
     /* Path B */
     self->signal_monitor_fd = -1;
@@ -1704,6 +1706,7 @@ gst_streambox_src_finalize(GObject *object)
     GstStreamboxSrc *self = GST_STREAMBOX_SRC(object);
     g_free(self->device);
     g_mutex_clear(&self->state_lock);
+    g_mutex_clear(&self->patha_out_lock);
 
     if (self->flush_pipefd[0] >= 0)
         close(self->flush_pipefd[0]);
@@ -1983,12 +1986,11 @@ start_path_a(GstStreamboxSrc *self)
     /* Detect colorimetry from HDMI RX signal for caps */
     hdmirx_detect_colorimetry(self);
 
-    /* Pre-allocate a small rotating pool of CMA output buffers.
-     * The encoder's kernel DMA-buf import caches fd→phys_addr mappings;
-     * if the same fd number is recycled (because we alloc/close each frame),
-     * the encoder hardware reads stale physical memory. Using a pool ensures
-     * each frame submission uses a distinct fd number. */
-    self->patha_out_slot = 0;
+    /* Pre-allocate a pool of CMA output buffers with acquire/release lifecycle.
+     * Each buffer is marked "free" initially; create_path_a() acquires one,
+     * and the downstream element's unref of the GstBuffer triggers a callback
+     * that marks it free again. This prevents the Vulkan shader from
+     * overwriting a buffer while the encoder hardware is still reading it. */
     self->patha_out_count = 0;
     for (guint i = 0; i < PATHA_OUT_POOL_SIZE; i++) {
         int fd = alloc_cma_dmabuf(self, self->out_buf_size);
@@ -1999,12 +2001,14 @@ start_path_a(GstStreamboxSrc *self)
             for (guint j = 0; j < i; j++) {
                 close(self->patha_out_fds[j]);
                 self->patha_out_fds[j] = -1;
+                self->patha_out_free[j] = FALSE;
             }
             vfmcap_close(self->cap_ctx);
             self->cap_ctx = NULL;
             return FALSE;
         }
         self->patha_out_fds[i] = fd;
+        self->patha_out_free[i] = TRUE;
         self->patha_out_count++;
     }
 
@@ -2041,14 +2045,57 @@ stop_path_a(GstStreamboxSrc *self)
             close(self->patha_out_fds[i]);
             self->patha_out_fds[i] = -1;
         }
+        self->patha_out_free[i] = FALSE;
     }
     self->patha_out_count = 0;
-    self->patha_out_slot = 0;
 
     if (self->heap_fd >= 0) {
         close(self->heap_fd);
         self->heap_fd = -1;
     }
+}
+
+/* ---- Path A output buffer pool: acquire / release helpers ---- */
+
+typedef struct {
+    GstStreamboxSrc *self;  /* ref'd */
+    guint            pool_index;
+} PathABufContext;
+
+/* Called when the downstream element (encoder) unrefs the GstBuffer.
+ * Marks the pool slot as free so create_path_a() can reuse it. */
+static void
+patha_buf_release(gpointer data)
+{
+    PathABufContext *ctx = (PathABufContext *)data;
+    GstStreamboxSrc *self = ctx->self;
+    guint idx = ctx->pool_index;
+
+    if (idx < self->patha_out_count) {
+        g_mutex_lock(&self->patha_out_lock);
+        self->patha_out_free[idx] = TRUE;
+        g_mutex_unlock(&self->patha_out_lock);
+    }
+
+    gst_object_unref(self);
+    g_free(ctx);
+}
+
+/* Acquire a free buffer slot from the Path A pool.
+ * Returns the index, or -1 if all buffers are in use. */
+static gint
+patha_pool_acquire(GstStreamboxSrc *self)
+{
+    g_mutex_lock(&self->patha_out_lock);
+    for (guint i = 0; i < self->patha_out_count; i++) {
+        if (self->patha_out_free[i]) {
+            self->patha_out_free[i] = FALSE;
+            g_mutex_unlock(&self->patha_out_lock);
+            return (gint)i;
+        }
+    }
+    g_mutex_unlock(&self->patha_out_lock);
+    return -1;
 }
 
 static GstFlowReturn
@@ -2098,11 +2145,29 @@ create_path_a(GstStreamboxSrc *self, GstBuffer **buf)
         return GST_FLOW_EOS;
     }
 
-    /* Get the next pool buffer (round-robin).
-     * The pool ensures each frame gets a distinct fd number, avoiding the
-     * encoder's kernel DMA-buf fd→phys caching that causes stale reads. */
-    guint slot = self->patha_out_slot;
-    self->patha_out_slot = (slot + 1) % self->patha_out_count;
+    /* Acquire a free output buffer from the pool.
+     * The buffer won't be reused until the downstream element (encoder)
+     * unrefs the GstBuffer, which triggers patha_buf_release().
+     * If all buffers are busy, poll briefly — the encoder is synchronous
+     * so a slot should free up within one frame period (~16ms at 60fps). */
+    gint slot = -1;
+    for (int attempt = 0; attempt < 60; attempt++) {  /* up to ~300ms */
+        slot = patha_pool_acquire(self);
+        if (slot >= 0)
+            break;
+        if (self->flushing) {
+            vfmcap_release_frame(self->cap_ctx, &frame);
+            return GST_FLOW_FLUSHING;
+        }
+        g_usleep(5000);  /* 5ms */
+    }
+    if (slot < 0) {
+        GST_ERROR_OBJECT(self,
+            "Path A output pool exhausted after 300ms (%u buffers in use) — frame %lu",
+            self->patha_out_count, (unsigned long)self->frame_count);
+        vfmcap_release_frame(self->cap_ctx, &frame);
+        return GST_FLOW_ERROR;
+    }
     int out_fd = self->patha_out_fds[slot];
 
     /* GPU convert: AMLY -> NV12 or P010 */
@@ -2120,6 +2185,9 @@ create_path_a(GstStreamboxSrc *self, GstBuffer **buf)
     if (ret != VFMCAP_OK) {
         GST_ERROR_OBJECT(self, "GPU conversion failed: %s",
                          vfmcap_last_error(self->cap_ctx));
+        g_mutex_lock(&self->patha_out_lock);
+        self->patha_out_free[slot] = TRUE;
+        g_mutex_unlock(&self->patha_out_lock);
         return GST_FLOW_ERROR;
     }
 
@@ -2130,6 +2198,9 @@ create_path_a(GstStreamboxSrc *self, GstBuffer **buf)
     if (dup_fd < 0) {
         GST_ERROR_OBJECT(self, "dup(out_fd=%d) failed: %s",
                          out_fd, strerror(errno));
+        g_mutex_lock(&self->patha_out_lock);
+        self->patha_out_free[slot] = TRUE;
+        g_mutex_unlock(&self->patha_out_lock);
         return GST_FLOW_ERROR;
     }
 
@@ -2141,6 +2212,9 @@ create_path_a(GstStreamboxSrc *self, GstBuffer **buf)
     if (!mem) {
         GST_ERROR_OBJECT(self, "Failed to wrap DMA-buf fd as GstMemory");
         close(dup_fd);
+        g_mutex_lock(&self->patha_out_lock);
+        self->patha_out_free[slot] = TRUE;
+        g_mutex_unlock(&self->patha_out_lock);
         return GST_FLOW_ERROR;
     }
 
@@ -2181,6 +2255,16 @@ create_path_a(GstStreamboxSrc *self, GstBuffer **buf)
     gst_buffer_add_video_meta_full(buffer, GST_VIDEO_FRAME_FLAG_NONE,
                                     gst_fmt, self->width, self->height,
                                     2, offsets, strides);
+
+    /* Attach release callback — when the encoder (or any downstream element)
+     * unrefs this GstBuffer, patha_buf_release() marks the pool slot as free
+     * so we can safely reuse it for a future frame. */
+    PathABufContext *pctx = g_new(PathABufContext, 1);
+    pctx->self = GST_STREAMBOX_SRC(gst_object_ref(self));
+    pctx->pool_index = (guint)slot;
+    gst_mini_object_set_qdata(GST_MINI_OBJECT(buffer),
+                               g_quark_from_static_string("patha-pool-ctx"),
+                               pctx, patha_buf_release);
 
     self->frame_count++;
 

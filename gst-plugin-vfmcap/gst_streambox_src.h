@@ -112,12 +112,15 @@ struct _GstStreamboxSrc
     int       heap_fd;             /* /dev/dma_heap/system-uncached fd */
     guint32   out_buf_size;        /* Output buffer size for current fmt */
 
-    /* Path A output CMA buffer pool — avoids fd recycling that confuses
-     * the encoder's kernel DMA-buf import cache. Rotate through N buffers
-     * so each frame submission uses a distinct fd number. */
+    /* Path A output CMA buffer pool — acquire/release lifecycle.
+     * Each buffer is marked "in use" when acquired for GPU conversion
+     * and marked "free" when the downstream element (encoder) unrefs
+     * the GstBuffer.  This prevents the GPU from overwriting a buffer
+     * that the encoder hardware is still DMA-reading. */
 #define PATHA_OUT_POOL_SIZE 6
     int       patha_out_fds[PATHA_OUT_POOL_SIZE]; /* pre-allocated CMA output DMA-buf fds */
-    guint     patha_out_slot;      /* round-robin index */
+    gboolean  patha_out_free[PATHA_OUT_POOL_SIZE]; /* TRUE = available for use */
+    GMutex    patha_out_lock;      /* protects patha_out_free[] */
     guint     patha_out_count;     /* number allocated (0 if pool not init'd) */
 
     /* ---- Signal monitor (vfm_cap event fd, used by Path B) ---- */

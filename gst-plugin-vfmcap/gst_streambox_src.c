@@ -69,6 +69,7 @@ _get_time_us(void)
 #define DEFAULT_DEVICE_VFMCAP  "/dev/video_cap"
 #define DEFAULT_DEVICE_VDIN1   "/dev/video71"
 #define DEFAULT_NUM_BUFFERS    6
+#define DEFAULT_PATHA_POOL_SIZE 12
 #define DEFAULT_OUTPUT_FMT     GST_STREAMBOX_OUTPUT_NV12
 #define DEFAULT_SOURCE_MODE    GST_STREAMBOX_SOURCE_VFMCAP
 
@@ -104,6 +105,7 @@ enum
     PROP_SOURCE,
     PROP_DEVICE,
     PROP_NUM_BUFFERS,
+    PROP_PATHA_POOL_SIZE,
     PROP_OUTPUT_FORMAT,
     PROP_VDIN1_INPUT,
 };
@@ -1490,6 +1492,12 @@ gst_streambox_src_class_init(GstStreamboxSrcClass *klass)
             2, 16, DEFAULT_NUM_BUFFERS,
             G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
+    g_object_class_install_property(gobject_class, PROP_PATHA_POOL_SIZE,
+        g_param_spec_uint("patha-pool-size", "Path A Pool Size",
+            "Number of preallocated Path A output DMA-bufs for downstream processing",
+            6, PATHA_OUT_POOL_SIZE_MAX, DEFAULT_PATHA_POOL_SIZE,
+            G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
     g_object_class_install_property(gobject_class, PROP_OUTPUT_FORMAT,
         g_param_spec_enum("output-format", "Output Format",
             "Output pixel format: NV12/NV21 (8-bit) or P010 (10-bit). "
@@ -1534,6 +1542,7 @@ gst_streambox_src_init(GstStreamboxSrc *self)
     self->source_mode = DEFAULT_SOURCE_MODE;
     self->device = NULL;  /* auto-detect */
     self->num_buffers = DEFAULT_NUM_BUFFERS;
+    self->patha_out_pool_size = DEFAULT_PATHA_POOL_SIZE;
     self->output_fmt = DEFAULT_OUTPUT_FMT;
     self->vdin1_input = VDIN1_INPUT_VPP_POST_BLEND;
 
@@ -1555,7 +1564,7 @@ gst_streambox_src_init(GstStreamboxSrc *self)
     self->out_buf_size = 0;
     self->patha_out_count = 0;
     g_mutex_init(&self->patha_out_lock);
-    for (guint i = 0; i < PATHA_OUT_POOL_SIZE; i++) {
+    for (guint i = 0; i < PATHA_OUT_POOL_SIZE_MAX; i++) {
         self->patha_out_fds[i] = -1;
         self->patha_out_free[i] = FALSE;
     }
@@ -1654,6 +1663,9 @@ gst_streambox_src_set_property(GObject *object, guint prop_id,
     case PROP_NUM_BUFFERS:
         self->num_buffers = g_value_get_uint(value);
         break;
+    case PROP_PATHA_POOL_SIZE:
+        self->patha_out_pool_size = g_value_get_uint(value);
+        break;
     case PROP_OUTPUT_FORMAT:
         self->output_fmt = g_value_get_enum(value);
         break;
@@ -1687,6 +1699,9 @@ gst_streambox_src_get_property(GObject *object, guint prop_id,
         break;
     case PROP_NUM_BUFFERS:
         g_value_set_uint(value, self->num_buffers);
+        break;
+    case PROP_PATHA_POOL_SIZE:
+        g_value_set_uint(value, self->patha_out_pool_size);
         break;
     case PROP_OUTPUT_FORMAT:
         g_value_set_enum(value, self->output_fmt);
@@ -1992,11 +2007,11 @@ start_path_a(GstStreamboxSrc *self)
      * that marks it free again. This prevents the Vulkan shader from
      * overwriting a buffer while the encoder hardware is still reading it. */
     self->patha_out_count = 0;
-    for (guint i = 0; i < PATHA_OUT_POOL_SIZE; i++) {
+    for (guint i = 0; i < self->patha_out_pool_size; i++) {
         int fd = alloc_cma_dmabuf(self, self->out_buf_size);
         if (fd < 0) {
             GST_ERROR_OBJECT(self, "Path A pool: failed to allocate buf %u/%u",
-                             i, PATHA_OUT_POOL_SIZE);
+                             i, self->patha_out_pool_size);
             /* Cleanup what we allocated */
             for (guint j = 0; j < i; j++) {
                 close(self->patha_out_fds[j]);

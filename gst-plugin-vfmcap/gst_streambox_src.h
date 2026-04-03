@@ -117,9 +117,10 @@ struct _GstStreamboxSrc
      * and marked "free" when the downstream element (encoder) unrefs
      * the GstBuffer.  This prevents the GPU from overwriting a buffer
      * that the encoder hardware is still DMA-reading. */
-#define PATHA_OUT_POOL_SIZE 12
-    int       patha_out_fds[PATHA_OUT_POOL_SIZE]; /* pre-allocated CMA output DMA-buf fds */
-    gboolean  patha_out_free[PATHA_OUT_POOL_SIZE]; /* TRUE = available for use */
+#define PATHA_OUT_POOL_SIZE_MAX 16
+    guint     patha_out_pool_size; /* requested Path A output pool depth */
+    int       patha_out_fds[PATHA_OUT_POOL_SIZE_MAX]; /* pre-allocated CMA output DMA-buf fds */
+    gboolean  patha_out_free[PATHA_OUT_POOL_SIZE_MAX]; /* TRUE = available for use */
     GMutex    patha_out_lock;      /* protects patha_out_free[] */
     guint     patha_out_count;     /* number allocated (0 if pool not init'd) */
 

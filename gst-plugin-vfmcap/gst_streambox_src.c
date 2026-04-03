@@ -2017,10 +2017,10 @@ start_path_a(GstStreamboxSrc *self)
     self->sig_state = GST_STREAMBOX_STATE_STREAMING;
     g_mutex_unlock(&self->state_lock);
 
-    GST_INFO_OBJECT(self, "Path A started: %ux%u @ %u/%u, output=%s (%u bytes)",
+    GST_INFO_OBJECT(self, "Path A started: %ux%u @ %u/%u, output=%s (%u bytes), pool=%u",
                      self->width, self->height, self->fps_n, self->fps_d,
                      self->output_fmt == GST_STREAMBOX_OUTPUT_P010 ? "P010" : "NV12",
-                     self->out_buf_size);
+                     self->out_buf_size, self->patha_out_count);
     return TRUE;
 }
 

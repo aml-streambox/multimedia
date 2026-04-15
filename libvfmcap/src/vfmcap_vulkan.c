@@ -31,6 +31,7 @@
 #include <fcntl.h>
 
 #include "vfmcap_vulkan.h"
+#include "hdr_lut3d.h"
 
 /* ---------- DMA-buf heap allocation ---------- */
 
@@ -272,6 +273,12 @@ struct VulkanCtx {
     VkDescriptorSetLayout   gfx_descriptor_set_layout_tbdr;
     VkDescriptorSet         gfx_descriptor_set_tbdr;
     VkPipelineLayout        gfx_pipeline_layout_tbdr;
+
+    /* 3D LUT for HDR-to-SDR tone mapping */
+    VkImage                 lut_3d_image;
+    VkDeviceMemory          lut_3d_memory;
+    VkImageView             lut_3d_view;
+    VkSampler               lut_3d_sampler;
 
     VkShaderModule          gfx_shader_vert;
     VkShaderModule          gfx_shader_nv12_y;
@@ -1305,6 +1312,272 @@ static int load_shader(VulkanCtx *vk, const unsigned char *spv_data, size_t spv_
     return 0;
 }
 
+/* ---------- 3D LUT for HDR tone mapping ---------- */
+
+/**
+ * create_lut3d_resources - Create 3D image, view, sampler, and upload LUT data.
+ *
+ * For color_mode 0 (passthrough), creates a 1x1x1 dummy with neutral values
+ * so the descriptor binding is always valid.
+ * For color_mode 1 or 2, generates the full 33^3 LUT and uploads via staging buffer.
+ */
+static int create_lut3d_resources(VulkanCtx *vk)
+{
+    VkResult result;
+    uint32_t dim = (vk->color_mode == 1 || vk->color_mode == 2) ? LUT3D_SIZE : 1;
+    VkDeviceSize texel_bytes = (VkDeviceSize)dim * dim * dim * 4 * sizeof(uint16_t); /* RGBA16 */
+
+    /* --- Create 3D image --- */
+    VkImageCreateInfo img_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType = VK_IMAGE_TYPE_3D,
+        .format = VK_FORMAT_R16G16B16A16_UNORM,
+        .extent = { dim, dim, dim },
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+
+    result = vkCreateImage(vk->device, &img_info, NULL, &vk->lut_3d_image);
+    VK_CHECK(result, "vkCreateImage(lut3d)");
+
+    VkMemoryRequirements mem_req;
+    vkGetImageMemoryRequirements(vk->device, vk->lut_3d_image, &mem_req);
+
+    int mem_type = find_memory_type(vk, mem_req.memoryTypeBits,
+                                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (mem_type < 0) {
+        snprintf(vk->last_error, sizeof(vk->last_error),
+                 "No device-local memory for LUT 3D image");
+        return -1;
+    }
+
+    VkMemoryAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = mem_req.size,
+        .memoryTypeIndex = (uint32_t)mem_type,
+    };
+    result = vkAllocateMemory(vk->device, &alloc_info, NULL, &vk->lut_3d_memory);
+    VK_CHECK(result, "vkAllocateMemory(lut3d)");
+
+    result = vkBindImageMemory(vk->device, vk->lut_3d_image, vk->lut_3d_memory, 0);
+    VK_CHECK(result, "vkBindImageMemory(lut3d)");
+
+    /* --- Create image view --- */
+    VkImageViewCreateInfo view_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image = vk->lut_3d_image,
+        .viewType = VK_IMAGE_VIEW_TYPE_3D,
+        .format = VK_FORMAT_R16G16B16A16_UNORM,
+        .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0, .levelCount = 1,
+            .baseArrayLayer = 0, .layerCount = 1,
+        },
+    };
+    result = vkCreateImageView(vk->device, &view_info, NULL, &vk->lut_3d_view);
+    VK_CHECK(result, "vkCreateImageView(lut3d)");
+
+    /* --- Create sampler (trilinear, clamp-to-edge) --- */
+    VkSamplerCreateInfo sampler_info = {
+        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        .magFilter = VK_FILTER_LINEAR,
+        .minFilter = VK_FILTER_LINEAR,
+        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+        .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .minLod = 0.0f,
+        .maxLod = 0.0f,
+    };
+    result = vkCreateSampler(vk->device, &sampler_info, NULL, &vk->lut_3d_sampler);
+    VK_CHECK(result, "vkCreateSampler(lut3d)");
+
+    /* --- Generate LUT data on CPU --- */
+    uint16_t *lut_data = NULL;
+    if (vk->color_mode == 1 || vk->color_mode == 2) {
+        lut_data = malloc(LUT3D_BYTES);
+        if (!lut_data) {
+            snprintf(vk->last_error, sizeof(vk->last_error), "malloc LUT data failed");
+            return -1;
+        }
+        if (hdr_lut3d_generate(lut_data, vk->color_mode) != 0) {
+            free(lut_data);
+            snprintf(vk->last_error, sizeof(vk->last_error),
+                     "hdr_lut3d_generate failed for mode %u", vk->color_mode);
+            return -1;
+        }
+        hdr_lut3d_sanity_check(lut_data, vk->color_mode);
+        texel_bytes = LUT3D_BYTES;
+    } else {
+        /* 1x1x1 passthrough dummy: mid-gray neutral (Y=0.5, Cb=0.5, Cr=0.5) */
+        lut_data = malloc(8);
+        if (!lut_data) return -1;
+        lut_data[0] = 32768; /* R = Y */
+        lut_data[1] = 32768; /* G = Cb */
+        lut_data[2] = 32768; /* B = Cr */
+        lut_data[3] = 65535; /* A */
+        texel_bytes = 8;
+    }
+
+    /* --- Create staging buffer and upload --- */
+    VkBuffer staging_buf = VK_NULL_HANDLE;
+    VkDeviceMemory staging_mem = VK_NULL_HANDLE;
+
+    VkBufferCreateInfo buf_info = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = texel_bytes,
+        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+    result = vkCreateBuffer(vk->device, &buf_info, NULL, &staging_buf);
+    if (result != VK_SUCCESS) { free(lut_data); VK_CHECK(result, "vkCreateBuffer(staging)"); }
+
+    VkMemoryRequirements staging_req;
+    vkGetBufferMemoryRequirements(vk->device, staging_buf, &staging_req);
+
+    int staging_type = find_memory_type(vk, staging_req.memoryTypeBits,
+                                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (staging_type < 0) {
+        free(lut_data);
+        vkDestroyBuffer(vk->device, staging_buf, NULL);
+        snprintf(vk->last_error, sizeof(vk->last_error),
+                 "No host-visible memory for LUT staging");
+        return -1;
+    }
+
+    VkMemoryAllocateInfo staging_alloc = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = staging_req.size,
+        .memoryTypeIndex = (uint32_t)staging_type,
+    };
+    result = vkAllocateMemory(vk->device, &staging_alloc, NULL, &staging_mem);
+    if (result != VK_SUCCESS) {
+        free(lut_data);
+        vkDestroyBuffer(vk->device, staging_buf, NULL);
+        VK_CHECK(result, "vkAllocateMemory(staging)");
+    }
+
+    result = vkBindBufferMemory(vk->device, staging_buf, staging_mem, 0);
+    if (result != VK_SUCCESS) {
+        free(lut_data);
+        vkFreeMemory(vk->device, staging_mem, NULL);
+        vkDestroyBuffer(vk->device, staging_buf, NULL);
+        VK_CHECK(result, "vkBindBufferMemory(staging)");
+    }
+
+    void *mapped = NULL;
+    result = vkMapMemory(vk->device, staging_mem, 0, texel_bytes, 0, &mapped);
+    if (result != VK_SUCCESS) {
+        free(lut_data);
+        vkFreeMemory(vk->device, staging_mem, NULL);
+        vkDestroyBuffer(vk->device, staging_buf, NULL);
+        VK_CHECK(result, "vkMapMemory(staging)");
+    }
+    memcpy(mapped, lut_data, texel_bytes);
+    vkUnmapMemory(vk->device, staging_mem);
+    free(lut_data);
+
+    /* --- Record upload commands --- */
+    VkCommandBuffer cmd = vk->command_buffer;
+
+    /* Reset fence from signaled state */
+    vkResetFences(vk->device, 1, &vk->fence);
+
+    result = vkResetCommandPool(vk->device, vk->command_pool, 0);
+    VK_CHECK(result, "vkResetCommandPool(lut upload)");
+
+    VkCommandBufferBeginInfo begin = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    result = vkBeginCommandBuffer(cmd, &begin);
+    VK_CHECK(result, "vkBeginCommandBuffer(lut upload)");
+
+    /* Transition UNDEFINED -> TRANSFER_DST_OPTIMAL */
+    VkImageMemoryBarrier to_dst = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = 0,
+        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .image = vk->lut_3d_image,
+        .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0, .levelCount = 1,
+            .baseArrayLayer = 0, .layerCount = 1,
+        },
+    };
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, NULL, 0, NULL, 1, &to_dst);
+
+    /* Copy buffer -> image */
+    VkBufferImageCopy copy_region = {
+        .bufferOffset = 0,
+        .bufferRowLength = 0,
+        .bufferImageHeight = 0,
+        .imageSubresource = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .mipLevel = 0,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        },
+        .imageOffset = {0, 0, 0},
+        .imageExtent = {dim, dim, dim},
+    };
+    vkCmdCopyBufferToImage(cmd, staging_buf, vk->lut_3d_image,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy_region);
+
+    /* Transition TRANSFER_DST -> SHADER_READ_ONLY_OPTIMAL */
+    VkImageMemoryBarrier to_shader = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        .image = vk->lut_3d_image,
+        .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0, .levelCount = 1,
+            .baseArrayLayer = 0, .layerCount = 1,
+        },
+    };
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                         0, 0, NULL, 0, NULL, 1, &to_shader);
+
+    result = vkEndCommandBuffer(cmd);
+    VK_CHECK(result, "vkEndCommandBuffer(lut upload)");
+
+    VkSubmitInfo submit = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &cmd,
+    };
+    result = vkQueueSubmit(vk->graphics_queue, 1, &submit, vk->fence);
+    VK_CHECK(result, "vkQueueSubmit(lut upload)");
+
+    result = vkWaitForFences(vk->device, 1, &vk->fence, VK_TRUE, 5000000000ULL);
+    VK_CHECK(result, "vkWaitForFences(lut upload)");
+
+    /* Cleanup staging resources */
+    vkDestroyBuffer(vk->device, staging_buf, NULL);
+    vkFreeMemory(vk->device, staging_mem, NULL);
+
+    fprintf(stderr, "[vfmcap-vk] 3D LUT created: %ux%ux%u RGBA16 (%s)\n",
+            dim, dim, dim,
+            vk->color_mode == 1 ? "HDR10->SDR" :
+            vk->color_mode == 2 ? "HLG->SDR" : "passthrough dummy");
+
+    return 0;
+}
+
 /* ---------- Initialization ---------- */
 
 int vfmcap_vk_init(VulkanCtx **vk_out, uint32_t width, uint32_t height,
@@ -1493,7 +1766,7 @@ int vfmcap_vk_init(VulkanCtx **vk_out, uint32_t width, uint32_t height,
     /* Descriptor pool */
     VkDescriptorPoolSize pool_sizes[] = {
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6 },
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 6 },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8 },
         { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3 },
     };
 
@@ -1741,15 +2014,17 @@ int vfmcap_vk_init(VulkanCtx **vk_out, uint32_t width, uint32_t height,
                                     &vk->gfx_pipeline_layout_10bit);
     VK_CHECK(result, "vkCreatePipelineLayout(gfx-10bit)");
 
-    /* TBDR-optimized descriptor set layout: single SSBO binding for AMLY input buffer */
+    /* TBDR-optimized descriptor set layout: SSBO + 3D LUT sampler */
     VkDescriptorSetLayoutBinding tbdr_bindings[] = {
         { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+          .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        { .binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
           .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
     };
 
     VkDescriptorSetLayoutCreateInfo tbdr_layout_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        .bindingCount = 1,
+        .bindingCount = 2,
         .pBindings = tbdr_bindings,
     };
 
@@ -2175,6 +2450,13 @@ int vfmcap_vk_init(VulkanCtx **vk_out, uint32_t width, uint32_t height,
             vfmcap_vk_cleanup(vk);
             return -1;
         }
+    }
+
+    /* Create 3D LUT for HDR tone mapping (or dummy for passthrough) */
+    if (create_lut3d_resources(vk) != 0) {
+        fprintf(stderr, "[vfmcap-vk] Failed to create 3D LUT: %s\n", vk->last_error);
+        vfmcap_vk_cleanup(vk);
+        return -1;
     }
 
     vk->initialized = 1;
@@ -2858,17 +3140,32 @@ int vfmcap_vk_render_10bit_and_wait(VulkanCtx *vk, int in_fd,
     result = vkBeginCommandBuffer(cmd, &begin_info);
     VK_CHECK(result, "vkBeginCommandBuffer");
 
-    /* Update TBDR descriptor set with AMLY input buffer */
+    /* Update TBDR descriptor set with AMLY input buffer + 3D LUT */
     VkDescriptorBufferInfo buffer_info = { in_buffer, 0, input_size };
-    VkWriteDescriptorSet tbdr_write = {
-        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-        .dstSet = vk->gfx_descriptor_set_tbdr,
-        .dstBinding = 0,
-        .descriptorCount = 1,
-        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        .pBufferInfo = &buffer_info,
+    VkDescriptorImageInfo lut_info = {
+        .sampler = vk->lut_3d_sampler,
+        .imageView = vk->lut_3d_view,
+        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
     };
-    vkUpdateDescriptorSets(vk->device, 1, &tbdr_write, 0, NULL);
+    VkWriteDescriptorSet tbdr_writes[] = {
+        {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = vk->gfx_descriptor_set_tbdr,
+            .dstBinding = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .pBufferInfo = &buffer_info,
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = vk->gfx_descriptor_set_tbdr,
+            .dstBinding = 1,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .pImageInfo = &lut_info,
+        },
+    };
+    vkUpdateDescriptorSets(vk->device, 2, tbdr_writes, 0, NULL);
 
     /* Push constants: { src_width, src_height, pairs_per_row, color_mode } */
     uint32_t pairs_per_row = src_width / 2;
@@ -3245,6 +3542,15 @@ void vfmcap_vk_cleanup(VulkanCtx *vk)
         vkDestroyPipelineLayout(vk->device, vk->gfx_pipeline_layout_tbdr, NULL);
     if (vk->gfx_descriptor_set_layout_tbdr != VK_NULL_HANDLE)
         vkDestroyDescriptorSetLayout(vk->device, vk->gfx_descriptor_set_layout_tbdr, NULL);
+    /* 3D LUT resources */
+    if (vk->lut_3d_sampler != VK_NULL_HANDLE)
+        vkDestroySampler(vk->device, vk->lut_3d_sampler, NULL);
+    if (vk->lut_3d_view != VK_NULL_HANDLE)
+        vkDestroyImageView(vk->device, vk->lut_3d_view, NULL);
+    if (vk->lut_3d_image != VK_NULL_HANDLE)
+        vkDestroyImage(vk->device, vk->lut_3d_image, NULL);
+    if (vk->lut_3d_memory != VK_NULL_HANDLE)
+        vkFreeMemory(vk->device, vk->lut_3d_memory, NULL);
     if (vk->gfx_shader_vert != VK_NULL_HANDLE)
         vkDestroyShaderModule(vk->device, vk->gfx_shader_vert, NULL);
     if (vk->gfx_shader_nv12_y != VK_NULL_HANDLE)

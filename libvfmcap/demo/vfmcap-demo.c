@@ -647,7 +647,8 @@ int main(int argc, char *argv[])
             do_p010 ? "P010 " : "", do_nv12 ? "NV12 " : "",
             (!do_p010 && !do_nv12) ? "none" : "");
     if (color_mode) fprintf(stderr, "Color: %s\n",
-                            color_mode == 1 ? "HDR10->SDR" : "HLG->SDR");
+                            color_mode == 1 ? "HDR10->SDR" :
+                            color_mode == 2 ? "HLG->SDR" : "unknown");
     if (do_profile) fprintf(stderr, "Mode: PROFILING\n");
 
     /* Open */

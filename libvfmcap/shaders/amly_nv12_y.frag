@@ -1,21 +1,17 @@
 #version 450
-#extension GL_GOOGLE_include_directive : enable
 
-// TBDR-optimized NV12 Y output: reads AMLY SSBO directly in the fragment shader.
+// TBDR-optimized NV12 Y output with 3D LUT HDR conversion.
 //
 // Same decode logic as amly_p010_y.frag, but output is R8_UNORM.
-// The GPU's natural UNORM quantization when writing to R8 does:
-//   stored_uint8 = round(out_float * 255.0)
-//
-// When color_mode != 0, extracts full YCbCr, runs HDR->SDR conversion,
-// and outputs the BT.709 Y component.
+// When color_mode != 0: samples 3D LUT for BT.709 Y.
 //
 // Push constants: { src_width, src_height, pairs_per_row, color_mode }
 //   color_mode: 0=passthrough, 1=HDR10 (PQ)->SDR, 2=HLG->SDR
 // Binding 0: AMLY input buffer (SSBO)
+// Binding 1: 3D LUT texture (sampler3D) — HDR YCbCr->YCbCr lookup
 // Output: R8_UNORM color attachment at source (or scaled) resolution
 
-#include "hdr_colorconv.glsl"
+precision mediump float;
 
 layout(location = 0) in vec2 v_uv;
 layout(location = 0) out float out_y;
@@ -23,6 +19,8 @@ layout(location = 0) out float out_y;
 layout(set = 0, binding = 0, std430) readonly buffer AMLYBuffer {
     uint data[];
 } amly;
+
+layout(set = 0, binding = 1) uniform sampler3D lut3d;
 
 layout(push_constant) uniform Params {
     uint src_width;
@@ -85,23 +83,20 @@ void main() {
     }
 
     if (params.color_mode == 0u) {
-        // Passthrough: output as normalized float; R8_UNORM framebuffer truncates 10->8 bit
+        // Passthrough: R8_UNORM truncates 10->8 bit naturally
         out_y = float(y_val << 6u) / 65535.0;
     } else {
-        // HDR->SDR: need Cb and Cr too
+        // HDR->SDR via 3D LUT
         uint cb_val = (bs >> 12) & 0x3FFu;
         uint cr_val = ((bs & 0x3u) << 8) | hi;
 
-        float y_n  = float(y_val)  / 1023.0;
-        float cb_n = float(cb_val) / 1023.0;
-        float cr_n = float(cr_val) / 1023.0;
+        vec3 coord = vec3(float(y_val) / 1023.0,
+                          float(cb_val) / 1023.0,
+                          float(cr_val) / 1023.0);
 
-        float out_y_sdr = hdr_to_sdr_y(y_n, cb_n, cr_n, params.color_mode);
+        vec4 sdr = texture(lut3d, coord);
 
-        // NV12 R8_UNORM: the hardware writes round(out_float * 255.0).
-        // hdr_to_sdr_y returns a normalized value representing the final
-        // limited-range BT.709 Y. Output directly — the R8_UNORM write
-        // naturally quantizes the 10-bit-range value down to 8 bits.
-        out_y = out_y_sdr;
+        // NV12 R8_UNORM: hardware writes round(out_float * 255.0)
+        out_y = sdr.r;
     }
 }

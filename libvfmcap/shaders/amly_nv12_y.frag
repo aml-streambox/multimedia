@@ -1,0 +1,85 @@
+#version 450
+
+// TBDR-optimized NV12 Y output: reads AMLY SSBO directly in the fragment shader.
+//
+// Same decode logic as amly_p010_y.frag, but output is R8_UNORM.
+// The GPU's natural UNORM quantization when writing to R8 does:
+//   stored_uint8 = round(out_float * 255.0)
+// We output: float(val10 << 6) / 65535.0
+// → stored = round(val10 * 64 / 65535 * 255) = round(val10 * 0.24896...)
+// → ≈ val10 >> 2 (correct 10→8 bit truncation with ≤1 LSB error)
+//
+// Push constants: { src_width, src_height, pairs_per_row, reserved }
+// Binding 0: AMLY input buffer (SSBO)
+// Output: R8_UNORM color attachment at source (or scaled) resolution
+
+layout(location = 0) in vec2 v_uv;
+layout(location = 0) out float out_y;
+
+layout(set = 0, binding = 0, std430) readonly buffer AMLYBuffer {
+    uint data[];
+} amly;
+
+layout(push_constant) uniform Params {
+    uint src_width;
+    uint src_height;
+    uint pairs_per_row;
+    uint reserved;
+} params;
+
+uint bswap32(uint val) {
+    return ((val & 0x000000FFu) << 24) |
+           ((val & 0x0000FF00u) <<  8) |
+           ((val & 0x00FF0000u) >>  8) |
+           ((val & 0xFF000000u) >> 24);
+}
+
+uint read_corrected_word(uint p) {
+    uint base = p & ~1u;
+    uint raw_a = amly.data[base];
+    uint raw_b = amly.data[base + 1u];
+    return ((p & 1u) == 0u) ? bswap32(raw_b) : bswap32(raw_a);
+}
+
+void read_pair(uint pair_idx, out uint lo, out uint hi) {
+    uint byte_offset = pair_idx * 5u;
+    uint word_idx = byte_offset >> 2;
+    uint shift = (byte_offset & 3u) << 3;
+
+    uint cw0 = read_corrected_word(word_idx);
+    uint cw1 = read_corrected_word(word_idx + 1u);
+
+    if (shift == 0u) {
+        lo = cw0;
+        hi = cw1 & 0xFFu;
+    } else {
+        uint cw2 = read_corrected_word(word_idx + 2u);
+        lo = (cw0 >> shift) | (cw1 << (32u - shift));
+        hi = ((cw1 >> shift) | (cw2 << (32u - shift))) & 0xFFu;
+    }
+}
+
+void main() {
+    uint src_x = uint(v_uv.x * float(params.src_width));
+    uint src_y = uint(v_uv.y * float(params.src_height));
+
+    src_x = min(src_x, params.src_width - 1u);
+    src_y = min(src_y, params.src_height - 1u);
+
+    uint pair_in_row = src_x >> 1;
+    uint pair_idx = src_y * params.pairs_per_row + pair_in_row;
+
+    uint lo, hi;
+    read_pair(pair_idx, lo, hi);
+
+    uint bs = bswap32(lo);
+    uint y_val;
+    if ((src_x & 1u) == 0u) {
+        y_val = (bs >> 22) & 0x3FFu;
+    } else {
+        y_val = (bs >> 2) & 0x3FFu;
+    }
+
+    // Output as normalized float; R8_UNORM framebuffer naturally truncates 10→8 bit
+    out_y = float(y_val << 6u) / 65535.0;
+}

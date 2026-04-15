@@ -153,6 +153,12 @@ typedef void (VKAPI_PTR *PFN_vkCmdEndRenderingKHR)(VkCommandBuffer commandBuffer
 #include "../shaders/p010_uv_from_r16g16.frag_spv.h"
 #include "../shaders/yuv_from_yuva.frag_spv.h"
 
+/* TBDR-optimized shaders: fragment reads AMLY SSBO directly, no intermediate images */
+#include "../shaders/amly_p010_y_spv.h"
+#include "../shaders/amly_p010_uv_spv.h"
+#include "../shaders/amly_nv12_y_spv.h"
+#include "../shaders/amly_nv12_uv_spv.h"
+
 /* ---------- DMA-buf import cache (legacy VkBuffer for compute) ---------- */
 
 typedef struct {
@@ -252,11 +258,20 @@ struct VulkanCtx {
     VkPipeline              gfx_pipeline_p010_y;
     VkPipeline              gfx_pipeline_p010_uv;
 
-    /* Graphics pipelines (dynamic rendering) for 10-bit two-plane sampler path */
+    /* Graphics pipelines (dynamic rendering) for 10-bit two-plane sampler path (legacy) */
     VkPipeline              gfx_pipeline_nv12_y_10bit;
     VkPipeline              gfx_pipeline_nv12_uv_10bit;
     VkPipeline              gfx_pipeline_p010_y_10bit;
     VkPipeline              gfx_pipeline_p010_uv_10bit;
+
+    /* TBDR-optimized pipelines: fragment reads AMLY SSBO directly, no intermediates */
+    VkPipeline              gfx_pipeline_tbdr_nv12_y;
+    VkPipeline              gfx_pipeline_tbdr_nv12_uv;
+    VkPipeline              gfx_pipeline_tbdr_p010_y;
+    VkPipeline              gfx_pipeline_tbdr_p010_uv;
+    VkDescriptorSetLayout   gfx_descriptor_set_layout_tbdr;
+    VkDescriptorSet         gfx_descriptor_set_tbdr;
+    VkPipelineLayout        gfx_pipeline_layout_tbdr;
 
     VkShaderModule          gfx_shader_vert;
     VkShaderModule          gfx_shader_nv12_y;
@@ -267,6 +282,10 @@ struct VulkanCtx {
     VkShaderModule          gfx_shader_nv12_uv_from_r16g16;
     VkShaderModule          gfx_shader_p010_y_from_r16;
     VkShaderModule          gfx_shader_p010_uv_from_r16g16;
+    VkShaderModule          gfx_shader_tbdr_p010_y;
+    VkShaderModule          gfx_shader_tbdr_p010_uv;
+    VkShaderModule          gfx_shader_tbdr_nv12_y;
+    VkShaderModule          gfx_shader_tbdr_nv12_uv;
 
     /* Ycbcr sampler for NV12/NV21 input images */
     VkSampler               ycbcr_sampler;
@@ -1470,14 +1489,14 @@ int vfmcap_vk_init(VulkanCtx **vk_out, uint32_t width, uint32_t height, vfmcap_v
 
     /* Descriptor pool */
     VkDescriptorPoolSize pool_sizes[] = {
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6 },
         { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 6 },
         { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3 },
     };
 
     VkDescriptorPoolCreateInfo desc_pool_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .maxSets = 6,
+        .maxSets = 7,
         .poolSizeCount = 3,
         .pPoolSizes = pool_sizes,
     };
@@ -1719,6 +1738,51 @@ int vfmcap_vk_init(VulkanCtx **vk_out, uint32_t width, uint32_t height, vfmcap_v
                                     &vk->gfx_pipeline_layout_10bit);
     VK_CHECK(result, "vkCreatePipelineLayout(gfx-10bit)");
 
+    /* TBDR-optimized descriptor set layout: single SSBO binding for AMLY input buffer */
+    VkDescriptorSetLayoutBinding tbdr_bindings[] = {
+        { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+          .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+    };
+
+    VkDescriptorSetLayoutCreateInfo tbdr_layout_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 1,
+        .pBindings = tbdr_bindings,
+    };
+
+    result = vkCreateDescriptorSetLayout(vk->device, &tbdr_layout_info, NULL,
+                                         &vk->gfx_descriptor_set_layout_tbdr);
+    VK_CHECK(result, "vkCreateDescriptorSetLayout(tbdr)");
+
+    VkDescriptorSetAllocateInfo tbdr_desc_alloc = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = vk->descriptor_pool,
+        .descriptorSetCount = 1,
+        .pSetLayouts = &vk->gfx_descriptor_set_layout_tbdr,
+    };
+
+    result = vkAllocateDescriptorSets(vk->device, &tbdr_desc_alloc, &vk->gfx_descriptor_set_tbdr);
+    VK_CHECK(result, "vkAllocateDescriptorSets(tbdr)");
+
+    /* TBDR pipeline layout: SSBO descriptor + push constants for fragment stage */
+    VkPushConstantRange tbdr_push_constant = {
+        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+        .offset = 0,
+        .size = sizeof(uint32_t) * 4,  /* { src_width, src_height, pairs_per_row, reserved } */
+    };
+
+    VkPipelineLayoutCreateInfo tbdr_pl_layout_info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1,
+        .pSetLayouts = &vk->gfx_descriptor_set_layout_tbdr,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &tbdr_push_constant,
+    };
+
+    result = vkCreatePipelineLayout(vk->device, &tbdr_pl_layout_info, NULL,
+                                    &vk->gfx_pipeline_layout_tbdr);
+    VK_CHECK(result, "vkCreatePipelineLayout(tbdr)");
+
     /* Load shaders */
     if (load_shader(vk, amly_to_p010_spv, sizeof(amly_to_p010_spv),
                     &vk->shader_p010) != 0) {
@@ -1829,6 +1893,32 @@ int vfmcap_vk_init(VulkanCtx **vk_out, uint32_t width, uint32_t height, vfmcap_v
     }
     if (load_shader(vk, p010_uv_from_r16g16_frag_spv, sizeof(p010_uv_from_r16g16_frag_spv),
                     &vk->gfx_shader_p010_uv_from_r16g16) != 0) {
+        *vk_out = NULL;
+        vfmcap_vk_cleanup(vk);
+        return -1;
+    }
+
+    /* Load TBDR-optimized fragment shaders (AMLY SSBO direct-read) */
+    if (load_shader(vk, amly_p010_y_spv, sizeof(amly_p010_y_spv),
+                    &vk->gfx_shader_tbdr_p010_y) != 0) {
+        *vk_out = NULL;
+        vfmcap_vk_cleanup(vk);
+        return -1;
+    }
+    if (load_shader(vk, amly_p010_uv_spv, sizeof(amly_p010_uv_spv),
+                    &vk->gfx_shader_tbdr_p010_uv) != 0) {
+        *vk_out = NULL;
+        vfmcap_vk_cleanup(vk);
+        return -1;
+    }
+    if (load_shader(vk, amly_nv12_y_spv, sizeof(amly_nv12_y_spv),
+                    &vk->gfx_shader_tbdr_nv12_y) != 0) {
+        *vk_out = NULL;
+        vfmcap_vk_cleanup(vk);
+        return -1;
+    }
+    if (load_shader(vk, amly_nv12_uv_spv, sizeof(amly_nv12_uv_spv),
+                    &vk->gfx_shader_tbdr_nv12_uv) != 0) {
         *vk_out = NULL;
         vfmcap_vk_cleanup(vk);
         return -1;
@@ -2017,6 +2107,51 @@ int vfmcap_vk_init(VulkanCtx **vk_out, uint32_t width, uint32_t height, vfmcap_v
                                        NULL, &vk->gfx_pipeline_p010_uv_10bit);
     VK_CHECK(result, "vkCreateGraphicsPipelines(P010 UV 10bit)");
 
+    /* Create TBDR-optimized graphics pipelines (fragment reads AMLY SSBO directly) */
+    gfx_info.pNext = &nv12_y_render;  /* R8_UNORM */
+    gfx_info.pStages = (VkPipelineShaderStageCreateInfo[]){
+        vert_stage,
+        { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0,
+          VK_SHADER_STAGE_FRAGMENT_BIT, vk->gfx_shader_tbdr_nv12_y, "main", NULL },
+    };
+    gfx_info.layout = vk->gfx_pipeline_layout_tbdr;
+    result = vkCreateGraphicsPipelines(vk->device, VK_NULL_HANDLE, 1, &gfx_info,
+                                       NULL, &vk->gfx_pipeline_tbdr_nv12_y);
+    VK_CHECK(result, "vkCreateGraphicsPipelines(TBDR NV12 Y)");
+
+    gfx_info.pNext = &nv12_uv_render;  /* R8G8_UNORM */
+    gfx_info.pStages = (VkPipelineShaderStageCreateInfo[]){
+        vert_stage,
+        { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0,
+          VK_SHADER_STAGE_FRAGMENT_BIT, vk->gfx_shader_tbdr_nv12_uv, "main", NULL },
+    };
+    gfx_info.layout = vk->gfx_pipeline_layout_tbdr;
+    result = vkCreateGraphicsPipelines(vk->device, VK_NULL_HANDLE, 1, &gfx_info,
+                                       NULL, &vk->gfx_pipeline_tbdr_nv12_uv);
+    VK_CHECK(result, "vkCreateGraphicsPipelines(TBDR NV12 UV)");
+
+    gfx_info.pNext = &p010_y_render;  /* R16_UNORM */
+    gfx_info.pStages = (VkPipelineShaderStageCreateInfo[]){
+        vert_stage,
+        { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0,
+          VK_SHADER_STAGE_FRAGMENT_BIT, vk->gfx_shader_tbdr_p010_y, "main", NULL },
+    };
+    gfx_info.layout = vk->gfx_pipeline_layout_tbdr;
+    result = vkCreateGraphicsPipelines(vk->device, VK_NULL_HANDLE, 1, &gfx_info,
+                                       NULL, &vk->gfx_pipeline_tbdr_p010_y);
+    VK_CHECK(result, "vkCreateGraphicsPipelines(TBDR P010 Y)");
+
+    gfx_info.pNext = &p010_uv_render;  /* R16G16_UNORM */
+    gfx_info.pStages = (VkPipelineShaderStageCreateInfo[]){
+        vert_stage,
+        { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0,
+          VK_SHADER_STAGE_FRAGMENT_BIT, vk->gfx_shader_tbdr_p010_uv, "main", NULL },
+    };
+    gfx_info.layout = vk->gfx_pipeline_layout_tbdr;
+    result = vkCreateGraphicsPipelines(vk->device, VK_NULL_HANDLE, 1, &gfx_info,
+                                       NULL, &vk->gfx_pipeline_tbdr_p010_uv);
+    VK_CHECK(result, "vkCreateGraphicsPipelines(TBDR P010 UV)");
+
     /* Create output pools based on requested format */
     if (fmt == VFMCAP_VK_FMT_NV12 || fmt == VFMCAP_VK_FMT_NV21) {
         if (output_pool_create(vk, 4, width, height, VK_FORMAT_R8_UNORM,
@@ -2037,17 +2172,6 @@ int vfmcap_vk_init(VulkanCtx **vk_out, uint32_t width, uint32_t height, vfmcap_v
             vfmcap_vk_cleanup(vk);
             return -1;
         }
-    }
-
-    /* Create R16 Y + R16G16 UV intermediate pools for 10-bit compute->graphics chain */
-    if (output_pool_create_internal(vk, 4, width, height, VK_FORMAT_R16_UNORM,
-                                     VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                                     &vk->pool_intermediate_y) != 0 ||
-        output_pool_create_internal(vk, 4, width / 2, height / 2, VK_FORMAT_R16G16_UNORM,
-                                     VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                                     &vk->pool_intermediate_uv) != 0) {
-        vfmcap_vk_cleanup(vk);
-        return -1;
     }
 
     vk->initialized = 1;
@@ -2668,13 +2792,13 @@ int vfmcap_vk_render_10bit_and_wait(VulkanCtx *vk, int in_fd,
     OutputPool *uv_pool = NULL;
 
     if (fmt == VFMCAP_VK_FMT_NV12 || fmt == VFMCAP_VK_FMT_NV21) {
-        y_pipeline = vk->gfx_pipeline_nv12_y_10bit;
-        uv_pipeline = vk->gfx_pipeline_nv12_uv_10bit;
+        y_pipeline = vk->gfx_pipeline_tbdr_nv12_y;
+        uv_pipeline = vk->gfx_pipeline_tbdr_nv12_uv;
         y_pool = &vk->pool_nv12_y;
         uv_pool = &vk->pool_nv12_uv;
     } else if (fmt == VFMCAP_VK_FMT_P010) {
-        y_pipeline = vk->gfx_pipeline_p010_y_10bit;
-        uv_pipeline = vk->gfx_pipeline_p010_uv_10bit;
+        y_pipeline = vk->gfx_pipeline_tbdr_p010_y;
+        uv_pipeline = vk->gfx_pipeline_tbdr_p010_uv;
         y_pool = &vk->pool_p010_y;
         uv_pool = &vk->pool_p010_uv;
     } else {
@@ -2694,38 +2818,21 @@ int vfmcap_vk_render_10bit_and_wait(VulkanCtx *vk, int in_fd,
     };
     ioctl(in_fd, DMA_BUF_IOCTL_SYNC, &sync_start_rd);
 
-    /* Acquire intermediate (R16 Y + R16G16 UV) and output pool entries */
-    OutputPoolEntry *intermediate_y_entry = output_pool_acquire(&vk->pool_intermediate_y);
-    OutputPoolEntry *intermediate_uv_entry = output_pool_acquire(&vk->pool_intermediate_uv);
+    /* Acquire output pool entries only — no intermediates needed */
     OutputPoolEntry *y_entry = output_pool_acquire(y_pool);
     OutputPoolEntry *uv_entry = output_pool_acquire(uv_pool);
-    if (!intermediate_y_entry || !intermediate_uv_entry || !y_entry || !uv_entry) {
-        if (intermediate_y_entry) output_pool_release(&vk->pool_intermediate_y, intermediate_y_entry);
-        if (intermediate_uv_entry) output_pool_release(&vk->pool_intermediate_uv, intermediate_uv_entry);
+    if (!y_entry || !uv_entry) {
         if (y_entry) output_pool_release(y_pool, y_entry);
         if (uv_entry) output_pool_release(uv_pool, uv_entry);
         snprintf(vk->last_error, sizeof(vk->last_error), "Output pool exhausted");
         return -1;
     }
 
-    VkImage intermediate_y_image = intermediate_y_entry->image;
-    VkImageView intermediate_y_view = intermediate_y_entry->view;
-    VkImage intermediate_uv_image = intermediate_uv_entry->image;
-    VkImageView intermediate_uv_view = intermediate_uv_entry->view;
-
-    /* Get output images and views.
-     * For copyout pool entries (has_copy_buffer=1), the image/view are stored
-     * directly in the pool entry (internal GPU-local).
-     * For regular DMA-buf pool entries, import via image cache. */
-    VkImage out_y_image, out_uv_image;
-    VkImageView out_y_view, out_uv_view;
+    VkImage out_y_image = y_entry->image;
+    VkImageView out_y_view = y_entry->view;
+    VkImage out_uv_image = uv_entry->image;
+    VkImageView out_uv_view = uv_entry->view;
     int uses_copyout = y_entry->has_copy_buffer;
-
-    /* Both copyout and DMA-buf pool entries have image + view from creation */
-    out_y_image = y_entry->image;
-    out_y_view = y_entry->view;
-    out_uv_image = uv_entry->image;
-    out_uv_view = uv_entry->view;
 
     VkResult result;
 
@@ -2748,82 +2855,21 @@ int vfmcap_vk_render_10bit_and_wait(VulkanCtx *vk, int in_fd,
     result = vkBeginCommandBuffer(cmd, &begin_info);
     VK_CHECK(result, "vkBeginCommandBuffer");
 
-    /* Update compute descriptors: buffer + Y image + UV image */
+    /* Update TBDR descriptor set with AMLY input buffer */
     VkDescriptorBufferInfo buffer_info = { in_buffer, 0, input_size };
-    VkDescriptorImageInfo img_info_y = {
-        .imageView = intermediate_y_view,
-        .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+    VkWriteDescriptorSet tbdr_write = {
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = vk->gfx_descriptor_set_tbdr,
+        .dstBinding = 0,
+        .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .pBufferInfo = &buffer_info,
     };
-    VkDescriptorImageInfo img_info_uv = {
-        .imageView = intermediate_uv_view,
-        .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
-    };
-    VkWriteDescriptorSet compute_writes[] = {
-        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-          .dstSet = vk->compute_descriptor_set_decode, .dstBinding = 0,
-          .descriptorCount = 1,
-          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-          .pBufferInfo = &buffer_info },
-        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-          .dstSet = vk->compute_descriptor_set_decode, .dstBinding = 1,
-          .descriptorCount = 1,
-          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-          .pImageInfo = &img_info_y },
-        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-          .dstSet = vk->compute_descriptor_set_decode, .dstBinding = 2,
-          .descriptorCount = 1,
-          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-          .pImageInfo = &img_info_uv },
-    };
-    vkUpdateDescriptorSets(vk->device, 3, compute_writes, 0, NULL);
+    vkUpdateDescriptorSets(vk->device, 1, &tbdr_write, 0, NULL);
 
-    /* Bind compute pipeline and dispatch */
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipeline_amly_decode);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            vk->pipeline_layout_decode, 0, 1,
-                            &vk->compute_descriptor_set_decode, 0, NULL);
-
+    /* Push constants: { src_width, src_height, pairs_per_row, reserved } */
     uint32_t pairs_per_row = src_width / 2;
     uint32_t push_data[] = { src_width, src_height, pairs_per_row, 0u };
-    vkCmdPushConstants(cmd, vk->pipeline_layout_decode, VK_SHADER_STAGE_COMPUTE_BIT,
-                       0, sizeof(push_data), push_data);
-
-    uint32_t groups_x = (pairs_per_row + 127) / 128;
-    uint32_t groups_y = src_height;
-    vkCmdDispatch(cmd, groups_x, groups_y, 1);
-
-    /* Transition intermediate Y/UV images to SHADER_READ_ONLY_OPTIMAL for graphics */
-    VkImageMemoryBarrier intermediate_y_barrier = {
-        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-        .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
-        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-        .image = intermediate_y_image,
-        .subresourceRange = {
-            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-            .baseMipLevel = 0,
-            .levelCount = 1,
-            .baseArrayLayer = 0,
-            .layerCount = 1,
-        },
-    };
-
-    VkImageMemoryBarrier intermediate_uv_barrier = {
-        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-        .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
-        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-        .image = intermediate_uv_image,
-        .subresourceRange = {
-            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-            .baseMipLevel = 0,
-            .levelCount = 1,
-            .baseArrayLayer = 0,
-            .layerCount = 1,
-        },
-    };
 
     /* Transition output Y to COLOR_ATTACHMENT_OPTIMAL */
     VkImageMemoryBarrier out_y_barrier = {
@@ -2835,49 +2881,17 @@ int vfmcap_vk_render_10bit_and_wait(VulkanCtx *vk, int in_fd,
         .image = out_y_image,
         .subresourceRange = {
             .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-            .baseMipLevel = 0,
-            .levelCount = 1,
-            .baseArrayLayer = 0,
-            .layerCount = 1,
+            .baseMipLevel = 0, .levelCount = 1,
+            .baseArrayLayer = 0, .layerCount = 1,
         },
     };
 
-    VkImageMemoryBarrier barriers[3] = { intermediate_y_barrier, intermediate_uv_barrier, out_y_barrier };
     vkCmdPipelineBarrier(cmd,
-                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
                          VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
                          VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                         0, 0, NULL, 0, NULL, 3, barriers);
+                         0, 0, NULL, 0, NULL, 1, &out_y_barrier);
 
-    /* Update graphics descriptor set with intermediate Y and UV image views */
-    VkDescriptorImageInfo img_info_gfx_y = {
-        .sampler = vk->regular_sampler,
-        .imageView = intermediate_y_view,
-        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-    };
-    VkDescriptorImageInfo img_info_gfx_uv = {
-        .sampler = vk->regular_sampler,
-        .imageView = intermediate_uv_view,
-        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-    };
-    VkWriteDescriptorSet gfx_writes[] = {
-        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-          .dstSet = vk->gfx_descriptor_set_10bit,
-          .dstBinding = 0,
-          .descriptorCount = 1,
-          .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-          .pImageInfo = &img_info_gfx_y },
-        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-          .dstSet = vk->gfx_descriptor_set_10bit,
-          .dstBinding = 1,
-          .descriptorCount = 1,
-          .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-          .pImageInfo = &img_info_gfx_uv },
-    };
-    vkUpdateDescriptorSets(vk->device, 2, gfx_writes, 0, NULL);
-
-    /* Y pass */
+    /* ---- Y pass: TBDR fragment reads AMLY SSBO, writes Y output ---- */
     VkRenderingAttachmentInfo y_attach = {
         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
         .imageView = out_y_view,
@@ -2897,8 +2911,10 @@ int vfmcap_vk_render_10bit_and_wait(VulkanCtx *vk, int in_fd,
     vk->cmd_begin_rendering(cmd, &y_render);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, y_pipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            vk->gfx_pipeline_layout_10bit, 0, 1,
-                            &vk->gfx_descriptor_set_10bit, 0, NULL);
+                            vk->gfx_pipeline_layout_tbdr, 0, 1,
+                            &vk->gfx_descriptor_set_tbdr, 0, NULL);
+    vkCmdPushConstants(cmd, vk->gfx_pipeline_layout_tbdr,
+                       VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push_data), push_data);
     VkViewport viewport_y = { 0.0f, 0.0f, (float)dst_width, (float)dst_height, 0.0f, 1.0f };
     VkRect2D scissor_y = { {0, 0}, {dst_width, dst_height} };
     vkCmdSetViewport(cmd, 0, 1, &viewport_y);
@@ -2906,7 +2922,8 @@ int vfmcap_vk_render_10bit_and_wait(VulkanCtx *vk, int in_fd,
     vkCmdDraw(cmd, 3, 1, 0, 0);
     vk->cmd_end_rendering(cmd);
 
-    /* Transition output Y: COLOR_ATTACHMENT -> TRANSFER_SRC (if copyout) or GENERAL */
+    /* Transition Y output: COLOR_ATTACHMENT -> TRANSFER_SRC (copyout) or GENERAL
+     * Transition UV output: UNDEFINED -> COLOR_ATTACHMENT */
     VkImageLayout y_final_layout = uses_copyout ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
                                                 : VK_IMAGE_LAYOUT_GENERAL;
     VkAccessFlags y_final_access = uses_copyout ? VK_ACCESS_TRANSFER_READ_BIT : 0;
@@ -2922,14 +2939,11 @@ int vfmcap_vk_render_10bit_and_wait(VulkanCtx *vk, int in_fd,
         .image = out_y_image,
         .subresourceRange = {
             .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-            .baseMipLevel = 0,
-            .levelCount = 1,
-            .baseArrayLayer = 0,
-            .layerCount = 1,
+            .baseMipLevel = 0, .levelCount = 1,
+            .baseArrayLayer = 0, .layerCount = 1,
         },
     };
 
-    /* Transition output UV to COLOR_ATTACHMENT_OPTIMAL */
     VkImageMemoryBarrier out_uv_barrier = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
         .srcAccessMask = 0,
@@ -2939,22 +2953,18 @@ int vfmcap_vk_render_10bit_and_wait(VulkanCtx *vk, int in_fd,
         .image = out_uv_image,
         .subresourceRange = {
             .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-            .baseMipLevel = 0,
-            .levelCount = 1,
-            .baseArrayLayer = 0,
-            .layerCount = 1,
+            .baseMipLevel = 0, .levelCount = 1,
+            .baseArrayLayer = 0, .layerCount = 1,
         },
     };
 
-    VkImageMemoryBarrier barriers2[2] = { y_post_render, out_uv_barrier };
+    VkImageMemoryBarrier barriers[2] = { y_post_render, out_uv_barrier };
     vkCmdPipelineBarrier(cmd,
                          VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
-                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                         y_final_stage,
-                         0, 0, NULL, 0, NULL, 2, barriers2);
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | y_final_stage,
+                         0, 0, NULL, 0, NULL, 2, barriers);
 
-    /* UV pass */
+    /* ---- UV pass: TBDR fragment reads 2 AMLY rows, averages chroma ---- */
     VkRenderingAttachmentInfo uv_attach = {
         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
         .imageView = out_uv_view,
@@ -2973,6 +2983,11 @@ int vfmcap_vk_render_10bit_and_wait(VulkanCtx *vk, int in_fd,
 
     vk->cmd_begin_rendering(cmd, &uv_render);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, uv_pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            vk->gfx_pipeline_layout_tbdr, 0, 1,
+                            &vk->gfx_descriptor_set_tbdr, 0, NULL);
+    vkCmdPushConstants(cmd, vk->gfx_pipeline_layout_tbdr,
+                       VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push_data), push_data);
     VkViewport viewport_uv = { 0.0f, 0.0f, (float)(dst_width / 2), (float)(dst_height / 2), 0.0f, 1.0f };
     VkRect2D scissor_uv = { {0, 0}, {dst_width / 2, dst_height / 2} };
     vkCmdSetViewport(cmd, 0, 1, &viewport_uv);
@@ -2981,8 +2996,7 @@ int vfmcap_vk_render_10bit_and_wait(VulkanCtx *vk, int in_fd,
     vk->cmd_end_rendering(cmd);
 
     if (uses_copyout) {
-        /* Copyout path: transition UV image to TRANSFER_SRC, then copy both
-         * images to their DMA-buf backed buffers. */
+        /* Copyout path: transition UV to TRANSFER_SRC, then copy both planes */
         VkImageMemoryBarrier uv_to_transfer = {
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
@@ -2992,10 +3006,8 @@ int vfmcap_vk_render_10bit_and_wait(VulkanCtx *vk, int in_fd,
             .image = out_uv_image,
             .subresourceRange = {
                 .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                .baseMipLevel = 0,
-                .levelCount = 1,
-                .baseArrayLayer = 0,
-                .layerCount = 1,
+                .baseMipLevel = 0, .levelCount = 1,
+                .baseArrayLayer = 0, .layerCount = 1,
             },
         };
 
@@ -3011,9 +3023,7 @@ int vfmcap_vk_render_10bit_and_wait(VulkanCtx *vk, int in_fd,
             .bufferImageHeight = dst_height,
             .imageSubresource = {
                 .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                .mipLevel = 0,
-                .baseArrayLayer = 0,
-                .layerCount = 1,
+                .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1,
             },
             .imageOffset = {0, 0, 0},
             .imageExtent = {dst_width, dst_height, 1},
@@ -3028,9 +3038,7 @@ int vfmcap_vk_render_10bit_and_wait(VulkanCtx *vk, int in_fd,
             .bufferImageHeight = dst_height / 2,
             .imageSubresource = {
                 .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                .mipLevel = 0,
-                .baseArrayLayer = 0,
-                .layerCount = 1,
+                .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1,
             },
             .imageOffset = {0, 0, 0},
             .imageExtent = {dst_width / 2, dst_height / 2, 1},
@@ -3038,7 +3046,7 @@ int vfmcap_vk_render_10bit_and_wait(VulkanCtx *vk, int in_fd,
         vkCmdCopyImageToBuffer(cmd, out_uv_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                uv_entry->copy_buffer, 1, &uv_copy);
 
-        /* Memory barrier to ensure transfer is visible to host/downstream */
+        /* Memory barrier for transfer visibility */
         VkMemoryBarrier transfer_done = {
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
             .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -3059,10 +3067,8 @@ int vfmcap_vk_render_10bit_and_wait(VulkanCtx *vk, int in_fd,
             .image = out_uv_image,
             .subresourceRange = {
                 .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                .baseMipLevel = 0,
-                .levelCount = 1,
-                .baseArrayLayer = 0,
-                .layerCount = 1,
+                .baseMipLevel = 0, .levelCount = 1,
+                .baseArrayLayer = 0, .layerCount = 1,
             },
         };
 
@@ -3075,8 +3081,7 @@ int vfmcap_vk_render_10bit_and_wait(VulkanCtx *vk, int in_fd,
     result = vkEndCommandBuffer(cmd);
     VK_CHECK(result, "vkEndCommandBuffer");
 
-    /* DMA-buf sync: start write access on output copyout buffers before GPU submit
-     * (needed for cached DMA-buf heap buffers to ensure CPU cache coherency) */
+    /* DMA-buf sync: start write access on output copyout buffers */
     if (uses_copyout) {
         struct dma_buf_sync sync_start_wr = {
             .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE
@@ -3093,7 +3098,7 @@ int vfmcap_vk_render_10bit_and_wait(VulkanCtx *vk, int in_fd,
     };
 
     result = vkQueueSubmit(vk->graphics_queue, 1, &submit_info, vk->fence);
-    VK_CHECK(result, "vkQueueSubmit(graphics-10bit)");
+    VK_CHECK(result, "vkQueueSubmit(tbdr-10bit)");
 
     vk->pending_in_fd = in_fd;
     vk->pending_out_fd = y_entry->dmabuf_fd;
@@ -3103,16 +3108,10 @@ int vfmcap_vk_render_10bit_and_wait(VulkanCtx *vk, int in_fd,
     /* Wait for completion */
     int ret = vfmcap_vk_convert_wait(vk);
     if (ret != 0) {
-        output_pool_release(&vk->pool_intermediate_y, intermediate_y_entry);
-        output_pool_release(&vk->pool_intermediate_uv, intermediate_uv_entry);
         output_pool_release(y_pool, y_entry);
         output_pool_release(uv_pool, uv_entry);
         return -1;
     }
-
-    /* Release intermediate pools immediately — they are internal temporaries */
-    output_pool_release(&vk->pool_intermediate_y, intermediate_y_entry);
-    output_pool_release(&vk->pool_intermediate_uv, intermediate_uv_entry);
 
     *out_y_fd = y_entry->dmabuf_fd;
     *out_uv_fd = uv_entry->dmabuf_fd;
@@ -3195,8 +3194,6 @@ void vfmcap_vk_cleanup(VulkanCtx *vk)
     output_pool_destroy(vk, &vk->pool_p010_uv);
     output_pool_destroy(vk, &vk->pool_nv12_afbc);
     output_pool_destroy(vk, &vk->pool_a2b10g10r10_afbc);
-    output_pool_destroy(vk, &vk->pool_intermediate_y);
-    output_pool_destroy(vk, &vk->pool_intermediate_uv);
 
     cache_entry_destroy(vk, &vk->cached_output);
 
@@ -3232,6 +3229,19 @@ void vfmcap_vk_cleanup(VulkanCtx *vk)
         vkDestroyPipeline(vk->device, vk->gfx_pipeline_nv12_y_10bit, NULL);
     if (vk->gfx_pipeline_nv12_uv_10bit != VK_NULL_HANDLE)
         vkDestroyPipeline(vk->device, vk->gfx_pipeline_nv12_uv_10bit, NULL);
+    /* TBDR pipelines */
+    if (vk->gfx_pipeline_tbdr_nv12_y != VK_NULL_HANDLE)
+        vkDestroyPipeline(vk->device, vk->gfx_pipeline_tbdr_nv12_y, NULL);
+    if (vk->gfx_pipeline_tbdr_nv12_uv != VK_NULL_HANDLE)
+        vkDestroyPipeline(vk->device, vk->gfx_pipeline_tbdr_nv12_uv, NULL);
+    if (vk->gfx_pipeline_tbdr_p010_y != VK_NULL_HANDLE)
+        vkDestroyPipeline(vk->device, vk->gfx_pipeline_tbdr_p010_y, NULL);
+    if (vk->gfx_pipeline_tbdr_p010_uv != VK_NULL_HANDLE)
+        vkDestroyPipeline(vk->device, vk->gfx_pipeline_tbdr_p010_uv, NULL);
+    if (vk->gfx_pipeline_layout_tbdr != VK_NULL_HANDLE)
+        vkDestroyPipelineLayout(vk->device, vk->gfx_pipeline_layout_tbdr, NULL);
+    if (vk->gfx_descriptor_set_layout_tbdr != VK_NULL_HANDLE)
+        vkDestroyDescriptorSetLayout(vk->device, vk->gfx_descriptor_set_layout_tbdr, NULL);
     if (vk->gfx_shader_vert != VK_NULL_HANDLE)
         vkDestroyShaderModule(vk->device, vk->gfx_shader_vert, NULL);
     if (vk->gfx_shader_nv12_y != VK_NULL_HANDLE)
@@ -3250,6 +3260,15 @@ void vfmcap_vk_cleanup(VulkanCtx *vk)
         vkDestroyShaderModule(vk->device, vk->gfx_shader_p010_y_from_r16, NULL);
     if (vk->gfx_shader_p010_uv_from_r16g16 != VK_NULL_HANDLE)
         vkDestroyShaderModule(vk->device, vk->gfx_shader_p010_uv_from_r16g16, NULL);
+    /* TBDR shader modules */
+    if (vk->gfx_shader_tbdr_p010_y != VK_NULL_HANDLE)
+        vkDestroyShaderModule(vk->device, vk->gfx_shader_tbdr_p010_y, NULL);
+    if (vk->gfx_shader_tbdr_p010_uv != VK_NULL_HANDLE)
+        vkDestroyShaderModule(vk->device, vk->gfx_shader_tbdr_p010_uv, NULL);
+    if (vk->gfx_shader_tbdr_nv12_y != VK_NULL_HANDLE)
+        vkDestroyShaderModule(vk->device, vk->gfx_shader_tbdr_nv12_y, NULL);
+    if (vk->gfx_shader_tbdr_nv12_uv != VK_NULL_HANDLE)
+        vkDestroyShaderModule(vk->device, vk->gfx_shader_tbdr_nv12_uv, NULL);
     if (vk->pipeline_p010 != VK_NULL_HANDLE)
         vkDestroyPipeline(vk->device, vk->pipeline_p010, NULL);
     if (vk->pipeline_nv12 != VK_NULL_HANDLE)

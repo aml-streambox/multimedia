@@ -20,10 +20,8 @@
 //   y1 = (bs >> 2)  & 0x3FF
 //   v0 = ((bs & 0x3) << 8) | hi
 //
-// P010 output: Wave521 MSB byte-swap format.
-// Standard P010 uses val << 6 (MSB-aligned in LE 16-bit).
-// Wave521 encoder expects 10-bit value byte-swapped in 16-bit word:
-//   wave_swap(val) = ((val & 0xFF) << 8) | ((val >> 8) & 0x3)
+// P010 output: Standard P010 format.
+// Each 10-bit value is left-justified in a 16-bit word: val << 6
 // Two Y values packed per uint32. UV plane: half height, U and V interleaved.
 
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
@@ -198,12 +196,11 @@ void read_pair_global(uint pair_idx, out uint lo, out uint hi) {
     }
 }
 
-// Wave521 byte-swap format (matches amlvenc's working GLES/Vulkan shader).
+// Standard P010 packing.
 // Input: 10-bit value (0..1023)
-// Output: 16-bit byte-swapped representation:
-//   ((val & 0xFF) << 8) | ((val >> 8) & 0x3)
-uint wave_swap(uint val) {
-    return ((val & 0xFFu) << 8) | ((val >> 8) & 0x3u);
+// Output: 16-bit word with value left-justified: val << 6
+uint p010_pack(uint val) {
+    return val << 6u;
 }
 
 void main() {
@@ -246,9 +243,9 @@ void main() {
     uint y1 = (bs >> 2) & 0x3FFu;
     uint v0 = ((bs & 0x3u) << 8) | hi;
 
-    // Y plane: Wave521 byte-swap format, two 16-bit values per uint32
-    uint y0_ws = wave_swap(y0);
-    uint y1_ws = wave_swap(y1);
+    // Y plane: Standard P010 format, two 16-bit values per uint32
+    uint y0_ws = p010_pack(y0);
+    uint y1_ws = p010_pack(y1);
 
     // Pack two Y values into one uint32
     uint pair_idx = row * params.pairs_per_row + global_pair;
@@ -269,11 +266,11 @@ void main() {
         uint u_avg = (u0 + nu0 + 1u) >> 1;
         uint v_avg = (v0 + nv0 + 1u) >> 1;
 
-        // UV plane: Wave521 byte-swap format, U then V packed
+        // UV plane: Standard P010 format, U then V packed
         uint uv_row = row >> 1;
         uint uv_idx = uv_row * params.pairs_per_row + global_pair;
-        uint u_ws = wave_swap(u_avg);
-        uint v_ws = wave_swap(v_avg);
+        uint u_ws = p010_pack(u_avg);
+        uint v_ws = p010_pack(v_avg);
         uv_output.data[uv_idx] = u_ws | (v_ws << 16);
     }
 }

@@ -1,0 +1,134 @@
+#version 450
+
+// AMLY (40-bit packed YUV422 10-bit) to R8G8B8A8_UNORM intermediate conversion
+//
+// Hardware writes with WORDS_SWAP=1 + WR_ENDIAN=0 (big endian).
+// Correction: bswap64 each 64-bit word during tile load into shared memory.
+// After correction, data is in native little-endian byte order.
+//
+// Workgroup: 128 threads x 1 row.
+// Each thread processes 1 pixel pair (2 pixels).
+// Tile = 128 pairs = 640 bytes = 160 uint32 words (+2 guard).
+//
+// Component order in 40-bit after bswap64 correction:
+//   uint bs = bswap32(lo);
+//   y0 = (bs >> 22) & 0x3FF
+//   u0 = (bs >> 12) & 0x3FF
+//   y1 = (bs >> 2)  & 0x3FF
+//   v0 = ((bs & 0x3) << 8) | hi
+//
+// Output: R8G8B8A8_UNORM storage image with (Y, U, V, 0) per pixel.
+// 10-bit components are downshifted to 8-bit: val >> 2
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer InputBuffer {
+    uint data[];
+} input_buffer;
+
+layout(rgba8, set = 0, binding = 1) uniform writeonly image2D out_img;
+
+layout(push_constant) uniform Params {
+    uint width;
+    uint height;
+    uint pairs_per_row;
+    uint hdr_mode;     // unused, reserved for API compatibility
+} params;
+
+// Tile: 128 pairs * 5 bytes = 640 bytes, + up to 3 bytes alignment + 8 bytes guard = 651
+// Worst case: (651 + 3) / 4 = 163.5 → 164 words
+#define TILE_PAIRS 128u
+#define TILE_BYTES (TILE_PAIRS * 5u)
+#define TILE_WORDS ((TILE_BYTES + 3u + 8u) / 4u + 1u)  // 164
+
+shared uint tile[TILE_WORDS];
+
+// Byte-swap a 32-bit word
+uint bswap32(uint val) {
+    return ((val & 0x000000FFu) << 24) |
+           ((val & 0x0000FF00u) <<  8) |
+           ((val & 0x00FF0000u) >>  8) |
+           ((val & 0xFF000000u) >> 24);
+}
+
+// Load input words into shared memory with bswap64 correction.
+void load_tile(uint base_word_idx, uint n_words) {
+    uint lid = gl_LocalInvocationID.x;
+    for (uint i = lid * 2u; i < n_words; i += 128u * 2u) {
+        if (i + 1u < n_words) {
+            uint w0 = input_buffer.data[base_word_idx + i];
+            uint w1 = input_buffer.data[base_word_idx + i + 1u];
+            tile[i]      = bswap32(w1);
+            tile[i + 1u] = bswap32(w0);
+        } else if (i < n_words) {
+            tile[i] = 0u;
+        }
+    }
+    barrier();
+}
+
+// Extract 40 contiguous bits from tile[] starting at local pair index.
+void extract_pair_from_tile_offset(uint local_pair, uint byte_offset_base,
+                                   out uint lo, out uint hi) {
+    uint byte_off = byte_offset_base + local_pair * 5u;
+    uint widx = byte_off >> 2;
+    uint shift = (byte_off & 3u) << 3;
+
+    uint w0 = tile[widx];
+    uint w1 = tile[widx + 1u];
+
+    if (shift == 0u) {
+        lo = w0;
+        hi = w1 & 0xFFu;
+    } else {
+        uint w2 = tile[widx + 2u];
+        lo = (w0 >> shift) | (w1 << (32u - shift));
+        hi = ((w1 >> shift) | (w2 << (32u - shift))) & 0xFFu;
+    }
+}
+
+void main() {
+    uint row = gl_WorkGroupID.y;
+    uint lid = gl_LocalInvocationID.x;
+
+    if (row >= params.height) return;
+
+    uint tile_start = gl_WorkGroupID.x * TILE_PAIRS;
+    uint tile_pairs = min(TILE_PAIRS, params.pairs_per_row - tile_start);
+
+    uint row_byte_start = row * params.pairs_per_row * 5u;
+    uint tile_byte_start = row_byte_start + tile_start * 5u;
+    uint base_word_idx = tile_byte_start >> 2;
+    uint tile_byte_offset = tile_byte_start & 3u;
+
+    uint tile_bytes_needed = tile_byte_offset + tile_pairs * 5u;
+    uint n_words = (tile_bytes_needed + 3u) / 4u + 2u;
+    if (n_words > TILE_WORDS) n_words = TILE_WORDS;
+
+    load_tile(base_word_idx, n_words);
+
+    uint global_pair = tile_start + lid;
+    if (lid >= tile_pairs) return;
+
+    uint lo, hi;
+    extract_pair_from_tile_offset(lid, tile_byte_offset, lo, hi);
+
+    uint bs = bswap32(lo);
+    uint y0 = (bs >> 22) & 0x3FFu;
+    uint u0 = (bs >> 12) & 0x3FFu;
+    uint y1 = (bs >> 2) & 0x3FFu;
+    uint v0 = ((bs & 0x3u) << 8) | hi;
+
+    // Down-convert 10-bit to 8-bit
+    float y0_f = float(y0 >> 2u) / 255.0;
+    float y1_f = float(y1 >> 2u) / 255.0;
+    float u_f  = float(u0 >> 2u) / 255.0;
+    float v_f  = float(v0 >> 2u) / 255.0;
+
+    int x0 = int(global_pair * 2u);
+    int x1 = int(global_pair * 2u + 1u);
+    int y  = int(row);
+
+    imageStore(out_img, ivec2(x0, y), vec4(y0_f, u_f, v_f, 0.0));
+    imageStore(out_img, ivec2(x1, y), vec4(y1_f, u_f, v_f, 0.0));
+}

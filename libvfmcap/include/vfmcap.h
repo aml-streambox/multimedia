@@ -3,24 +3,30 @@
  *
  * Zero-copy HDMI capture library for Amlogic A311D2 (T7) SoC.
  * Wraps /dev/video_cap (vfm_cap kernel module) with V4L2 streaming
- * and Vulkan-based raw format conversion on the Mali-G52 GPU.
+ * and optional Vulkan-based format conversion on the Mali-G52 GPU.
  *
- * This SDK performs raw format packing ONLY (AMLY -> P010, AMLY -> NV12).
- * No color space conversion, tone mapping, or gamut mapping is performed.
- * For color-processed capture, use vdin1 loopback (VPP HDR->SDR path).
+ * Default behavior is raw passthrough (zero GPU involvement).
+ * GPU conversion is only performed when an output format is explicitly
+ * requested via vfmcap_config_t.
  *
- * Data flow (CPU never touches pixel data):
+ * Data flow (CPU never touches pixel data when converting):
  *   vdin0 CMA buffer -> DMA-buf fd -> Vulkan GPU import ->
- *   compute shader -> output DMA-buf -> downstream (encoder, display)
+ *   graphics/compute shaders -> output DMA-buf -> downstream (encoder, display)
  *
  * Usage:
- *   vfmcap_ctx_t *ctx = vfmcap_open("/dev/video_cap");
+ *   vfmcap_config_t cfg = {0};
+ *   cfg.output_format = VFMCAP_FMT_NV12;
+ *   cfg.target_width = 1920;
+ *   cfg.target_height = 1080;
+ *   vfmcap_ctx_t *ctx = vfmcap_open("/dev/video_cap", &cfg);
  *   vfmcap_start(ctx, 6);
  *   while (running) {
  *       vfmcap_frame_t frame;
- *       vfmcap_acquire_frame(ctx, &frame, 1000);
- *       vfmcap_convert_p010(ctx, &frame, output_dmabuf_fd);
- *       // pass output_dmabuf_fd to encoder / consumer
+ *       int rc = vfmcap_acquire_frame(ctx, &frame, 1000);
+ *       if (rc == VFMCAP_RECONFIGURED) {
+ *           // signal changed, handle new width/height/format
+ *       }
+ *       // pass frame.dmabuf_fd to consumer
  *       vfmcap_release_frame(ctx, &frame);
  *   }
  *   vfmcap_stop(ctx);
@@ -43,31 +49,48 @@ extern "C" {
 
 typedef struct vfmcap_ctx vfmcap_ctx_t;
 
+/* ---------- Output format enum ---------- */
+
+typedef enum {
+    VFMCAP_FMT_RAW = 0,           /* Default: raw passthrough, zero GPU */
+    VFMCAP_FMT_NV12 = 1,          /* 8-bit semi-planar (Y 8-bit + UV interleaved 8-bit) */
+    VFMCAP_FMT_NV21 = 2,          /* 8-bit semi-planar (Y 8-bit + VU interleaved 8-bit) */
+    VFMCAP_FMT_P010 = 3,          /* 10-bit semi-planar (Y 16-bit LE + UV interleaved 16-bit LE) */
+    VFMCAP_FMT_NV12_AFBC = 4,     /* 8-bit AFBC compressed NV12 */
+    VFMCAP_FMT_A2B10G10R10_AFBC = 5, /* 10-bit AFBC compressed A2B10G10R10 */
+    VFMCAP_FMT_VYUY_10BIT = 6,    /* Amlogic private VYUY 10-bit passthrough (no conversion) */
+} vfmcap_output_fmt_t;
+
 /* ---------- Frame descriptor ---------- */
 
 /**
  * struct vfmcap_frame_t - Describes one captured frame
  *
  * Returned by vfmcap_acquire_frame(). The @dmabuf_fd points directly
- * to vdin0's CMA buffer (AMLY 10-bit format). The consumer should
- * pass this fd to vfmcap_convert_p010() or vfmcap_convert_nv12()
- * for GPU-based format conversion, or use it directly if the downstream
- * consumer understands AMLY format.
+ * to vdin0's CMA buffer when output_format is RAW or VYUY_10BIT.
+ * When GPU conversion is requested, it points to the converted output
+ * buffer managed by libvfmcap.
  *
  * The fd is valid until vfmcap_release_frame() is called.
  */
 typedef struct {
-    int      dmabuf_fd;       /* DMA-buf fd for the raw AMLY frame */
+    int      dmabuf_fd;       /* DMA-buf fd for the frame (Y plane for multi-planar) */
+    int      dmabuf_fd2;      /* DMA-buf fd for UV plane (NV12/P010 linear) or -1 */
     uint32_t index;           /* V4L2 buffer index (internal use) */
     uint32_t width;           /* Frame width in pixels */
     uint32_t height;          /* Frame height in pixels */
-    uint32_t bytesperline;    /* Bytes per line (width * 5 / 2 for AMLY) */
+    uint32_t bytesperline;    /* Bytes per line */
     uint32_t size;            /* Total buffer size in bytes */
-    uint32_t pixelformat;     /* V4L2_PIX_FMT (e.g. 'AMLY') */
+    uint32_t pixelformat;     /* V4L2_PIX_FMT (e.g. 'AMLY', 'NV12') */
     uint32_t bitdepth;        /* 8, 10, or 12 */
     uint32_t sequence;        /* Frame sequence number */
     uint64_t timestamp_us;    /* Frame timestamp in microseconds */
     uint32_t signal_type;     /* HDR/colorimetry from vframe.signal_type */
+
+    /* New fields for architecture redesign */
+    uint64_t drm_modifier;    /* DRM format modifier (0 for linear) */
+    uint32_t is_repeated;     /* 1 if this frame was repeated for framerate conversion */
+    void    *priv;            /* Internal state (pool entries, etc.) */
 } vfmcap_frame_t;
 
 /* ---------- Signal info ---------- */
@@ -102,35 +125,39 @@ typedef struct {
 #define VFMCAP_EVENT_TIMEOUT        0  /* poll() timed out */
 #define VFMCAP_EVENT_ERROR         -1  /* Error occurred */
 
-/* ---------- Output format enum ---------- */
-
-typedef enum {
-    VFMCAP_FMT_P010 = 0,    /* 10-bit semi-planar (Y 16-bit LE + UV interleaved 16-bit LE) */
-    VFMCAP_FMT_NV12 = 1,    /* 8-bit semi-planar (Y 8-bit + UV interleaved 8-bit) */
-} vfmcap_output_fmt_t;
-
 /* ---------- Error codes ---------- */
 
-#define VFMCAP_OK            0
-#define VFMCAP_ERR_OPEN     -1   /* Failed to open device */
-#define VFMCAP_ERR_IOCTL    -2   /* V4L2 ioctl failed */
-#define VFMCAP_ERR_TIMEOUT  -3   /* DQBUF / poll timed out */
-#define VFMCAP_ERR_NOSIG    -4   /* No signal detected */
-#define VFMCAP_ERR_VULKAN   -5   /* Vulkan initialization/conversion failed */
-#define VFMCAP_ERR_NOMEM    -6   /* Out of memory */
-#define VFMCAP_ERR_INVAL    -7   /* Invalid argument */
-#define VFMCAP_ERR_STATE    -8   /* Wrong state (e.g. not started) */
+#define VFMCAP_OK                 0
+#define VFMCAP_ERR_OPEN          -1   /* Failed to open device */
+#define VFMCAP_ERR_IOCTL         -2   /* V4L2 ioctl failed */
+#define VFMCAP_ERR_TIMEOUT       -3   /* DQBUF / poll timed out */
+#define VFMCAP_ERR_NOSIG         -4   /* No signal detected */
+#define VFMCAP_ERR_VULKAN        -5   /* Vulkan initialization/conversion failed */
+#define VFMCAP_ERR_NOMEM         -6   /* Out of memory */
+#define VFMCAP_ERR_INVAL         -7   /* Invalid argument */
+#define VFMCAP_ERR_STATE         -8   /* Wrong state (e.g. not started) */
+#define VFMCAP_RECONFIGURED       1   /* Frame returned after dynamic reconfiguration */
+
+/* ---------- Configuration ---------- */
+
+typedef struct {
+    vfmcap_output_fmt_t output_format;  /* Requested output format (default: RAW) */
+    uint32_t target_width;              /* Target output width (0 = match source) */
+    uint32_t target_height;             /* Target output height (0 = match source) */
+    float    target_fps;                /* Target framerate (0 = match source) */
+} vfmcap_config_t;
 
 /* ---------- Lifecycle ---------- */
 
 /**
  * vfmcap_open - Open the capture device
  * @device: Device path (NULL for default "/dev/video_cap")
+ * @config: Capture configuration (NULL for default raw passthrough)
  *
  * Returns context pointer on success, NULL on failure.
  * Call vfmcap_last_error() for error details.
  */
-vfmcap_ctx_t *vfmcap_open(const char *device);
+vfmcap_ctx_t *vfmcap_open(const char *device, const vfmcap_config_t *config);
 
 /**
  * vfmcap_start - Start V4L2 streaming
@@ -138,7 +165,7 @@ vfmcap_ctx_t *vfmcap_open(const char *device);
  * @num_buffers: Number of V4L2 MMAP buffers (4-16, recommend 6)
  *
  * Calls REQBUFS, STREAMON, and subscribes to SOURCE_CHANGE events.
- * Also initializes the Vulkan compute pipeline for format conversion.
+ * Also initializes the Vulkan pipeline if conversion is configured.
  *
  * Returns VFMCAP_OK on success, negative error code on failure.
  */
@@ -173,7 +200,7 @@ void vfmcap_close(vfmcap_ctx_t *ctx);
  * directly to vdin0's CMA frame buffer. The fd is valid until
  * vfmcap_release_frame() is called.
  *
- * Returns VFMCAP_OK, VFMCAP_ERR_TIMEOUT, or negative error.
+ * Returns VFMCAP_OK, VFMCAP_RECONFIGURED, VFMCAP_ERR_TIMEOUT, or negative error.
  */
 int vfmcap_acquire_frame(vfmcap_ctx_t *ctx, vfmcap_frame_t *frame, int timeout_ms);
 
@@ -187,23 +214,15 @@ int vfmcap_acquire_frame(vfmcap_ctx_t *ctx, vfmcap_frame_t *frame, int timeout_m
  */
 void vfmcap_release_frame(vfmcap_ctx_t *ctx, vfmcap_frame_t *frame);
 
-/* ---------- GPU format conversion ---------- */
+/* ---------- GPU format conversion (legacy API - deprecated) ---------- */
 
 /**
  * vfmcap_convert_p010 - Convert AMLY frame to P010 via Vulkan GPU
  * @ctx: Context
  * @frame: Acquired frame (source AMLY DMA-buf)
  * @out_dmabuf_fd: Output DMA-buf fd (caller-allocated, must be large enough)
- *                 Required size: width * height * 3 (Y=w*h*2 + UV=w*h)
  *
- * Dispatches a Vulkan compute shader that reads the AMLY 40-bit packed
- * input and writes standard P010 output (10-bit left-justified in 16-bit).
- * Both input and output are accessed via DMA-buf - CPU never touches data.
- *
- * This is a synchronous call (blocks until GPU completes). For async
- * operation, use vfmcap_convert_submit() + vfmcap_convert_wait().
- *
- * Returns VFMCAP_OK or negative error code.
+ * DEPRECATED: Use vfmcap_open() with output_format=VFMCAP_FMT_P010 instead.
  */
 int vfmcap_convert_p010(vfmcap_ctx_t *ctx, vfmcap_frame_t *frame, int out_dmabuf_fd);
 
@@ -212,13 +231,8 @@ int vfmcap_convert_p010(vfmcap_ctx_t *ctx, vfmcap_frame_t *frame, int out_dmabuf
  * @ctx: Context
  * @frame: Acquired frame (source AMLY DMA-buf)
  * @out_dmabuf_fd: Output DMA-buf fd (caller-allocated, must be large enough)
- *                 Required size: width * height * 3 / 2 (Y=w*h + UV=w*h/2)
  *
- * Same as vfmcap_convert_p010 but outputs 8-bit NV12 (10-bit to 8-bit
- * truncation: val >> 2). No color space conversion is applied —
- * output preserves original BT.2020 PQ colorimetry.
- *
- * Returns VFMCAP_OK or negative error code.
+ * DEPRECATED: Use vfmcap_open() with output_format=VFMCAP_FMT_NV12 instead.
  */
 int vfmcap_convert_nv12(vfmcap_ctx_t *ctx, vfmcap_frame_t *frame, int out_dmabuf_fd);
 
@@ -229,11 +243,7 @@ int vfmcap_convert_nv12(vfmcap_ctx_t *ctx, vfmcap_frame_t *frame, int out_dmabuf
  * @out_dmabuf_fd: Output DMA-buf fd
  * @fmt: Output format (VFMCAP_FMT_P010 or VFMCAP_FMT_NV12)
  *
- * Dispatches GPU work and returns immediately. Must call
- * vfmcap_convert_wait() before the next submit or before
- * releasing the frame.
- *
- * Returns VFMCAP_OK or negative error code.
+ * DEPRECATED: Use vfmcap_open() with configured output format instead.
  */
 int vfmcap_convert_submit(vfmcap_ctx_t *ctx, vfmcap_frame_t *frame,
                           int out_dmabuf_fd, vfmcap_output_fmt_t fmt);
@@ -242,8 +252,7 @@ int vfmcap_convert_submit(vfmcap_ctx_t *ctx, vfmcap_frame_t *frame,
  * vfmcap_convert_wait - Wait for async GPU conversion to complete
  * @ctx: Context
  *
- * Blocks until the previously submitted conversion finishes.
- * Returns VFMCAP_OK or negative error code.
+ * DEPRECATED: Use vfmcap_open() with configured output format instead.
  */
 int vfmcap_convert_wait(vfmcap_ctx_t *ctx);
 

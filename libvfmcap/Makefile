@@ -48,7 +48,14 @@ $(DEMO_TARGET): $(DEMO_OBJS) $(LIB_TARGET)
 	$(CC) -c $(CFLAGS) $< -o $@
 
 # Ensure shader SPIR-V headers exist
-src/vfmcap_vulkan.o: shaders/amly_to_p010_spv.h shaders/amly_to_nv12_spv.h
+src/vfmcap_vulkan.o: shaders/amly_to_p010_spv.h shaders/amly_to_nv12_spv.h \
+    shaders/amly_decode_spv.h \
+    shaders/fullscreen.vert_spv.h \
+    shaders/nv12_y.frag_spv.h shaders/nv12_uv.frag_spv.h \
+    shaders/p010_y.frag_spv.h shaders/p010_uv.frag_spv.h \
+    shaders/nv12_y_from_r16.frag_spv.h shaders/nv12_uv_from_r16g16.frag_spv.h \
+    shaders/p010_y_from_r16.frag_spv.h shaders/p010_uv_from_r16g16.frag_spv.h \
+    shaders/yuv_from_yuva.frag_spv.h
 
 clean:
 	rm -f $(LIB_OBJS) $(DEMO_OBJS) $(LIB_TARGET) $(DEMO_TARGET)

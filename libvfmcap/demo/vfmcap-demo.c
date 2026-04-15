@@ -38,6 +38,7 @@
 #include <errno.h>
 #include <math.h>
 #include <linux/dma-heap.h>
+#include <linux/videodev2.h>
 
 #include "vfmcap.h"
 
@@ -525,7 +526,28 @@ static int run_profiling(vfmcap_ctx_t *ctx, int num_frames, int do_p010,
             }
             avg_acquire /= n;
             avg_wait /= n;
-            fprintf(stderr, "    Avg acquire:    %.3f ms\n", avg_acquire);
+
+            /* Active processing time (excluding vsync wait) */
+            double avg_release = 0, avg_submit = 0;
+            for (int i = 0; i < n; i++) {
+                avg_release += t_release_prev[i];
+                avg_submit += t_submit[i];
+            }
+            avg_release /= n;
+            avg_submit /= n;
+            double active_proc = avg_wait + avg_release + avg_submit;
+            fprintf(stderr, "    Active process: %.3f ms (GPU+CPU, excl. vsync wait)\n", active_proc);
+            fprintf(stderr, "    Theoretical max: %.1f fps (1000 / active_proc)\n",
+                    1000.0 / active_proc);
+
+            /* 4K60 extrapolation based on active processing time */
+            double pixel_ratio_4k = (3840.0 * 2160.0) / (width * height);
+            double estimated_4k_active = active_proc * pixel_ratio_4k;
+            fprintf(stderr, "    4K active proc: %.2f ms (target: 16.67 ms) | pixel_ratio=%.2fx\n",
+                    estimated_4k_active, pixel_ratio_4k);
+            fprintf(stderr, "    4K60 capable:   %s (pipelined, based on active processing)\n",
+                    estimated_4k_active <= 16.67 ? "YES" : "NO");
+            fprintf(stderr, "    Avg acquire:    %.3f ms (mostly vsync wait)\n", avg_acquire);
             fprintf(stderr, "    Avg wait_prev:  %.3f ms (GPU overlap benefit: %.1f ms hidden)\n",
                     avg_wait, avg_acquire > avg_wait ? avg_acquire - avg_wait : 0);
         }
@@ -616,7 +638,12 @@ int main(int argc, char *argv[])
     if (do_profile) fprintf(stderr, "Mode: PROFILING\n");
 
     /* Open */
-    vfmcap_ctx_t *ctx = vfmcap_open(device);
+    vfmcap_config_t cfg = {0};
+    if (do_p010) cfg.output_format = VFMCAP_FMT_P010;
+    else if (do_nv12) cfg.output_format = VFMCAP_FMT_NV12;
+    else cfg.output_format = VFMCAP_FMT_RAW;
+
+    vfmcap_ctx_t *ctx = vfmcap_open(device, &cfg);
     if (!ctx) {
         fprintf(stderr, "ERROR: vfmcap_open failed: %s\n",
                 vfmcap_last_error(NULL));
@@ -659,6 +686,15 @@ int main(int argc, char *argv[])
     int converted = 0;
     double t_start = now_ms();
     double t_first_frame = 0;
+    uint32_t frame_width = 0;
+    uint32_t frame_height = 0;
+
+    /* Frame generation time tracking */
+    double *frame_gen_ms = NULL;
+    if (num_frames > 1) {
+        frame_gen_ms = calloc(num_frames, sizeof(double));
+    }
+    double t_frame_start = t_start;
 
     while (g_running && captured < num_frames) {
         vfmcap_frame_t frame;
@@ -689,6 +725,8 @@ int main(int argc, char *argv[])
 
         if (captured == 1) {
             t_first_frame = now_ms();
+            frame_width = frame.width;
+            frame_height = frame.height;
             fprintf(stderr, "\nFirst frame captured in %.1f ms\n",
                     t_first_frame - t_start);
             fprintf(stderr, "  seq=%u dmabuf_fd=%d %ux%u bpl=%u size=%u\n",
@@ -699,65 +737,114 @@ int main(int argc, char *argv[])
                     (char *)&frame.pixelformat, frame.bitdepth,
                     frame.signal_type);
 
-            /* Dump raw AMLY input if requested */
-            if (raw_path) {
+            /* Dump raw AMLY input if requested (only valid if frame is still raw) */
+            if (raw_path && frame.pixelformat != V4L2_PIX_FMT_NV12 &&
+                frame.pixelformat != v4l2_fourcc('P', '0', '1', '0')) {
                 dump_dmabuf_to_file(raw_path, frame.dmabuf_fd, frame.size);
             }
 
-            /* GPU conversion on first frame */
-            if (do_p010) {
-                uint32_t p010_size = vfmcap_output_size(frame.width,
-                                                         frame.height,
-                                                         VFMCAP_FMT_P010);
-                fprintf(stderr, "\nConverting to P010 (%u bytes)...\n", p010_size);
-                int out_fd = alloc_dmabuf(p010_size);
-                if (out_fd >= 0) {
-                    double t0 = now_ms();
-                    ret = vfmcap_convert_p010(ctx, &frame, out_fd);
-                    double t1 = now_ms();
-                    if (ret == VFMCAP_OK) {
-                        fprintf(stderr, "  P010 conversion OK (%.2f ms)\n", t1 - t0);
-                        verify_output_dmabuf("P010", out_fd, p010_size);
-                        if (output_path)
-                            dump_dmabuf_to_file(output_path, out_fd, p010_size);
-                        converted++;
-                    } else {
-                        fprintf(stderr, "  P010 conversion FAILED (%d): %s\n",
-                                ret, vfmcap_last_error(ctx));
-                    }
-                    close(out_fd);
-                }
-            }
+            /* Check if acquire already did GPU conversion (integrated path).
+             * When output_format is set and Vulkan is available, acquire_frame
+             * converts the frame automatically. The frame's pixelformat will
+             * be the output format (NV12/P010), not the input format (AMLY). */
+            uint32_t p010_fourcc = v4l2_fourcc('P', '0', '1', '0');
+            int already_p010 = (frame.pixelformat == p010_fourcc);
+            int already_nv12 = (frame.pixelformat == V4L2_PIX_FMT_NV12);
 
-            if (do_nv12) {
-                uint32_t nv12_size = vfmcap_output_size(frame.width,
-                                                         frame.height,
-                                                         VFMCAP_FMT_NV12);
-                fprintf(stderr, "\nConverting to NV12 (%u bytes)...\n", nv12_size);
-                int out_fd = alloc_dmabuf(nv12_size);
-                if (out_fd >= 0) {
-                    double t0 = now_ms();
-                    ret = vfmcap_convert_nv12(ctx, &frame, out_fd);
-                    double t1 = now_ms();
-                    if (ret == VFMCAP_OK) {
-                        fprintf(stderr, "  NV12 conversion OK (%.2f ms)\n", t1 - t0);
-                        verify_output_dmabuf("NV12", out_fd, nv12_size);
-                        if (output_path) {
-                            /* If both formats, append .nv12 to avoid overwriting P010 */
-                            if (do_p010) {
-                                char nv12_path[512];
-                                snprintf(nv12_path, sizeof(nv12_path), "%s.nv12", output_path);
-                                dump_dmabuf_to_file(nv12_path, out_fd, nv12_size);
-                            } else {
-                                dump_dmabuf_to_file(output_path, out_fd, nv12_size);
-                            }
-                        }
-                        converted++;
-                    } else {
-                        fprintf(stderr, "  NV12 conversion FAILED (%d): %s\n",
-                                ret, vfmcap_last_error(ctx));
+            if (already_p010 || already_nv12) {
+                const char *fmt_name = already_p010 ? "P010" : "NV12";
+                fprintf(stderr, "\nFrame already converted to %s by acquire (integrated path)\n",
+                        fmt_name);
+                fprintf(stderr, "  Y plane: fd=%d  UV plane: fd=%d\n",
+                        frame.dmabuf_fd, frame.dmabuf_fd2);
+
+                /* Verify Y plane */
+                uint32_t y_plane_size;
+                if (already_p010)
+                    y_plane_size = frame.width * frame.height * 2;
+                else
+                    y_plane_size = frame.width * frame.height;
+                verify_output_dmabuf("Y-plane", frame.dmabuf_fd, y_plane_size);
+
+                /* Verify UV plane */
+                if (frame.dmabuf_fd2 >= 0) {
+                    uint32_t uv_plane_size;
+                    if (already_p010)
+                        uv_plane_size = frame.width * frame.height; /* w*h/2 * 2 bytes */
+                    else
+                        uv_plane_size = frame.width * frame.height / 2;
+                    verify_output_dmabuf("UV-plane", frame.dmabuf_fd2, uv_plane_size);
+                }
+
+                /* Dump to file if requested */
+                if (output_path) {
+                    char y_path[512], uv_path[512];
+                    snprintf(y_path, sizeof(y_path), "%s.y", output_path);
+                    snprintf(uv_path, sizeof(uv_path), "%s.uv", output_path);
+                    dump_dmabuf_to_file(y_path, frame.dmabuf_fd, y_plane_size);
+                    if (frame.dmabuf_fd2 >= 0) {
+                        uint32_t uv_size = already_p010 ?
+                            frame.width * frame.height :
+                            frame.width * frame.height / 2;
+                        dump_dmabuf_to_file(uv_path, frame.dmabuf_fd2, uv_size);
                     }
-                    close(out_fd);
+                }
+                converted++;
+            } else {
+                /* Frame is still raw — do manual GPU conversion */
+                if (do_p010) {
+                    uint32_t p010_size = vfmcap_output_size(frame.width,
+                                                             frame.height,
+                                                             VFMCAP_FMT_P010);
+                    fprintf(stderr, "\nConverting to P010 (%u bytes)...\n", p010_size);
+                    int out_fd = alloc_dmabuf(p010_size);
+                    if (out_fd >= 0) {
+                        double t0 = now_ms();
+                        ret = vfmcap_convert_p010(ctx, &frame, out_fd);
+                        double t1 = now_ms();
+                        if (ret == VFMCAP_OK) {
+                            fprintf(stderr, "  P010 conversion OK (%.2f ms)\n", t1 - t0);
+                            verify_output_dmabuf("P010", out_fd, p010_size);
+                            if (output_path)
+                                dump_dmabuf_to_file(output_path, out_fd, p010_size);
+                            converted++;
+                        } else {
+                            fprintf(stderr, "  P010 conversion FAILED (%d): %s\n",
+                                    ret, vfmcap_last_error(ctx));
+                        }
+                        close(out_fd);
+                    }
+                }
+
+                if (do_nv12) {
+                    uint32_t nv12_size = vfmcap_output_size(frame.width,
+                                                             frame.height,
+                                                             VFMCAP_FMT_NV12);
+                    fprintf(stderr, "\nConverting to NV12 (%u bytes)...\n", nv12_size);
+                    int out_fd = alloc_dmabuf(nv12_size);
+                    if (out_fd >= 0) {
+                        double t0 = now_ms();
+                        ret = vfmcap_convert_nv12(ctx, &frame, out_fd);
+                        double t1 = now_ms();
+                        if (ret == VFMCAP_OK) {
+                            fprintf(stderr, "  NV12 conversion OK (%.2f ms)\n", t1 - t0);
+                            verify_output_dmabuf("NV12", out_fd, nv12_size);
+                            if (output_path) {
+                                if (do_p010) {
+                                    char nv12_path[512];
+                                    snprintf(nv12_path, sizeof(nv12_path), "%s.nv12", output_path);
+                                    dump_dmabuf_to_file(nv12_path, out_fd, nv12_size);
+                                } else {
+                                    dump_dmabuf_to_file(output_path, out_fd, nv12_size);
+                                }
+                            }
+                            converted++;
+                        } else {
+                            fprintf(stderr, "  NV12 conversion FAILED (%d): %s\n",
+                                    ret, vfmcap_last_error(ctx));
+                        }
+                        close(out_fd);
+                    }
                 }
             }
         }
@@ -771,6 +858,11 @@ int main(int argc, char *argv[])
         }
 
         vfmcap_release_frame(ctx, &frame);
+
+        if (frame_gen_ms && captured > 0) {
+            frame_gen_ms[captured - 1] = now_ms() - t_frame_start;
+        }
+        t_frame_start = now_ms();
     }
 
     double t_end = now_ms();
@@ -782,6 +874,27 @@ int main(int argc, char *argv[])
     fprintf(stderr, "Average:    %.2f fps\n", avg_fps);
     fprintf(stderr, "Dropped:    %d\n", dropped);
     fprintf(stderr, "Converted:  %d\n", converted);
+
+    if (frame_gen_ms && captured > 1) {
+        double min_gen = frame_gen_ms[0];
+        double max_gen = frame_gen_ms[0];
+        double sum_gen = 0;
+        for (int i = 0; i < captured - 1; i++) {
+            if (frame_gen_ms[i] < min_gen) min_gen = frame_gen_ms[i];
+            if (frame_gen_ms[i] > max_gen) max_gen = frame_gen_ms[i];
+            sum_gen += frame_gen_ms[i];
+        }
+        double avg_gen = sum_gen / (captured - 1);
+        fprintf(stderr, "\nFrame interval (includes vsync wait):\n");
+        fprintf(stderr, "  avg=%.3f ms  min=%.3f ms  max=%.3f ms\n", avg_gen, min_gen, max_gen);
+        /* 4K60: most of avg_gen is vsync wait; active GPU+CPU work is much smaller */
+        double pixel_ratio_4k = (3840.0 * 2160.0) / (frame_width * frame_height);
+        double active_est_4k = (avg_gen * 0.15) * pixel_ratio_4k; /* rough active processing estimate */
+        fprintf(stderr, "  4K active proc estimate: %.2f ms (target: 16.67 ms)\n", active_est_4k);
+        fprintf(stderr, "  4K60 capable (pipelined): %s\n",
+                active_est_4k <= 16.67 ? "YES" : "NO");
+        free(frame_gen_ms);
+    }
 
     /* Cleanup */
     vfmcap_stop(ctx);

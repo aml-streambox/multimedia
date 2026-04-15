@@ -3,7 +3,7 @@
  *
  * Wraps /dev/video_cap V4L2 device with zero-copy DMA-buf streaming.
  * CPU never touches frame data — only control plane (ioctls, poll).
- * Raw format conversion only (AMLY -> P010/NV12). No color space conversion.
+ * Optional GPU format conversion via Vulkan graphics/compute pipeline.
  *
  * Copyright (C) 2026 StreamBox
  * SPDX-License-Identifier: MIT
@@ -22,7 +22,7 @@
 #include <sys/mman.h>
 #include <linux/videodev2.h>
 
-#include "vfmcap.h"
+#include "../include/vfmcap.h"
 #include "vfmcap_vulkan.h"
 
 /* ---------- Custom ioctl from vfm_cap kernel module ---------- */
@@ -57,13 +57,24 @@ struct vfm_cap_signal_info_kern {
 #define VFMCAP_MIN_BUFFERS      4
 #define VFMCAP_ERROR_SIZE       256
 
+/* ---------- Internal frame priv (for output pool tracking) ---------- */
+
+typedef struct {
+    int             vdin_fd;
+    int             out_y_fd;
+    int             out_uv_fd;
+    vfmcap_vk_fmt_t vk_fmt;
+} vfmcap_frame_priv_t;
+
 /* ---------- Internal context ---------- */
 
 struct vfmcap_ctx {
     int                  fd;           /* V4L2 device fd */
     char                 device[128];  /* Device path */
     int                  streaming;    /* 1 if STREAMON called */
-    int                  vulkan_init;  /* 1 if Vulkan pipeline initialized */
+
+    /* Configuration */
+    vfmcap_config_t      config;
 
     /* Current format */
     uint32_t             width;
@@ -75,6 +86,19 @@ struct vfmcap_ctx {
 
     /* V4L2 MMAP buffers (flow-control tokens only) */
     unsigned int         num_buffers;
+
+    /* Vulkan pipeline (NULL when not needed) */
+    VulkanCtx           *vk;
+
+    /* Framerate conversion state */
+    uint64_t             ts_accum_us;  /* Timestamp accumulator for target_fps */
+    uint64_t             last_frame_ts_us;
+    vfmcap_frame_t       last_frame;   /* Cached for frame repeat */
+    int                  has_last_frame;
+
+    /* Dynamic reconfiguration state */
+    int                  reconfig_pending; /* 1 if reconfig occurred, next acquire returns RECONFIGURED */
+    int                  signal_lost;      /* 1 if signal currently lost */
 
     /* Error message */
     char                 last_error[VFMCAP_ERROR_SIZE];
@@ -94,9 +118,42 @@ static int xioctl(int fd, unsigned long request, void *arg)
     return r;
 }
 
+/* ---------- Helpers ---------- */
+
+static int64_t now_ms_mono(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static int needs_vulkan(const vfmcap_config_t *cfg)
+{
+    if (!cfg) return 0;
+    switch (cfg->output_format) {
+    case VFMCAP_FMT_RAW:
+    case VFMCAP_FMT_VYUY_10BIT:
+        return 0;
+    default:
+        return 1;
+    }
+}
+
+static vfmcap_vk_fmt_t to_vk_fmt(vfmcap_output_fmt_t fmt)
+{
+    switch (fmt) {
+    case VFMCAP_FMT_NV12: return VFMCAP_VK_FMT_NV12;
+    case VFMCAP_FMT_NV21: return VFMCAP_VK_FMT_NV21;
+    case VFMCAP_FMT_P010: return VFMCAP_VK_FMT_P010;
+    case VFMCAP_FMT_NV12_AFBC: return VFMCAP_VK_FMT_NV12_AFBC;
+    case VFMCAP_FMT_A2B10G10R10_AFBC: return VFMCAP_VK_FMT_A2B10G10R10_AFBC;
+    default: return VFMCAP_VK_FMT_NV12;
+    }
+}
+
 /* ---------- Lifecycle ---------- */
 
-vfmcap_ctx_t *vfmcap_open(const char *device)
+vfmcap_ctx_t *vfmcap_open(const char *device, const vfmcap_config_t *config)
 {
     const char *dev = device ? device : VFMCAP_DEFAULT_DEVICE;
 
@@ -134,6 +191,13 @@ vfmcap_ctx_t *vfmcap_open(const char *device)
 
     ctx->fd = fd;
     strncpy(ctx->device, dev, sizeof(ctx->device) - 1);
+    ctx->last_frame.dmabuf_fd = -1;
+
+    if (config) {
+        memcpy(&ctx->config, config, sizeof(ctx->config));
+    } else {
+        ctx->config.output_format = VFMCAP_FMT_RAW;
+    }
 
     /* Read current format */
     struct v4l2_format fmt;
@@ -145,10 +209,23 @@ vfmcap_ctx_t *vfmcap_open(const char *device)
         ctx->pixelformat = fmt.fmt.pix_mp.pixelformat;
         ctx->bytesperline = fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
         ctx->sizeimage = fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
+        /* Infer bitdepth from pixel format */
+        if (ctx->pixelformat == v4l2_fourcc('A', 'M', 'L', 'Y'))
+            ctx->bitdepth = 10;
+        else if (ctx->pixelformat == V4L2_PIX_FMT_NV12 ||
+                 ctx->pixelformat == V4L2_PIX_FMT_NV21 ||
+                 ctx->pixelformat == V4L2_PIX_FMT_YUV420 ||
+                 ctx->pixelformat == V4L2_PIX_FMT_YVU420)
+            ctx->bitdepth = 8;
+        else if (ctx->pixelformat == v4l2_fourcc('P', '0', '1', '0'))
+            ctx->bitdepth = 10;
+        else
+            ctx->bitdepth = 8; /* default assumption */
     }
 
-    fprintf(stderr, "[vfmcap] Opened %s: %ux%u pixfmt=%.4s\n",
-            dev, ctx->width, ctx->height, (char *)&ctx->pixelformat);
+    fprintf(stderr, "[vfmcap] Opened %s: %ux%u pixfmt=%.4s format=%d\n",
+            dev, ctx->width, ctx->height, (char *)&ctx->pixelformat,
+            ctx->config.output_format);
 
     return ctx;
 }
@@ -163,6 +240,13 @@ int vfmcap_start(vfmcap_ctx_t *ctx, unsigned int num_buffers)
     if (num_buffers > VFMCAP_MAX_BUFFERS)
         num_buffers = VFMCAP_MAX_BUFFERS;
 
+    /* Validate format compatibility for VYUY passthrough */
+    if (ctx->config.output_format == VFMCAP_FMT_VYUY_10BIT && ctx->bitdepth != 10) {
+        snprintf(ctx->last_error, sizeof(ctx->last_error),
+                 "VYUY 10-bit passthrough requires 10-bit input");
+        return VFMCAP_ERR_INVAL;
+    }
+
     /* Re-read format (may have changed due to signal change) */
     struct v4l2_format fmt;
     memset(&fmt, 0, sizeof(fmt));
@@ -173,6 +257,17 @@ int vfmcap_start(vfmcap_ctx_t *ctx, unsigned int num_buffers)
         ctx->pixelformat = fmt.fmt.pix_mp.pixelformat;
         ctx->bytesperline = fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
         ctx->sizeimage = fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
+        if (ctx->pixelformat == v4l2_fourcc('A', 'M', 'L', 'Y'))
+            ctx->bitdepth = 10;
+        else if (ctx->pixelformat == V4L2_PIX_FMT_NV12 ||
+                 ctx->pixelformat == V4L2_PIX_FMT_NV21 ||
+                 ctx->pixelformat == V4L2_PIX_FMT_YUV420 ||
+                 ctx->pixelformat == V4L2_PIX_FMT_YVU420)
+            ctx->bitdepth = 8;
+        else if (ctx->pixelformat == v4l2_fourcc('P', '0', '1', '0'))
+            ctx->bitdepth = 10;
+        else
+            ctx->bitdepth = 8;
     }
 
     /* Subscribe to SOURCE_CHANGE events */
@@ -181,15 +276,7 @@ int vfmcap_start(vfmcap_ctx_t *ctx, unsigned int num_buffers)
     sub.type = V4L2_EVENT_SOURCE_CHANGE;
     xioctl(ctx->fd, VIDIOC_SUBSCRIBE_EVENT, &sub);
 
-    /*
-     * Drain any stale events queued before we subscribed.
-     * The kernel may have queued SOURCE_CHANGE events from prior signal
-     * transitions (e.g. HDMI source went to sleep and woke back up).
-     * If we don't drain them, the first poll() in acquire_frame() will
-     * return immediately with POLLPRI, potentially wasting time on
-     * obsolete events.  Belt-and-suspenders: acquire_frame()'s poll loop
-     * also handles this, but draining here keeps the initial acquire fast.
-     */
+    /* Drain stale events */
     {
         struct v4l2_event ev;
         int drained = 0;
@@ -245,21 +332,32 @@ int vfmcap_start(vfmcap_ctx_t *ctx, unsigned int num_buffers)
         return VFMCAP_ERR_IOCTL;
     }
     ctx->streaming = 1;
+    ctx->signal_lost = 0;
 
-    /* Initialize Vulkan if not already done */
-    if (!ctx->vulkan_init && ctx->width > 0 && ctx->height > 0) {
-        if (vfmcap_vk_init(ctx->width, ctx->height) == 0) {
-            ctx->vulkan_init = 1;
+    /* Initialize Vulkan if conversion is requested */
+    if (needs_vulkan(&ctx->config) && !ctx->vk && ctx->width > 0 && ctx->height > 0) {
+        if (vfmcap_vk_init(&ctx->vk, ctx->width, ctx->height,
+                           to_vk_fmt(ctx->config.output_format)) == 0) {
+            /* success */
         } else {
             fprintf(stderr, "[vfmcap] WARNING: Vulkan init failed: %s\n",
-                    vfmcap_vk_last_error());
-            /* Non-fatal — raw AMLY frames still available */
+                    vfmcap_vk_last_error(ctx->vk));
+            if (ctx->vk) {
+                vfmcap_vk_cleanup(ctx->vk);
+                ctx->vk = NULL;
+            }
+            /* Non-fatal for raw paths, fatal for conversion paths */
+            if (needs_vulkan(&ctx->config)) {
+                snprintf(ctx->last_error, sizeof(ctx->last_error),
+                         "Vulkan init failed: %s", vfmcap_vk_last_error(NULL));
+                return VFMCAP_ERR_VULKAN;
+            }
         }
     }
 
     fprintf(stderr, "[vfmcap] Streaming started: %ux%u pixfmt=%.4s vulkan=%s\n",
             ctx->width, ctx->height, (char *)&ctx->pixelformat,
-            ctx->vulkan_init ? "yes" : "no");
+            ctx->vk ? "yes" : "no");
 
     return VFMCAP_OK;
 }
@@ -289,23 +387,10 @@ void vfmcap_close(vfmcap_ctx_t *ctx)
 {
     if (!ctx) return;
 
-    /*
-     * Order matters!  Vulkan cleanup MUST happen BEFORE vfmcap_stop().
-     *
-     * vfmcap_stop() calls VIDIOC_REQBUFS(count=0) which tells the kernel
-     * driver to free the CMA buffer allocations.  If the Vulkan pipeline
-     * still holds VkDeviceMemory objects imported from those DMA-buf fds,
-     * the subsequent vkFreeMemory() in vfmcap_vk_cleanup() will try to
-     * unmap pages that have already been freed by the kernel, causing a
-     * use-after-free oops (BUG: 00000000f2000800) and system crash.
-     *
-     * By cleaning up Vulkan first, all GPU-imported references to the
-     * DMA-buf pages are released cleanly while the kernel buffers still
-     * exist.  Then vfmcap_stop() can safely free them.
-     */
-    if (ctx->vulkan_init) {
-        vfmcap_vk_cleanup();
-        ctx->vulkan_init = 0;
+    /* Vulkan cleanup MUST happen BEFORE vfmcap_stop() to avoid UAF */
+    if (ctx->vk) {
+        vfmcap_vk_cleanup(ctx->vk);
+        ctx->vk = NULL;
     }
 
     if (ctx->streaming)
@@ -316,17 +401,13 @@ void vfmcap_close(vfmcap_ctx_t *ctx)
         ctx->fd = -1;
     }
 
+    if (ctx->last_frame.dmabuf_fd >= 0) {
+        close(ctx->last_frame.dmabuf_fd);
+        ctx->last_frame.dmabuf_fd = -1;
+    }
+
     fprintf(stderr, "[vfmcap] Closed %s\n", ctx->device);
     free(ctx);
-}
-
-/* ---------- Helpers ---------- */
-
-static int64_t now_ms_mono(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
 /* ---------- Frame acquisition ---------- */
@@ -343,16 +424,7 @@ int vfmcap_acquire_frame(vfmcap_ctx_t *ctx, vfmcap_frame_t *frame, int timeout_m
     memset(frame, 0, sizeof(*frame));
     frame->dmabuf_fd = -1;
 
-    /*
-     * Poll for buffer ready.
-     *
-     * Must loop because poll() can return early due to V4L2 events
-     * (POLLPRI) without POLLIN being set — e.g. a SOURCE_CHANGE event
-     * queued by the kernel when signal transitions occur.  Without the
-     * loop, a stale event would consume the entire timeout in a single
-     * poll() return, causing a false timeout even though vdin0 is
-     * actively delivering frames.
-     */
+    /* Poll for buffer ready */
     if (timeout_ms != 0) {
         int64_t deadline = now_ms_mono() + timeout_ms;
 
@@ -371,25 +443,25 @@ int vfmcap_acquire_frame(vfmcap_ctx_t *ctx, vfmcap_frame_t *frame, int timeout_m
                 return VFMCAP_ERR_TIMEOUT;
             if (ret < 0) {
                 if (errno == EINTR)
-                    continue;  /* re-check deadline and retry */
+                    continue;
                 snprintf(ctx->last_error, sizeof(ctx->last_error),
                          "poll() failed: %s", strerror(errno));
                 return VFMCAP_ERR_IOCTL;
             }
 
-            /* Handle events (if any) */
+            /* Handle events */
             if (pfd.revents & POLLPRI) {
                 struct v4l2_event event;
                 memset(&event, 0, sizeof(event));
                 while (xioctl(ctx->fd, VIDIOC_DQEVENT, &event) == 0) {
                     if (event.type == V4L2_EVENT_SOURCE_CHANGE) {
-                        /* Extract signal info from event data */
                         struct vfm_cap_signal_info_kern *sig =
                             (struct vfm_cap_signal_info_kern *)event.u.data;
                         if (sig->status == 1) { /* NOSIG */
+                            ctx->signal_lost = 1;
                             return VFMCAP_ERR_NOSIG;
                         }
-                        /* Signal changed — format may have updated */
+                        /* Signal changed — update cached format */
                         struct v4l2_format fmt;
                         memset(&fmt, 0, sizeof(fmt));
                         fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
@@ -399,7 +471,17 @@ int vfmcap_acquire_frame(vfmcap_ctx_t *ctx, vfmcap_frame_t *frame, int timeout_m
                             ctx->pixelformat = fmt.fmt.pix_mp.pixelformat;
                             ctx->bytesperline = fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
                             ctx->sizeimage = fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
+                            if (ctx->pixelformat == v4l2_fourcc('A', 'M', 'L', 'Y'))
+                                ctx->bitdepth = 10;
+                            else if (ctx->pixelformat == V4L2_PIX_FMT_NV12 ||
+                                     ctx->pixelformat == V4L2_PIX_FMT_NV21)
+                                ctx->bitdepth = 8;
+                            else if (ctx->pixelformat == v4l2_fourcc('P', '0', '1', '0'))
+                                ctx->bitdepth = 10;
+                            else
+                                ctx->bitdepth = 8;
                         }
+                        ctx->reconfig_pending = 1;
                         fprintf(stderr, "[vfmcap] Source changed: %ux%u\n",
                                 ctx->width, ctx->height);
                     }
@@ -407,11 +489,8 @@ int vfmcap_acquire_frame(vfmcap_ctx_t *ctx, vfmcap_frame_t *frame, int timeout_m
                 }
             }
 
-            /* If data is available, break out to DQBUF */
             if (pfd.revents & POLLIN)
                 break;
-
-            /* Only event(s) — no data yet. Loop and re-poll with remaining time. */
         }
     }
 
@@ -441,13 +520,13 @@ int vfmcap_acquire_frame(vfmcap_ctx_t *ctx, vfmcap_frame_t *frame, int timeout_m
     if (xioctl(ctx->fd, VFM_CAP_IOC_GET_DMABUF, &dmabuf_req) < 0) {
         snprintf(ctx->last_error, sizeof(ctx->last_error),
                  "VFM_CAP_IOC_GET_DMABUF failed: %s", strerror(errno));
-        /* QBUF to recycle the buffer even on failure */
         xioctl(ctx->fd, VIDIOC_QBUF, &buf);
         return VFMCAP_ERR_IOCTL;
     }
 
     /* Fill frame descriptor */
     frame->dmabuf_fd = dmabuf_req.fd;
+    frame->dmabuf_fd2 = -1;
     frame->index = buf.index;
     frame->width = ctx->width;
     frame->height = ctx->height;
@@ -458,6 +537,99 @@ int vfmcap_acquire_frame(vfmcap_ctx_t *ctx, vfmcap_frame_t *frame, int timeout_m
     frame->sequence = buf.sequence;
     frame->timestamp_us = (uint64_t)buf.timestamp.tv_sec * 1000000ULL +
                           (uint64_t)buf.timestamp.tv_usec;
+    frame->drm_modifier = 0;
+    frame->is_repeated = 0;
+    frame->priv = NULL;
+
+    /* GPU conversion path (integrated into acquire) */
+    if (needs_vulkan(&ctx->config) && ctx->vk) {
+        uint32_t dst_w = ctx->config.target_width ? ctx->config.target_width : ctx->width;
+        uint32_t dst_h = ctx->config.target_height ? ctx->config.target_height : ctx->height;
+        vfmcap_vk_fmt_t vk_fmt = to_vk_fmt(ctx->config.output_format);
+
+        /* For now, only use graphics path for 8-bit input -> NV12/P010 */
+        if (ctx->bitdepth == 8 &&
+            (vk_fmt == VFMCAP_VK_FMT_NV12 || vk_fmt == VFMCAP_VK_FMT_P010)) {
+            int out_y_fd = -1, out_uv_fd = -1;
+            int ret = vfmcap_vk_render_and_wait(ctx->vk, dmabuf_req.fd,
+                                                ctx->width, ctx->height,
+                                                dst_w, dst_h, vk_fmt,
+                                                &out_y_fd, &out_uv_fd);
+            if (ret != 0) {
+                snprintf(ctx->last_error, sizeof(ctx->last_error),
+                         "Vulkan render failed: %s", vfmcap_vk_last_error(ctx->vk));
+                close(dmabuf_req.fd);
+                xioctl(ctx->fd, VIDIOC_QBUF, &buf);
+                return VFMCAP_ERR_VULKAN;
+            }
+
+            vfmcap_frame_priv_t *priv = calloc(1, sizeof(*priv));
+            if (!priv) {
+                vfmcap_vk_release_output(ctx->vk, out_y_fd, out_uv_fd, vk_fmt);
+                close(dmabuf_req.fd);
+                xioctl(ctx->fd, VIDIOC_QBUF, &buf);
+                return VFMCAP_ERR_NOMEM;
+            }
+            priv->vdin_fd = dmabuf_req.fd;
+            priv->out_y_fd = out_y_fd;
+            priv->out_uv_fd = out_uv_fd;
+            priv->vk_fmt = vk_fmt;
+
+            frame->dmabuf_fd = out_y_fd;
+            frame->dmabuf_fd2 = out_uv_fd;
+            frame->width = dst_w;
+            frame->height = dst_h;
+            frame->size = vfmcap_output_size(dst_w, dst_h, ctx->config.output_format);
+            frame->pixelformat = (vk_fmt == VFMCAP_VK_FMT_NV12) ?
+                                 V4L2_PIX_FMT_NV12 :
+                                 v4l2_fourcc('P', '0', '1', '0');
+            frame->priv = priv;
+        }
+        /* 10-bit input -> NV12/P010 via compute-to-graphics chain */
+        else if (ctx->bitdepth == 10 &&
+                 (vk_fmt == VFMCAP_VK_FMT_NV12 || vk_fmt == VFMCAP_VK_FMT_P010)) {
+            int out_y_fd = -1, out_uv_fd = -1;
+            int ret = vfmcap_vk_render_10bit_and_wait(ctx->vk, dmabuf_req.fd,
+                                                      ctx->width, ctx->height,
+                                                      dst_w, dst_h, vk_fmt,
+                                                      &out_y_fd, &out_uv_fd);
+            if (ret != 0) {
+                snprintf(ctx->last_error, sizeof(ctx->last_error),
+                         "Vulkan 10-bit render failed: %s", vfmcap_vk_last_error(ctx->vk));
+                close(dmabuf_req.fd);
+                xioctl(ctx->fd, VIDIOC_QBUF, &buf);
+                return VFMCAP_ERR_VULKAN;
+            }
+
+            vfmcap_frame_priv_t *priv = calloc(1, sizeof(*priv));
+            if (!priv) {
+                vfmcap_vk_release_output(ctx->vk, out_y_fd, out_uv_fd, vk_fmt);
+                close(dmabuf_req.fd);
+                xioctl(ctx->fd, VIDIOC_QBUF, &buf);
+                return VFMCAP_ERR_NOMEM;
+            }
+            priv->vdin_fd = dmabuf_req.fd;
+            priv->out_y_fd = out_y_fd;
+            priv->out_uv_fd = out_uv_fd;
+            priv->vk_fmt = vk_fmt;
+
+            frame->dmabuf_fd = out_y_fd;
+            frame->dmabuf_fd2 = out_uv_fd;
+            frame->width = dst_w;
+            frame->height = dst_h;
+            frame->size = vfmcap_output_size(dst_w, dst_h, ctx->config.output_format);
+            frame->pixelformat = (vk_fmt == VFMCAP_VK_FMT_NV12) ?
+                                 V4L2_PIX_FMT_NV12 :
+                                 v4l2_fourcc('P', '0', '1', '0');
+            frame->priv = priv;
+        }
+    }
+
+    /* Handle reconfig notification */
+    if (ctx->reconfig_pending) {
+        ctx->reconfig_pending = 0;
+        return VFMCAP_RECONFIGURED;
+    }
 
     return VFMCAP_OK;
 }
@@ -466,8 +638,20 @@ void vfmcap_release_frame(vfmcap_ctx_t *ctx, vfmcap_frame_t *frame)
 {
     if (!ctx || !frame) return;
 
-    /* Close the DMA-buf fd (releases kernel reference) */
-    if (frame->dmabuf_fd >= 0) {
+    if (frame->priv) {
+        vfmcap_frame_priv_t *priv = (vfmcap_frame_priv_t *)frame->priv;
+        if (ctx->vk) {
+            vfmcap_vk_release_output(ctx->vk, priv->out_y_fd, priv->out_uv_fd, priv->vk_fmt);
+        }
+        if (priv->vdin_fd >= 0) {
+            close(priv->vdin_fd);
+            priv->vdin_fd = -1;
+        }
+        free(priv);
+        frame->priv = NULL;
+        frame->dmabuf_fd = -1;
+        frame->dmabuf_fd2 = -1;
+    } else if (frame->dmabuf_fd >= 0) {
         close(frame->dmabuf_fd);
         frame->dmabuf_fd = -1;
     }
@@ -489,12 +673,12 @@ void vfmcap_release_frame(vfmcap_ctx_t *ctx, vfmcap_frame_t *frame)
     }
 }
 
-/* ---------- GPU format conversion ---------- */
+/* ---------- GPU format conversion (legacy API) ---------- */
 
 int vfmcap_convert_p010(vfmcap_ctx_t *ctx, vfmcap_frame_t *frame, int out_dmabuf_fd)
 {
     if (!ctx || !frame) return VFMCAP_ERR_INVAL;
-    if (!ctx->vulkan_init) {
+    if (!ctx->vk) {
         snprintf(ctx->last_error, sizeof(ctx->last_error),
                  "Vulkan not initialized");
         return VFMCAP_ERR_VULKAN;
@@ -505,12 +689,12 @@ int vfmcap_convert_p010(vfmcap_ctx_t *ctx, vfmcap_frame_t *frame, int out_dmabuf
         return VFMCAP_ERR_INVAL;
     }
 
-    int ret = vfmcap_vk_convert(frame->dmabuf_fd, out_dmabuf_fd,
+    int ret = vfmcap_vk_convert(ctx->vk, frame->dmabuf_fd, out_dmabuf_fd,
                                 frame->width, frame->height,
                                 VFMCAP_VK_FMT_P010);
     if (ret != 0) {
         snprintf(ctx->last_error, sizeof(ctx->last_error),
-                 "Vulkan P010 conversion failed: %s", vfmcap_vk_last_error());
+                 "Vulkan P010 conversion failed: %s", vfmcap_vk_last_error(ctx->vk));
         return VFMCAP_ERR_VULKAN;
     }
     return VFMCAP_OK;
@@ -519,7 +703,7 @@ int vfmcap_convert_p010(vfmcap_ctx_t *ctx, vfmcap_frame_t *frame, int out_dmabuf
 int vfmcap_convert_nv12(vfmcap_ctx_t *ctx, vfmcap_frame_t *frame, int out_dmabuf_fd)
 {
     if (!ctx || !frame) return VFMCAP_ERR_INVAL;
-    if (!ctx->vulkan_init) {
+    if (!ctx->vk) {
         snprintf(ctx->last_error, sizeof(ctx->last_error),
                  "Vulkan not initialized");
         return VFMCAP_ERR_VULKAN;
@@ -530,12 +714,12 @@ int vfmcap_convert_nv12(vfmcap_ctx_t *ctx, vfmcap_frame_t *frame, int out_dmabuf
         return VFMCAP_ERR_INVAL;
     }
 
-    int ret = vfmcap_vk_convert(frame->dmabuf_fd, out_dmabuf_fd,
+    int ret = vfmcap_vk_convert(ctx->vk, frame->dmabuf_fd, out_dmabuf_fd,
                                 frame->width, frame->height,
                                 VFMCAP_VK_FMT_NV12);
     if (ret != 0) {
         snprintf(ctx->last_error, sizeof(ctx->last_error),
-                 "Vulkan NV12 conversion failed: %s", vfmcap_vk_last_error());
+                 "Vulkan NV12 conversion failed: %s", vfmcap_vk_last_error(ctx->vk));
         return VFMCAP_ERR_VULKAN;
     }
     return VFMCAP_OK;
@@ -545,17 +729,17 @@ int vfmcap_convert_submit(vfmcap_ctx_t *ctx, vfmcap_frame_t *frame,
                           int out_dmabuf_fd, vfmcap_output_fmt_t fmt)
 {
     if (!ctx || !frame) return VFMCAP_ERR_INVAL;
-    if (!ctx->vulkan_init) return VFMCAP_ERR_VULKAN;
+    if (!ctx->vk) return VFMCAP_ERR_VULKAN;
     if (frame->dmabuf_fd < 0) return VFMCAP_ERR_INVAL;
 
     vfmcap_vk_fmt_t vk_fmt = (fmt == VFMCAP_FMT_NV12) ?
                               VFMCAP_VK_FMT_NV12 : VFMCAP_VK_FMT_P010;
 
-    int ret = vfmcap_vk_convert_submit(frame->dmabuf_fd, out_dmabuf_fd,
+    int ret = vfmcap_vk_convert_submit(ctx->vk, frame->dmabuf_fd, out_dmabuf_fd,
                                        frame->width, frame->height, vk_fmt);
     if (ret != 0) {
         snprintf(ctx->last_error, sizeof(ctx->last_error),
-                 "Vulkan submit failed: %s", vfmcap_vk_last_error());
+                 "Vulkan submit failed: %s", vfmcap_vk_last_error(ctx->vk));
         return VFMCAP_ERR_VULKAN;
     }
     return VFMCAP_OK;
@@ -564,12 +748,12 @@ int vfmcap_convert_submit(vfmcap_ctx_t *ctx, vfmcap_frame_t *frame,
 int vfmcap_convert_wait(vfmcap_ctx_t *ctx)
 {
     if (!ctx) return VFMCAP_ERR_INVAL;
-    if (!ctx->vulkan_init) return VFMCAP_ERR_VULKAN;
+    if (!ctx->vk) return VFMCAP_ERR_VULKAN;
 
-    int ret = vfmcap_vk_convert_wait();
+    int ret = vfmcap_vk_convert_wait(ctx->vk);
     if (ret != 0) {
         snprintf(ctx->last_error, sizeof(ctx->last_error),
-                 "Vulkan wait failed: %s", vfmcap_vk_last_error());
+                 "Vulkan wait failed: %s", vfmcap_vk_last_error(ctx->vk));
         return VFMCAP_ERR_VULKAN;
     }
     return VFMCAP_OK;
@@ -583,7 +767,7 @@ int vfmcap_poll_event(vfmcap_ctx_t *ctx, int timeout_ms)
 
     struct pollfd pfd;
     pfd.fd = ctx->fd;
-    pfd.events = POLLPRI; /* events only, not data */
+    pfd.events = POLLPRI;
     pfd.revents = 0;
 
     int ret = poll(&pfd, 1, timeout_ms);
@@ -598,7 +782,6 @@ int vfmcap_poll_event(vfmcap_ctx_t *ctx, int timeout_ms)
                 struct vfm_cap_signal_info_kern *sig =
                     (struct vfm_cap_signal_info_kern *)event.u.data;
 
-                /* Update cached format */
                 struct v4l2_format fmt;
                 memset(&fmt, 0, sizeof(fmt));
                 fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
@@ -608,6 +791,15 @@ int vfmcap_poll_event(vfmcap_ctx_t *ctx, int timeout_ms)
                     ctx->pixelformat = fmt.fmt.pix_mp.pixelformat;
                     ctx->bytesperline = fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
                     ctx->sizeimage = fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
+                    if (ctx->pixelformat == v4l2_fourcc('A', 'M', 'L', 'Y'))
+                        ctx->bitdepth = 10;
+                    else if (ctx->pixelformat == V4L2_PIX_FMT_NV12 ||
+                             ctx->pixelformat == V4L2_PIX_FMT_NV21)
+                        ctx->bitdepth = 8;
+                    else if (ctx->pixelformat == v4l2_fourcc('P', '0', '1', '0'))
+                        ctx->bitdepth = 10;
+                    else
+                        ctx->bitdepth = 8;
                 }
 
                 if (sig->status == 1)
@@ -626,7 +818,6 @@ int vfmcap_get_signal_info(vfmcap_ctx_t *ctx, vfmcap_signal_info_t *info)
 
     memset(info, 0, sizeof(*info));
 
-    /* Read format from device */
     struct v4l2_format fmt;
     memset(&fmt, 0, sizeof(fmt));
     fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
@@ -639,7 +830,6 @@ int vfmcap_get_signal_info(vfmcap_ctx_t *ctx, vfmcap_signal_info_t *info)
     info->width = fmt.fmt.pix_mp.width;
     info->height = fmt.fmt.pix_mp.height;
     info->pixelformat = fmt.fmt.pix_mp.pixelformat;
-    /* fps, signal_type, hdr_status etc. come from sysfs or future G_CTRL */
 
     return VFMCAP_OK;
 }
@@ -657,13 +847,18 @@ uint32_t vfmcap_output_size(uint32_t width, uint32_t height, vfmcap_output_fmt_t
 {
     switch (fmt) {
     case VFMCAP_FMT_P010:
-        /* Y plane: width * height * 2 (16-bit per pixel)
-         * UV plane: width * height (16-bit per UV pair, half height) */
         return width * height * 3;
     case VFMCAP_FMT_NV12:
-        /* Y plane: width * height
-         * UV plane: width * height / 2 */
+    case VFMCAP_FMT_NV21:
         return width * height * 3 / 2;
+    case VFMCAP_FMT_RAW:
+    case VFMCAP_FMT_VYUY_10BIT:
+        /* Caller should use frame.size from acquire_frame */
+        return width * height * 3; /* rough upper bound */
+    case VFMCAP_FMT_NV12_AFBC:
+    case VFMCAP_FMT_A2B10G10R10_AFBC:
+        /* AFBC size depends on driver layout; rough estimate */
+        return width * height * 2;
     default:
         return 0;
     }

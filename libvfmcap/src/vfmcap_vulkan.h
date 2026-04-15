@@ -36,10 +36,12 @@ typedef enum {
  * @width: Initial frame width
  * @height: Initial frame height
  * @fmt: Output format (determines which pipelines to create)
+ * @color_mode: HDR/color conversion mode (0=passthrough, 1=HDR10->SDR, 2=HLG->SDR)
  *
  * Returns 0 on success, -1 on failure.
  */
-int vfmcap_vk_init(VulkanCtx **vk, uint32_t width, uint32_t height, vfmcap_vk_fmt_t fmt);
+int vfmcap_vk_init(VulkanCtx **vk, uint32_t width, uint32_t height,
+                    vfmcap_vk_fmt_t fmt, uint32_t color_mode);
 
 /**
  * vfmcap_vk_convert_submit - Submit async GPU conversion

@@ -302,6 +302,7 @@ struct VulkanCtx {
 
     uint32_t                width;
     uint32_t                height;
+    uint32_t                color_mode;    /* 0=passthrough, 1=HDR10->SDR, 2=HLG->SDR */
     int                     initialized;
     uint64_t                frame_count;
     char                    last_error[256];
@@ -1306,7 +1307,8 @@ static int load_shader(VulkanCtx *vk, const unsigned char *spv_data, size_t spv_
 
 /* ---------- Initialization ---------- */
 
-int vfmcap_vk_init(VulkanCtx **vk_out, uint32_t width, uint32_t height, vfmcap_vk_fmt_t fmt)
+int vfmcap_vk_init(VulkanCtx **vk_out, uint32_t width, uint32_t height,
+                    vfmcap_vk_fmt_t fmt, uint32_t color_mode)
 {
     (void)fmt;
     VulkanCtx *vk = calloc(1, sizeof(VulkanCtx));
@@ -1315,6 +1317,7 @@ int vfmcap_vk_init(VulkanCtx **vk_out, uint32_t width, uint32_t height, vfmcap_v
 
     vk->width = width;
     vk->height = height;
+    vk->color_mode = color_mode;
     vk->input_cache_count = 0;
     vk->image_cache_count = 0;
     vk->cached_output.valid = 0;
@@ -2867,9 +2870,9 @@ int vfmcap_vk_render_10bit_and_wait(VulkanCtx *vk, int in_fd,
     };
     vkUpdateDescriptorSets(vk->device, 1, &tbdr_write, 0, NULL);
 
-    /* Push constants: { src_width, src_height, pairs_per_row, reserved } */
+    /* Push constants: { src_width, src_height, pairs_per_row, color_mode } */
     uint32_t pairs_per_row = src_width / 2;
-    uint32_t push_data[] = { src_width, src_height, pairs_per_row, 0u };
+    uint32_t push_data[] = { src_width, src_height, pairs_per_row, vk->color_mode };
 
     /* Transition output Y to COLOR_ATTACHMENT_OPTIMAL */
     VkImageMemoryBarrier out_y_barrier = {

@@ -1,17 +1,21 @@
 #version 450
+#extension GL_GOOGLE_include_directive : enable
 
 // TBDR-optimized NV12 Y output: reads AMLY SSBO directly in the fragment shader.
 //
 // Same decode logic as amly_p010_y.frag, but output is R8_UNORM.
 // The GPU's natural UNORM quantization when writing to R8 does:
 //   stored_uint8 = round(out_float * 255.0)
-// We output: float(val10 << 6) / 65535.0
-// → stored = round(val10 * 64 / 65535 * 255) = round(val10 * 0.24896...)
-// → ≈ val10 >> 2 (correct 10→8 bit truncation with ≤1 LSB error)
 //
-// Push constants: { src_width, src_height, pairs_per_row, reserved }
+// When color_mode != 0, extracts full YCbCr, runs HDR->SDR conversion,
+// and outputs the BT.709 Y component.
+//
+// Push constants: { src_width, src_height, pairs_per_row, color_mode }
+//   color_mode: 0=passthrough, 1=HDR10 (PQ)->SDR, 2=HLG->SDR
 // Binding 0: AMLY input buffer (SSBO)
 // Output: R8_UNORM color attachment at source (or scaled) resolution
+
+#include "hdr_colorconv.glsl"
 
 layout(location = 0) in vec2 v_uv;
 layout(location = 0) out float out_y;
@@ -24,7 +28,7 @@ layout(push_constant) uniform Params {
     uint src_width;
     uint src_height;
     uint pairs_per_row;
-    uint reserved;
+    uint color_mode;
 } params;
 
 uint bswap32(uint val) {
@@ -80,6 +84,24 @@ void main() {
         y_val = (bs >> 2) & 0x3FFu;
     }
 
-    // Output as normalized float; R8_UNORM framebuffer naturally truncates 10→8 bit
-    out_y = float(y_val << 6u) / 65535.0;
+    if (params.color_mode == 0u) {
+        // Passthrough: output as normalized float; R8_UNORM framebuffer truncates 10->8 bit
+        out_y = float(y_val << 6u) / 65535.0;
+    } else {
+        // HDR->SDR: need Cb and Cr too
+        uint cb_val = (bs >> 12) & 0x3FFu;
+        uint cr_val = ((bs & 0x3u) << 8) | hi;
+
+        float y_n  = float(y_val)  / 1023.0;
+        float cb_n = float(cb_val) / 1023.0;
+        float cr_n = float(cr_val) / 1023.0;
+
+        float out_y_sdr = hdr_to_sdr_y(y_n, cb_n, cr_n, params.color_mode);
+
+        // NV12 R8_UNORM: the hardware writes round(out_float * 255.0).
+        // hdr_to_sdr_y returns a normalized value representing the final
+        // limited-range BT.709 Y. Output directly — the R8_UNORM write
+        // naturally quantizes the 10-bit-range value down to 8 bits.
+        out_y = out_y_sdr;
+    }
 }

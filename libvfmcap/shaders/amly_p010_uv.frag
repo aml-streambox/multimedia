@@ -1,15 +1,23 @@
 #version 450
+#extension GL_GOOGLE_include_directive : enable
 
 // TBDR-optimized P010 UV output: reads AMLY SSBO directly in the fragment shader.
 //
-// This shader runs at half resolution (width/2 × height/2).
+// This shader runs at half resolution (width/2 x height/2).
 // Each fragment represents one chroma sample in 4:2:0 output.
 // It reads two AMLY pairs (current row + next row) and averages the
-// chroma components for 4:2:2 → 4:2:0 vertical subsampling.
+// chroma components for 4:2:2 -> 4:2:0 vertical subsampling.
 //
-// Push constants: { src_width, src_height, pairs_per_row, reserved }
+// When color_mode != 0, also extracts Y from each row and runs HDR->SDR
+// conversion on the averaged chroma with the averaged Y, outputting
+// BT.709 CbCr instead of raw BT.2020 CbCr.
+//
+// Push constants: { src_width, src_height, pairs_per_row, color_mode }
+//   color_mode: 0=passthrough, 1=HDR10 (PQ)->SDR, 2=HLG->SDR
 // Binding 0: AMLY input buffer (SSBO)
 // Output: R16G16_UNORM color attachment at half resolution
+
+#include "hdr_colorconv.glsl"
 
 layout(location = 0) in vec2 v_uv;
 layout(location = 0) out vec2 out_uv;
@@ -22,7 +30,7 @@ layout(push_constant) uniform Params {
     uint src_width;
     uint src_height;
     uint pairs_per_row;
-    uint reserved;
+    uint color_mode;
 } params;
 
 uint bswap32(uint val) {
@@ -79,6 +87,9 @@ void main() {
 
     // Read next row pair for vertical averaging
     uint u_avg, v_avg;
+    uint y0_val = (bs0 >> 22) & 0x3FFu;  // Y0 from current row (for HDR path)
+    uint y1_val = y0_val;  // default: same as current row
+
     if (src_row + 1u < params.src_height) {
         uint pair_idx1 = (src_row + 1u) * params.pairs_per_row + pair_in_row;
         uint lo1, hi1;
@@ -86,6 +97,7 @@ void main() {
         uint bs1 = bswap32(lo1);
         uint nu0 = (bs1 >> 12) & 0x3FFu;
         uint nv0 = ((bs1 & 0x3u) << 8) | hi1;
+        y1_val = (bs1 >> 22) & 0x3FFu;  // Y0 from next row
 
         u_avg = (u0 + nu0 + 1u) >> 1;
         v_avg = (v0 + nv0 + 1u) >> 1;
@@ -94,9 +106,24 @@ void main() {
         v_avg = v0;
     }
 
-    // P010: left-justified 10-bit in 16-bit
-    float u_f = float(u_avg << 6u) / 65535.0;
-    float v_f = float(v_avg << 6u) / 65535.0;
+    if (params.color_mode == 0u) {
+        // Passthrough: P010 left-justified 10-bit in 16-bit
+        float u_f = float(u_avg << 6u) / 65535.0;
+        float v_f = float(v_avg << 6u) / 65535.0;
+        out_uv = vec2(u_f, v_f);
+    } else {
+        // HDR->SDR: use averaged Y with averaged chroma for the conversion.
+        // Average Y from both rows to match the chroma averaging.
+        uint y_avg = (y0_val + y1_val + 1u) >> 1;
 
-    out_uv = vec2(u_f, v_f);
+        float y_n  = float(y_avg)  / 1023.0;
+        float cb_n = float(u_avg)  / 1023.0;
+        float cr_n = float(v_avg)  / 1023.0;
+
+        vec2 cbcr_sdr = hdr_to_sdr_cbcr(y_n, cb_n, cr_n, params.color_mode);
+
+        // P010: left-justified 10-bit in 16-bit
+        // hdr_to_sdr_cbcr returns normalized [0,1] values
+        out_uv = cbcr_sdr * (65472.0 / 65535.0);
+    }
 }

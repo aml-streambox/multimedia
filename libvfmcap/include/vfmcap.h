@@ -61,6 +61,14 @@ typedef enum {
     VFMCAP_FMT_VYUY_10BIT = 6,    /* Amlogic private VYUY 10-bit passthrough (no conversion) */
 } vfmcap_output_fmt_t;
 
+/* ---------- Color conversion mode ---------- */
+
+typedef enum {
+    VFMCAP_COLOR_PASSTHROUGH = 0,  /* No color space conversion (default) */
+    VFMCAP_COLOR_HDR10_TO_SDR = 1, /* BT.2020+PQ (HDR10) -> BT.709 SDR (Reinhard tone map) */
+    VFMCAP_COLOR_HLG_TO_SDR = 2,   /* BT.2020+HLG -> BT.709 SDR (Reinhard tone map) */
+} vfmcap_color_mode_t;
+
 /* ---------- Frame descriptor ---------- */
 
 /**
@@ -145,6 +153,7 @@ typedef struct {
     uint32_t target_width;              /* Target output width (0 = match source) */
     uint32_t target_height;             /* Target output height (0 = match source) */
     float    target_fps;                /* Target framerate (0 = match source) */
+    vfmcap_color_mode_t color_mode;     /* HDR/color conversion mode (default: PASSTHROUGH) */
 } vfmcap_config_t;
 
 /* ---------- Lifecycle ---------- */

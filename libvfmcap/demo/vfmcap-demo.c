@@ -580,11 +580,12 @@ int main(int argc, char *argv[])
     int num_frames = 100;
     int do_p010 = 0, do_nv12 = 0;
     int do_profile = 0;
+    int color_mode = 0;  /* 0=passthrough, 1=HDR10->SDR, 2=HLG->SDR */
     int opt;
 
     const char *raw_path = NULL;
 
-    while ((opt = getopt(argc, argv, "d:n:c:o:r:ph")) != -1) {
+    while ((opt = getopt(argc, argv, "d:n:c:o:r:m:ph")) != -1) {
         switch (opt) {
         case 'd':
             device = optarg;
@@ -608,18 +609,28 @@ int main(int argc, char *argv[])
         case 'r':
             raw_path = optarg;
             break;
+        case 'm':
+            if (strcmp(optarg, "hdr10") == 0) color_mode = 1;
+            else if (strcmp(optarg, "hlg") == 0) color_mode = 2;
+            else if (strcmp(optarg, "pass") == 0) color_mode = 0;
+            else {
+                fprintf(stderr, "Unknown color mode: %s (use: pass, hdr10, hlg)\n", optarg);
+                return 1;
+            }
+            break;
         case 'p':
             do_profile = 1;
             break;
         case 'h':
         default:
             fprintf(stderr,
-                "Usage: %s [-d device] [-n frames] [-c p010|nv12|both] [-o outfile] [-r rawfile] [-p]\n"
+                "Usage: %s [-d device] [-n frames] [-c p010|nv12|both] [-o outfile] [-r rawfile] [-m pass|hdr10|hlg] [-p]\n"
                 "  -d  Device path (default: /dev/video_cap)\n"
                 "  -n  Number of frames to capture (default: 100)\n"
                 "  -c  GPU convert: p010, nv12, or both\n"
                 "  -o  Dump converted frame to file (raw P010/NV12)\n"
                 "  -r  Dump raw AMLY input frame to file\n"
+                "  -m  Color mode: pass (default), hdr10 (HDR10->SDR), hlg (HLG->SDR)\n"
                 "  -p  Profiling mode: GPU-convert every frame, report timing stats\n",
                 argv[0]);
             return (opt == 'h') ? 0 : 1;
@@ -635,6 +646,8 @@ int main(int argc, char *argv[])
     fprintf(stderr, "Convert: %s%s%s\n",
             do_p010 ? "P010 " : "", do_nv12 ? "NV12 " : "",
             (!do_p010 && !do_nv12) ? "none" : "");
+    if (color_mode) fprintf(stderr, "Color: %s\n",
+                            color_mode == 1 ? "HDR10->SDR" : "HLG->SDR");
     if (do_profile) fprintf(stderr, "Mode: PROFILING\n");
 
     /* Open */
@@ -642,6 +655,7 @@ int main(int argc, char *argv[])
     if (do_p010) cfg.output_format = VFMCAP_FMT_P010;
     else if (do_nv12) cfg.output_format = VFMCAP_FMT_NV12;
     else cfg.output_format = VFMCAP_FMT_RAW;
+    cfg.color_mode = (vfmcap_color_mode_t)color_mode;
 
     vfmcap_ctx_t *ctx = vfmcap_open(device, &cfg);
     if (!ctx) {

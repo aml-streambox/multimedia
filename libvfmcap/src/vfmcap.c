@@ -337,7 +337,8 @@ int vfmcap_start(vfmcap_ctx_t *ctx, unsigned int num_buffers)
     /* Initialize Vulkan if conversion is requested */
     if (needs_vulkan(&ctx->config) && !ctx->vk && ctx->width > 0 && ctx->height > 0) {
         if (vfmcap_vk_init(&ctx->vk, ctx->width, ctx->height,
-                           to_vk_fmt(ctx->config.output_format)) == 0) {
+                            to_vk_fmt(ctx->config.output_format),
+                            (uint32_t)ctx->config.color_mode) == 0) {
             /* success */
         } else {
             fprintf(stderr, "[vfmcap] WARNING: Vulkan init failed: %s\n",

@@ -107,6 +107,10 @@ enum
     PROP_NUM_BUFFERS,
     PROP_PATHA_POOL_SIZE,
     PROP_OUTPUT_FORMAT,
+    PROP_TARGET_WIDTH,
+    PROP_TARGET_HEIGHT,
+    PROP_TARGET_FPS,
+    PROP_COLOR_MODE,
     PROP_VDIN1_INPUT,
 };
 
@@ -1507,6 +1511,30 @@ gst_streambox_src_class_init(GstStreamboxSrcClass *klass)
             DEFAULT_OUTPUT_FMT,
             G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
+    g_object_class_install_property(gobject_class, PROP_TARGET_WIDTH,
+        g_param_spec_uint("target-width", "Target Width",
+            "Target output width in pixels (0 = match source)",
+            0, 8192, 0,
+            G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+    g_object_class_install_property(gobject_class, PROP_TARGET_HEIGHT,
+        g_param_spec_uint("target-height", "Target Height",
+            "Target output height in pixels (0 = match source)",
+            0, 8192, 0,
+            G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+    g_object_class_install_property(gobject_class, PROP_TARGET_FPS,
+        g_param_spec_float("target-fps", "Target FPS",
+            "Target output framerate in fps (0 = match source)",
+            0.0f, 240.0f, 0.0f,
+            G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+    g_object_class_install_property(gobject_class, PROP_COLOR_MODE,
+        g_param_spec_uint("color-mode", "Color Mode",
+            "HDR/color conversion mode: 0=passthrough, 1=HDR10->SDR, 2=HLG->SDR",
+            0, 2, 0,
+            G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
     g_object_class_install_property(gobject_class, PROP_VDIN1_INPUT,
         g_param_spec_uint("vdin1-input", "VDIN1 Input Index",
             "V4L2 input index for vdin1 loopback source. "
@@ -1544,6 +1572,10 @@ gst_streambox_src_init(GstStreamboxSrc *self)
     self->num_buffers = DEFAULT_NUM_BUFFERS;
     self->patha_out_pool_size = DEFAULT_PATHA_POOL_SIZE;
     self->output_fmt = DEFAULT_OUTPUT_FMT;
+    self->target_width = 0;
+    self->target_height = 0;
+    self->target_fps = 0.0f;
+    self->color_mode = 0;
     self->vdin1_input = VDIN1_INPUT_VPP_POST_BLEND;
 
     self->sig_state = GST_STREAMBOX_STATE_IDLE;
@@ -1669,6 +1701,18 @@ gst_streambox_src_set_property(GObject *object, guint prop_id,
     case PROP_OUTPUT_FORMAT:
         self->output_fmt = g_value_get_enum(value);
         break;
+    case PROP_TARGET_WIDTH:
+        self->target_width = g_value_get_uint(value);
+        break;
+    case PROP_TARGET_HEIGHT:
+        self->target_height = g_value_get_uint(value);
+        break;
+    case PROP_TARGET_FPS:
+        self->target_fps = g_value_get_float(value);
+        break;
+    case PROP_COLOR_MODE:
+        self->color_mode = g_value_get_uint(value);
+        break;
     case PROP_VDIN1_INPUT:
         self->vdin1_input = g_value_get_uint(value);
         break;
@@ -1705,6 +1749,18 @@ gst_streambox_src_get_property(GObject *object, guint prop_id,
         break;
     case PROP_OUTPUT_FORMAT:
         g_value_set_enum(value, self->output_fmt);
+        break;
+    case PROP_TARGET_WIDTH:
+        g_value_set_uint(value, self->target_width);
+        break;
+    case PROP_TARGET_HEIGHT:
+        g_value_set_uint(value, self->target_height);
+        break;
+    case PROP_TARGET_FPS:
+        g_value_set_float(value, self->target_fps);
+        break;
+    case PROP_COLOR_MODE:
+        g_value_set_uint(value, self->color_mode);
         break;
     case PROP_VDIN1_INPUT:
         g_value_set_uint(value, self->vdin1_input);
@@ -1952,7 +2008,15 @@ start_path_a(GstStreamboxSrc *self)
 {
     const gchar *dev = resolve_device(self);
 
-    self->cap_ctx = vfmcap_open(dev);
+    vfmcap_config_t cfg = {0};
+    cfg.output_format = (self->output_fmt == GST_STREAMBOX_OUTPUT_P010)
+                         ? VFMCAP_FMT_P010 : VFMCAP_FMT_NV12;
+    cfg.target_width = self->target_width;
+    cfg.target_height = self->target_height;
+    cfg.target_fps = self->target_fps;
+    cfg.color_mode = (vfmcap_color_mode_t)self->color_mode;
+
+    self->cap_ctx = vfmcap_open(dev, &cfg);
     if (!self->cap_ctx) {
         GST_ELEMENT_ERROR(self, RESOURCE, OPEN_READ,
                           ("Failed to open %s", dev),
@@ -1994,48 +2058,19 @@ start_path_a(GstStreamboxSrc *self)
         return FALSE;
     }
 
-    vfmcap_output_fmt_t sdk_fmt = (self->output_fmt == GST_STREAMBOX_OUTPUT_P010)
-                                   ? VFMCAP_FMT_P010 : VFMCAP_FMT_NV12;
-    self->out_buf_size = vfmcap_output_size(self->width, self->height, sdk_fmt);
-
     /* Detect colorimetry from HDMI RX signal for caps */
     hdmirx_detect_colorimetry(self);
-
-    /* Pre-allocate a pool of CMA output buffers with acquire/release lifecycle.
-     * Each buffer is marked "free" initially; create_path_a() acquires one,
-     * and the downstream element's unref of the GstBuffer triggers a callback
-     * that marks it free again. This prevents the Vulkan shader from
-     * overwriting a buffer while the encoder hardware is still reading it. */
-    self->patha_out_count = 0;
-    for (guint i = 0; i < self->patha_out_pool_size; i++) {
-        int fd = alloc_cma_dmabuf(self, self->out_buf_size);
-        if (fd < 0) {
-            GST_ERROR_OBJECT(self, "Path A pool: failed to allocate buf %u/%u",
-                             i, self->patha_out_pool_size);
-            /* Cleanup what we allocated */
-            for (guint j = 0; j < i; j++) {
-                close(self->patha_out_fds[j]);
-                self->patha_out_fds[j] = -1;
-                self->patha_out_free[j] = FALSE;
-            }
-            vfmcap_close(self->cap_ctx);
-            self->cap_ctx = NULL;
-            return FALSE;
-        }
-        self->patha_out_fds[i] = fd;
-        self->patha_out_free[i] = TRUE;
-        self->patha_out_count++;
-    }
 
     self->streaming = TRUE;
     g_mutex_lock(&self->state_lock);
     self->sig_state = GST_STREAMBOX_STATE_STREAMING;
     g_mutex_unlock(&self->state_lock);
 
-    GST_INFO_OBJECT(self, "Path A started: %ux%u @ %u/%u, output=%s (%u bytes), pool=%u",
+    GST_INFO_OBJECT(self, "Path A started: %ux%u @ %u/%u, output=%s, target=%ux%u fps=%.1f color=%u",
                      self->width, self->height, self->fps_n, self->fps_d,
                      self->output_fmt == GST_STREAMBOX_OUTPUT_P010 ? "P010" : "NV12",
-                     self->out_buf_size, self->patha_out_count);
+                     self->target_width, self->target_height,
+                     self->target_fps, self->color_mode);
     return TRUE;
 }
 
@@ -2054,63 +2089,27 @@ stop_path_a(GstStreamboxSrc *self)
         self->cap_ctx = NULL;
     }
 
-    /* Free Path A output pool */
-    for (guint i = 0; i < self->patha_out_count; i++) {
-        if (self->patha_out_fds[i] >= 0) {
-            close(self->patha_out_fds[i]);
-            self->patha_out_fds[i] = -1;
-        }
-        self->patha_out_free[i] = FALSE;
-    }
-    self->patha_out_count = 0;
-
     if (self->heap_fd >= 0) {
         close(self->heap_fd);
         self->heap_fd = -1;
     }
 }
 
-/* ---- Path A output buffer pool: acquire / release helpers ---- */
-
 typedef struct {
-    GstStreamboxSrc *self;  /* ref'd */
-    guint            pool_index;
-} PathABufContext;
+    GstStreamboxSrc *self;
+    vfmcap_frame_t   frame;
+} PathAFrameContext;
 
-/* Called when the downstream element (encoder) unrefs the GstBuffer.
- * Marks the pool slot as free so create_path_a() can reuse it. */
 static void
-patha_buf_release(gpointer data)
+patha_frame_release(gpointer data)
 {
-    PathABufContext *ctx = (PathABufContext *)data;
-    GstStreamboxSrc *self = ctx->self;
-    guint idx = ctx->pool_index;
-
-    if (idx < self->patha_out_count) {
-        g_mutex_lock(&self->patha_out_lock);
-        self->patha_out_free[idx] = TRUE;
-        g_mutex_unlock(&self->patha_out_lock);
+    PathAFrameContext *ctx = (PathAFrameContext *)data;
+    if (ctx->self && ctx->self->cap_ctx) {
+        vfmcap_release_frame(ctx->self->cap_ctx, &ctx->frame);
     }
-
-    gst_object_unref(self);
+    if (ctx->self)
+        gst_object_unref(ctx->self);
     g_free(ctx);
-}
-
-/* Acquire a free buffer slot from the Path A pool.
- * Returns the index, or -1 if all buffers are in use. */
-static gint
-patha_pool_acquire(GstStreamboxSrc *self)
-{
-    g_mutex_lock(&self->patha_out_lock);
-    for (guint i = 0; i < self->patha_out_count; i++) {
-        if (self->patha_out_free[i]) {
-            self->patha_out_free[i] = FALSE;
-            g_mutex_unlock(&self->patha_out_lock);
-            return (gint)i;
-        }
-    }
-    g_mutex_unlock(&self->patha_out_lock);
-    return -1;
 }
 
 static GstFlowReturn
@@ -2123,7 +2122,7 @@ create_path_a(GstStreamboxSrc *self, GstBuffer **buf)
     if (!self->caps_set)
         push_current_caps(self);
 
-    /* Acquire frame */
+    /* Acquire frame (conversion integrated if configured) */
     vfmcap_frame_t frame;
     int ret = vfmcap_acquire_frame(self->cap_ctx, &frame, 1000);
 
@@ -2145,6 +2144,13 @@ create_path_a(GstStreamboxSrc *self, GstBuffer **buf)
         return GST_FLOW_EOS;
     }
 
+    if (ret == VFMCAP_RECONFIGURED) {
+        GST_INFO_OBJECT(self, "Signal reconfigured — exiting for restart");
+        vfmcap_release_frame(self->cap_ctx, &frame);
+        post_signal_change_message(self, "signal-changed");
+        return GST_FLOW_EOS;
+    }
+
     if (ret != VFMCAP_OK) {
         GST_ERROR_OBJECT(self, "acquire_frame failed: %s",
                          vfmcap_last_error(self->cap_ctx));
@@ -2160,134 +2166,117 @@ create_path_a(GstStreamboxSrc *self, GstBuffer **buf)
         return GST_FLOW_EOS;
     }
 
-    /* Acquire a free output buffer from the pool.
-     * The buffer won't be reused until the downstream element (encoder)
-     * unrefs the GstBuffer, which triggers patha_buf_release().
-     * If all buffers are busy, poll briefly — the encoder is synchronous
-     * so a slot should free up within one frame period (~16ms at 60fps). */
-    gint slot = -1;
-    for (int attempt = 0; attempt < 60; attempt++) {  /* up to ~300ms */
-        slot = patha_pool_acquire(self);
-        if (slot >= 0)
-            break;
-        if (self->flushing) {
-            vfmcap_release_frame(self->cap_ctx, &frame);
-            return GST_FLOW_FLUSHING;
-        }
-        g_usleep(5000);  /* 5ms */
-    }
-    if (slot < 0) {
-        GST_ERROR_OBJECT(self,
-            "Path A output pool exhausted after 300ms (%u buffers in use) — frame %lu",
-            self->patha_out_count, (unsigned long)self->frame_count);
-        vfmcap_release_frame(self->cap_ctx, &frame);
-        return GST_FLOW_ERROR;
-    }
-    int out_fd = self->patha_out_fds[slot];
-
-    /* GPU convert: AMLY -> NV12 or P010 */
-    vfmcap_output_fmt_t sdk_fmt = (self->output_fmt == GST_STREAMBOX_OUTPUT_P010)
-                                   ? VFMCAP_FMT_P010 : VFMCAP_FMT_NV12;
-    if (sdk_fmt == VFMCAP_FMT_P010)
-        ret = vfmcap_convert_p010(self->cap_ctx, &frame, out_fd);
-    else
-        ret = vfmcap_convert_nv12(self->cap_ctx, &frame, out_fd);
-
-    /* Release input frame immediately after GPU is done */
-    uint64_t frame_ts = frame.timestamp_us;
-    vfmcap_release_frame(self->cap_ctx, &frame);
-
-    if (ret != VFMCAP_OK) {
-        GST_ERROR_OBJECT(self, "GPU conversion failed: %s",
-                         vfmcap_last_error(self->cap_ctx));
-        g_mutex_lock(&self->patha_out_lock);
-        self->patha_out_free[slot] = TRUE;
-        g_mutex_unlock(&self->patha_out_lock);
-        return GST_FLOW_ERROR;
-    }
-
-    /* Wrap a dup'd fd in GstBuffer — pool retains the original fd.
-     * gst_dmabuf_allocator_alloc takes ownership of its fd arg and will
-     * close it when the GstMemory is freed, so we must dup(). */
-    int dup_fd = dup(out_fd);
+    /* Wrap the DMA-buf fd(s) in GstBuffer.
+     * For integrated conversion, frame.dmabuf_fd is the output buffer
+     * owned by libvfmcap. We dup it because gst_dmabuf_allocator_alloc
+     * takes ownership of the fd. */
+    int dup_fd = dup(frame.dmabuf_fd);
     if (dup_fd < 0) {
-        GST_ERROR_OBJECT(self, "dup(out_fd=%d) failed: %s",
-                         out_fd, strerror(errno));
-        g_mutex_lock(&self->patha_out_lock);
-        self->patha_out_free[slot] = TRUE;
-        g_mutex_unlock(&self->patha_out_lock);
+        GST_ERROR_OBJECT(self, "dup(frame.dmabuf_fd=%d) failed: %s",
+                         frame.dmabuf_fd, strerror(errno));
+        vfmcap_release_frame(self->cap_ctx, &frame);
         return GST_FLOW_ERROR;
     }
 
     GstAllocator *dmabuf_alloc = gst_dmabuf_allocator_new();
-    GstMemory *mem = gst_dmabuf_allocator_alloc(dmabuf_alloc, dup_fd,
-                                                 self->out_buf_size);
+    GstMemory *mem = gst_dmabuf_allocator_alloc(dmabuf_alloc, dup_fd, frame.size);
     gst_object_unref(dmabuf_alloc);
 
     if (!mem) {
         GST_ERROR_OBJECT(self, "Failed to wrap DMA-buf fd as GstMemory");
         close(dup_fd);
-        g_mutex_lock(&self->patha_out_lock);
-        self->patha_out_free[slot] = TRUE;
-        g_mutex_unlock(&self->patha_out_lock);
+        vfmcap_release_frame(self->cap_ctx, &frame);
         return GST_FLOW_ERROR;
     }
 
     GstBuffer *buffer = gst_buffer_new();
     gst_buffer_append_memory(buffer, mem);
 
-    /*
-     * Leave PTS as GST_CLOCK_TIME_NONE so that GstBaseSrc's do-timestamp
-     * logic assigns the pipeline running time.  Setting PTS to the raw
-     * vdin0 monotonic timestamp here would prevent the override and cause
-     * a massive timestamp mismatch with other live sources (e.g. alsasrc)
-     * in muxed pipelines.
-     */
+    /* Add second plane memory if present (NV12/P010 linear) */
+    if (frame.dmabuf_fd2 >= 0) {
+        int dup_fd2 = dup(frame.dmabuf_fd2);
+        if (dup_fd2 < 0) {
+            GST_ERROR_OBJECT(self, "dup(frame.dmabuf_fd2=%d) failed: %s",
+                             frame.dmabuf_fd2, strerror(errno));
+            gst_buffer_unref(buffer);
+            vfmcap_release_frame(self->cap_ctx, &frame);
+            return GST_FLOW_ERROR;
+        }
+        dmabuf_alloc = gst_dmabuf_allocator_new();
+        GstMemory *mem2 = gst_dmabuf_allocator_alloc(dmabuf_alloc, dup_fd2,
+                                                      frame.size / 2); /* approximate */
+        gst_object_unref(dmabuf_alloc);
+        if (!mem2) {
+            GST_ERROR_OBJECT(self, "Failed to wrap DMA-buf fd2 as GstMemory");
+            close(dup_fd2);
+            gst_buffer_unref(buffer);
+            vfmcap_release_frame(self->cap_ctx, &frame);
+            return GST_FLOW_ERROR;
+        }
+        gst_buffer_append_memory(buffer, mem2);
+    }
+
     GST_BUFFER_PTS(buffer) = GST_CLOCK_TIME_NONE;
     GST_BUFFER_DURATION(buffer) = gst_util_uint64_scale_int(GST_SECOND,
                                                              self->fps_d,
                                                              self->fps_n);
 
-    /* Add video meta */
-    GstVideoFormat gst_fmt = (self->output_fmt == GST_STREAMBOX_OUTPUT_P010)
-                              ? GST_VIDEO_FORMAT_P010_10LE
-                              : GST_VIDEO_FORMAT_NV12;
+    /* Add video meta from frame format */
+    GstVideoFormat gst_fmt;
+    guint n_planes = 1;
     gsize offsets[GST_VIDEO_MAX_PLANES] = { 0, };
     gint strides[GST_VIDEO_MAX_PLANES] = { 0, };
 
-    if (self->output_fmt == GST_STREAMBOX_OUTPUT_P010) {
-        strides[0] = self->width * 2;
-        strides[1] = self->width * 2;
+    if (frame.pixelformat == v4l2_fourcc('P', '0', '1', '0')) {
+        gst_fmt = GST_VIDEO_FORMAT_P010_10LE;
+        n_planes = 2;
+        strides[0] = frame.width * 2;
+        strides[1] = frame.width * 2;
         offsets[0] = 0;
-        offsets[1] = (gsize)self->width * self->height * 2;
+        offsets[1] = (gsize)frame.width * frame.height * 2;
+    } else if (frame.pixelformat == V4L2_PIX_FMT_NV12) {
+        gst_fmt = GST_VIDEO_FORMAT_NV12;
+        n_planes = 2;
+        strides[0] = frame.width;
+        strides[1] = frame.width;
+        offsets[0] = 0;
+        offsets[1] = (gsize)frame.width * frame.height;
+    } else if (frame.pixelformat == v4l2_fourcc('A', 'M', 'L', 'Y')) {
+        /* Raw AMLY passthrough — treat as single-plane opaque */
+        gst_fmt = GST_VIDEO_FORMAT_UNKNOWN;
+        n_planes = 1;
+        strides[0] = frame.bytesperline;
+        offsets[0] = 0;
     } else {
-        strides[0] = self->width;
-        strides[1] = self->width;
+        /* Fallback for other formats */
+        gst_fmt = GST_VIDEO_FORMAT_UNKNOWN;
+        n_planes = 1;
+        strides[0] = frame.bytesperline;
         offsets[0] = 0;
-        offsets[1] = (gsize)self->width * self->height;
     }
 
-    gst_buffer_add_video_meta_full(buffer, GST_VIDEO_FRAME_FLAG_NONE,
-                                    gst_fmt, self->width, self->height,
-                                    2, offsets, strides);
+    if (gst_fmt != GST_VIDEO_FORMAT_UNKNOWN) {
+        gst_buffer_add_video_meta_full(buffer, GST_VIDEO_FRAME_FLAG_NONE,
+                                        gst_fmt, frame.width, frame.height,
+                                        n_planes, offsets, strides);
+    }
 
-    /* Attach release callback — when the encoder (or any downstream element)
-     * unrefs this GstBuffer, patha_buf_release() marks the pool slot as free
-     * so we can safely reuse it for a future frame. */
-    PathABufContext *pctx = g_new(PathABufContext, 1);
+    /* Attach release callback so vfmcap_release_frame is called when
+     * the downstream element unrefs the GstBuffer. */
+    PathAFrameContext *pctx = g_new(PathAFrameContext, 1);
     pctx->self = GST_STREAMBOX_SRC(gst_object_ref(self));
-    pctx->pool_index = (guint)slot;
+    pctx->frame = frame;
     gst_mini_object_set_qdata(GST_MINI_OBJECT(buffer),
-                               g_quark_from_static_string("patha-pool-ctx"),
-                               pctx, patha_buf_release);
+                               g_quark_from_static_string("patha-frame-ctx"),
+                               pctx, patha_frame_release);
 
     self->frame_count++;
 
     if (self->frame_count == 1 || self->frame_count % 300 == 0) {
-        GST_INFO_OBJECT(self, "Path A frame %lu: %ux%u %s",
+        GST_INFO_OBJECT(self, "Path A frame %lu: %ux%u pixfmt=%.4s",
                          (unsigned long)self->frame_count,
-                         self->width, self->height,
-                         self->output_fmt == GST_STREAMBOX_OUTPUT_P010 ? "P010" : "NV12");
+                         frame.width, frame.height,
+                         (char *)&frame.pixelformat);
     }
 
     *buf = buffer;

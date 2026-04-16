@@ -89,6 +89,10 @@ struct _GstStreamboxSrc
     gchar    *device;                       /* device path (auto-detected or manual) */
     guint     num_buffers;                  /* V4L2 buffer count */
     GstStreamboxOutputFormat output_fmt;    /* NV12 or P010 (Path A only) */
+    guint     target_width;                 /* Target output width (0 = match source) */
+    guint     target_height;                /* Target output height (0 = match source) */
+    gfloat    target_fps;                   /* Target output framerate (0 = match source) */
+    guint     color_mode;                   /* 0=passthrough, 1=HDR10->SDR, 2=HLG->SDR */
     guint     vdin1_input;                  /* V4L2 input index for vdin1 (default 6 = VPP post-blend) */
 
     /* ---- Signal state machine ---- */

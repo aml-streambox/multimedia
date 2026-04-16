@@ -1867,6 +1867,7 @@ int vfmcap_vk_init(VulkanCtx **vk_out, uint32_t src_width, uint32_t src_height,
 
     vk->width = dst_width;
     vk->height = dst_height;
+    vk->color_mode = color_mode;
 
     if (dst_width == 0 || dst_height == 0 || dst_width > 16384 || dst_height > 16384) {
         snprintf(vk->last_error, sizeof(vk->last_error),

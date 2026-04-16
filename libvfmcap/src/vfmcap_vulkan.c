@@ -27,6 +27,7 @@
 #include <stdbool.h>
 #include <linux/dma-buf.h>
 #include <linux/dma-heap.h>
+#include <drm/drm_fourcc.h>
 #include <sys/ioctl.h>
 #include <fcntl.h>
 
@@ -201,11 +202,12 @@ typedef struct {
     VkImage         image;
     VkDeviceMemory  memory;
     VkImageView     view;
-    int             dmabuf_fd;      /* DMA-buf fd for image (dmabuf pool) or buffer (copy pool) */
+    VkImageView     view2;           /* Second plane view (UV for multi-planar AFBC) */
+    int             dmabuf_fd;       /* DMA-buf fd for image (dmabuf pool) or buffer (copy pool) */
+    int             dmabuf_fd2;      /* Second DMA-buf fd (unused for AFBC, -1) */
     int             in_use;
-    int             is_internal;    /* 1 = pure GPU-local image, no DMA-buf */
-    /* Copy-out fields: internal image + DMA-buf backed buffer for formats
-       that Mali cannot export as external VkImages (R16, R16G16). */
+    int             is_internal;     /* 1 = pure GPU-local image, no DMA-buf */
+    uint64_t        modifier;        /* DRM format modifier (0 = linear) */
     VkBuffer        copy_buffer;
     VkDeviceMemory  copy_buffer_memory;
     VkDeviceSize    copy_buffer_size;
@@ -1072,6 +1074,8 @@ static void output_pool_destroy(VulkanCtx *vk, OutputPool *pool)
         OutputPoolEntry *e = &pool->entries[i];
         if (e->view != VK_NULL_HANDLE)
             vkDestroyImageView(vk->device, e->view, NULL);
+        if (e->view2 != VK_NULL_HANDLE)
+            vkDestroyImageView(vk->device, e->view2, NULL);
         if (e->image != VK_NULL_HANDLE)
             vkDestroyImage(vk->device, e->image, NULL);
         if (e->memory != VK_NULL_HANDLE)
@@ -1082,6 +1086,8 @@ static void output_pool_destroy(VulkanCtx *vk, OutputPool *pool)
             vkFreeMemory(vk->device, e->copy_buffer_memory, NULL);
         if (e->dmabuf_fd >= 0)
             close(e->dmabuf_fd);
+        if (e->dmabuf_fd2 >= 0)
+            close(e->dmabuf_fd2);
     }
     free(pool->entries);
     pool->entries = NULL;
@@ -1287,6 +1293,136 @@ static int output_pool_create_copyout(VulkanCtx *vk, int capacity, uint32_t widt
         e->copy_buffer_size = buf_size;
         e->has_copy_buffer = 1;
         e->is_internal = 0;  /* has DMA-buf fd for downstream */
+        pool->count++;
+    }
+    return 0;
+}
+
+static int output_pool_create_afbc_nv12(VulkanCtx *vk, int capacity, uint32_t width,
+                                         uint32_t height, OutputPool *pool)
+{
+    memset(pool, 0, sizeof(*pool));
+    pool->entries = calloc(capacity, sizeof(OutputPoolEntry));
+    if (!pool->entries) return -1;
+    pool->capacity = capacity;
+    pool->width = width;
+    pool->height = height;
+    pool->format = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
+
+    uint64_t afbc_mod = DRM_FORMAT_MOD_ARM_AFBC(AFBC_FORMAT_MOD_BLOCK_SIZE_16x16 |
+                                                 AFBC_FORMAT_MOD_SPARSE |
+                                                 AFBC_FORMAT_MOD_SPLIT);
+
+    for (int i = 0; i < capacity; i++) {
+        OutputPoolEntry *e = &pool->entries[i];
+        e->dmabuf_fd = -1;
+        e->dmabuf_fd2 = -1;
+        e->modifier = afbc_mod;
+
+        VkImageDrmFormatModifierListCreateInfoEXT mod_list = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
+            .drmFormatModifierCount = 1,
+            .pDrmFormatModifiers = &afbc_mod,
+        };
+        VkExternalMemoryImageCreateInfo ext_mem = {
+            .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+            .pNext = &mod_list,
+            .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+        };
+        VkImageCreateInfo image_info = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .pNext = &ext_mem,
+            .imageType = VK_IMAGE_TYPE_2D,
+            .format = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM,
+            .extent = { width, height, 1 },
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+            .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        };
+        VkResult result = vkCreateImage(vk->device, &image_info, NULL, &e->image);
+        if (result != VK_SUCCESS) {
+            snprintf(vk->last_error, sizeof(vk->last_error),
+                     "vkCreateImage(AFBC NV12) failed: %d", result);
+            output_pool_destroy(vk, pool);
+            return -1;
+        }
+
+        VkMemoryRequirements mem_reqs;
+        vkGetImageMemoryRequirements(vk->device, e->image, &mem_reqs);
+
+        int dmabuf_fd = dmabuf_heap_alloc(mem_reqs.size);
+        if (dmabuf_fd < 0) {
+            snprintf(vk->last_error, sizeof(vk->last_error),
+                     "dmabuf_heap_alloc(AFBC NV12, %lu) failed", (unsigned long)mem_reqs.size);
+            output_pool_destroy(vk, pool);
+            return -1;
+        }
+
+        int fd_for_vulkan = dup(dmabuf_fd);
+        if (fd_for_vulkan < 0) {
+            close(dmabuf_fd);
+            output_pool_destroy(vk, pool);
+            return -1;
+        }
+
+        VkImportMemoryFdInfoKHR import_info = {
+            .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
+            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+            .fd = fd_for_vulkan,
+        };
+        VkMemoryAllocateInfo alloc_info = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .pNext = &import_info,
+            .allocationSize = mem_reqs.size,
+            .memoryTypeIndex = find_memory_type(vk, mem_reqs.memoryTypeBits, 0),
+        };
+        if (alloc_info.memoryTypeIndex == (uint32_t)-1) {
+            close(dmabuf_fd);
+            output_pool_destroy(vk, pool);
+            return -1;
+        }
+
+        result = vkAllocateMemory(vk->device, &alloc_info, NULL, &e->memory);
+        if (result != VK_SUCCESS) {
+            close(dmabuf_fd);
+            output_pool_destroy(vk, pool);
+            return -1;
+        }
+        vkBindImageMemory(vk->device, e->image, e->memory, 0);
+
+        VkImageViewCreateInfo y_view_info = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .image = e->image,
+            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .format = VK_FORMAT_R8_UNORM,
+            .subresourceRange = { VK_IMAGE_ASPECT_PLANE_0_BIT, 0, 1, 0, 1 },
+        };
+        result = vkCreateImageView(vk->device, &y_view_info, NULL, &e->view);
+        if (result != VK_SUCCESS) {
+            close(dmabuf_fd);
+            output_pool_destroy(vk, pool);
+            return -1;
+        }
+
+        VkImageViewCreateInfo uv_view_info = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .image = e->image,
+            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .format = VK_FORMAT_R8G8_UNORM,
+            .subresourceRange = { VK_IMAGE_ASPECT_PLANE_1_BIT, 0, 1, 0, 1 },
+        };
+        result = vkCreateImageView(vk->device, &uv_view_info, NULL, &e->view2);
+        if (result != VK_SUCCESS) {
+            close(dmabuf_fd);
+            output_pool_destroy(vk, pool);
+            return -1;
+        }
+
+        e->dmabuf_fd = dmabuf_fd;
         pool->count++;
     }
     return 0;
@@ -2603,6 +2739,12 @@ int vfmcap_vk_init(VulkanCtx **vk_out, uint32_t src_width, uint32_t src_height,
             vfmcap_vk_cleanup(vk);
             return -1;
         }
+    } else if (fmt == VFMCAP_VK_FMT_NV12_AFBC) {
+        if (output_pool_create_afbc_nv12(vk, 4, dst_width, dst_height,
+                                          &vk->pool_nv12_afbc) != 0) {
+            vfmcap_vk_cleanup(vk);
+            return -1;
+        }
     } else if (fmt == VFMCAP_VK_FMT_P010) {
         if (output_pool_create_copyout(vk, 4, dst_width, dst_height, VK_FORMAT_R16_UNORM,
                                        &vk->pool_p010_y) != 0 ||
@@ -3199,6 +3341,224 @@ int vfmcap_vk_render_submit(VulkanCtx *vk, int in_fd,
 
 /* ---------- Render with output pool ---------- */
 
+int vfmcap_vk_render_afbc_nv12_and_wait(VulkanCtx *vk, int in_fd,
+                                          uint32_t src_width, uint32_t src_height,
+                                          uint32_t dst_width, uint32_t dst_height,
+                                          int *out_fd, uint64_t *out_modifier)
+{
+    if (!vk || !vk->initialized) {
+        if (vk) snprintf(vk->last_error, sizeof(vk->last_error), "Not initialized");
+        return -1;
+    }
+
+    OutputPool *afbc_pool = &vk->pool_nv12_afbc;
+    OutputPoolEntry *entry = output_pool_acquire(afbc_pool);
+    if (!entry) {
+        snprintf(vk->last_error, sizeof(vk->last_error), "AFBC NV12 pool exhausted");
+        return -1;
+    }
+
+    VkImage in_image;
+    VkImageView in_view;
+    if (image_cache_get(vk, in_fd, src_width, src_height,
+                        VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, 0,
+                        &in_image, &in_view) != 0) {
+        output_pool_release(afbc_pool, entry);
+        return -1;
+    }
+
+    VkResult result;
+    if (vk->frame_count == 0)
+        vkResetFences(vk->device, 1, &vk->fence);
+
+    struct dma_buf_sync sync_start_rd = {
+        .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ,
+    };
+    ioctl(in_fd, DMA_BUF_IOCTL_SYNC, &sync_start_rd);
+
+    VkCommandBufferBeginInfo begin_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    result = vkBeginCommandBuffer(vk->command_buffer, &begin_info);
+    if (result != VK_SUCCESS) {
+        output_pool_release(afbc_pool, entry);
+        return -1;
+    }
+
+    {
+        VkImageMemoryBarrier in_bar = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = 0,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .image = in_image,
+            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+        };
+        VkImageMemoryBarrier out_bar = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = 0,
+            .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .image = entry->image,
+            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+        };
+        VkImageMemoryBarrier barriers[] = { in_bar, out_bar };
+        vkCmdPipelineBarrier(vk->command_buffer,
+                             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                             0, 0, NULL, 0, NULL, 2, barriers);
+    }
+
+    vkCmdBindDescriptorSets(vk->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            vk->gfx_pipeline_layout, 0, 1, &vk->gfx_descriptor_set, 0, NULL);
+
+    {
+        VkRenderingAttachmentInfo y_att = {
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .imageView = entry->view,
+            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .clearValue = {0},
+        };
+        VkRenderingInfo ri = {
+            .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+            .renderArea = {{0, 0}, {dst_width, dst_height}},
+            .layerCount = 1,
+            .colorAttachmentCount = 1,
+            .pColorAttachments = &y_att,
+        };
+        vk->cmd_begin_rendering(vk->command_buffer, &ri);
+        vkCmdBindPipeline(vk->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                          vk->gfx_pipeline_nv12_y);
+        VkViewport vp = { 0, (float)dst_height, (float)dst_width, -(float)dst_height, 0, 1 };
+        VkRect2D sc = { {0, 0}, {dst_width, dst_height} };
+        vkCmdSetViewport(vk->command_buffer, 0, 1, &vp);
+        vkCmdSetScissor(vk->command_buffer, 0, 1, &sc);
+        vkCmdDraw(vk->command_buffer, 3, 1, 0, 0);
+        vk->cmd_end_rendering(vk->command_buffer);
+    }
+
+    {
+        VkImageMemoryBarrier bar = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .image = entry->image,
+            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+        };
+        vkCmdPipelineBarrier(vk->command_buffer,
+                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                             0, 0, NULL, 0, NULL, 1, &bar);
+    }
+
+    {
+        VkRenderingAttachmentInfo uv_att = {
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .imageView = entry->view2,
+            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .clearValue = {0},
+        };
+        VkRenderingInfo ri = {
+            .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+            .renderArea = {{0, 0}, {dst_width / 2, dst_height / 2}},
+            .layerCount = 1,
+            .colorAttachmentCount = 1,
+            .pColorAttachments = &uv_att,
+        };
+        vk->cmd_begin_rendering(vk->command_buffer, &ri);
+        vkCmdBindPipeline(vk->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                          vk->gfx_pipeline_nv12_uv);
+        VkViewport vp = { 0, (float)(dst_height / 2), (float)(dst_width / 2), -(float)(dst_height / 2), 0, 1 };
+        VkRect2D sc = { {0, 0}, {dst_width / 2, dst_height / 2} };
+        vkCmdSetViewport(vk->command_buffer, 0, 1, &vp);
+        vkCmdSetScissor(vk->command_buffer, 0, 1, &sc);
+        vkCmdDraw(vk->command_buffer, 3, 1, 0, 0);
+        vk->cmd_end_rendering(vk->command_buffer);
+    }
+
+    {
+        VkImageMemoryBarrier in_bar = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+            .dstAccessMask = 0,
+            .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .image = in_image,
+            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+        };
+        VkImageMemoryBarrier out_bar = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            .dstAccessMask = 0,
+            .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .image = entry->image,
+            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+        };
+        VkImageMemoryBarrier barriers[] = { in_bar, out_bar };
+        vkCmdPipelineBarrier(vk->command_buffer,
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                             VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                             0, 0, NULL, 0, NULL, 2, barriers);
+    }
+
+    result = vkEndCommandBuffer(vk->command_buffer);
+    if (result != VK_SUCCESS) {
+        output_pool_release(afbc_pool, entry);
+        return -1;
+    }
+
+    VkSubmitInfo submit_info = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &vk->command_buffer,
+    };
+    result = vkQueueSubmit(vk->graphics_queue, 1, &submit_info, vk->fence);
+    if (result != VK_SUCCESS) {
+        output_pool_release(afbc_pool, entry);
+        return -1;
+    }
+
+    vkWaitForFences(vk->device, 1, &vk->fence, VK_TRUE, UINT64_MAX);
+    vkResetFences(vk->device, 1, &vk->fence);
+
+    struct dma_buf_sync sync_end_rd = {
+        .flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ,
+    };
+    ioctl(in_fd, DMA_BUF_IOCTL_SYNC, &sync_end_rd);
+
+    vk->frame_count++;
+
+    *out_fd = entry->dmabuf_fd;
+    *out_modifier = entry->modifier;
+    return 0;
+}
+
+void vfmcap_vk_release_afbc_output(VulkanCtx *vk, int fd, vfmcap_vk_fmt_t fmt)
+{
+    if (!vk) return;
+    OutputPool *pool = NULL;
+    if (fmt == VFMCAP_VK_FMT_NV12_AFBC)
+        pool = &vk->pool_nv12_afbc;
+    else
+        return;
+    for (int i = 0; i < pool->count; i++) {
+        if (pool->entries[i].dmabuf_fd == fd && pool->entries[i].in_use) {
+            pool->entries[i].in_use = 0;
+            return;
+        }
+    }
+}
+
 int vfmcap_vk_render_and_wait(VulkanCtx *vk, int in_fd,
                               uint32_t src_width, uint32_t src_height,
                               uint32_t dst_width, uint32_t dst_height,
@@ -3738,6 +4098,216 @@ int vfmcap_vk_render_predecode_and_wait(VulkanCtx *vk, int in_fd,
 
 /* ---------- 10-bit compute-to-graphics render ---------- */
 
+int vfmcap_vk_render_10bit_afbc_nv12_and_wait(VulkanCtx *vk, int in_fd,
+                                                uint32_t src_width, uint32_t src_height,
+                                                uint32_t dst_width, uint32_t dst_height,
+                                                int *out_fd, uint64_t *out_modifier)
+{
+    if (!vk || !vk->initialized) {
+        if (vk) snprintf(vk->last_error, sizeof(vk->last_error), "Not initialized");
+        return -1;
+    }
+
+    OutputPool *afbc_pool = &vk->pool_nv12_afbc;
+    OutputPoolEntry *entry = output_pool_acquire(afbc_pool);
+    if (!entry) {
+        snprintf(vk->last_error, sizeof(vk->last_error), "AFBC NV12 pool exhausted");
+        return -1;
+    }
+
+    VkDeviceSize input_size = (VkDeviceSize)src_width * src_height * 5 / 2;
+    int in_idx = input_cache_get(vk, in_fd, input_size);
+    if (in_idx < 0) {
+        output_pool_release(afbc_pool, entry);
+        return -1;
+    }
+    VkBuffer in_buffer = vk->input_cache[in_idx].buffer;
+
+    struct dma_buf_sync sync_start_rd = {
+        .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ
+    };
+    ioctl(in_fd, DMA_BUF_IOCTL_SYNC, &sync_start_rd);
+
+    VkResult result;
+    if (vk->frame_count == 0)
+        vkResetFences(vk->device, 1, &vk->fence);
+
+    VkCommandBuffer cmd = vk->command_buffer;
+    result = vkResetCommandPool(vk->device, vk->command_pool, 0);
+    VK_CHECK(result, "vkResetCommandPool");
+
+    VkCommandBufferBeginInfo begin_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    result = vkBeginCommandBuffer(cmd, &begin_info);
+    VK_CHECK(result, "vkBeginCommandBuffer");
+
+    VkDescriptorBufferInfo buffer_info = { in_buffer, 0, input_size };
+    VkDescriptorImageInfo lut_info = {
+        .sampler = vk->lut_3d_sampler,
+        .imageView = vk->lut_3d_view,
+        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+    };
+    VkWriteDescriptorSet tbdr_writes[] = {
+        {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = vk->gfx_descriptor_set_tbdr,
+            .dstBinding = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .pBufferInfo = &buffer_info,
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = vk->gfx_descriptor_set_tbdr,
+            .dstBinding = 1,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .pImageInfo = &lut_info,
+        },
+    };
+    vkUpdateDescriptorSets(vk->device, 2, tbdr_writes, 0, NULL);
+
+    uint32_t pairs_per_row = src_width / 2;
+    uint32_t push_data[] = { src_width, src_height, pairs_per_row, vk->color_mode };
+
+    /* Transition output to COLOR_ATTACHMENT_OPTIMAL */
+    VkImageMemoryBarrier out_barrier = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = 0,
+        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .image = entry->image,
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+    };
+    vkCmdPipelineBarrier(cmd,
+                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         0, 0, NULL, 0, NULL, 1, &out_barrier);
+
+    /* Y pass */
+    VkRenderingAttachmentInfo y_attach = {
+        .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        .imageView = entry->view,
+        .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+    };
+    VkRenderingInfo y_render = {
+        .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+        .renderArea = { {0, 0}, {dst_width, dst_height} },
+        .layerCount = 1,
+        .colorAttachmentCount = 1,
+        .pColorAttachments = &y_attach,
+    };
+    vk->cmd_begin_rendering(cmd, &y_render);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk->gfx_pipeline_tbdr_nv12_y);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            vk->gfx_pipeline_layout_tbdr, 0, 1,
+                            &vk->gfx_descriptor_set_tbdr, 0, NULL);
+    vkCmdPushConstants(cmd, vk->gfx_pipeline_layout_tbdr,
+                       VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push_data), push_data);
+    VkViewport vp_y = { 0.0f, 0.0f, (float)dst_width, (float)dst_height, 0.0f, 1.0f };
+    VkRect2D sc_y = { {0, 0}, {dst_width, dst_height} };
+    vkCmdSetViewport(cmd, 0, 1, &vp_y);
+    vkCmdSetScissor(cmd, 0, 1, &sc_y);
+    vkCmdDraw(cmd, 3, 1, 0, 0);
+    vk->cmd_end_rendering(cmd);
+
+    /* Barrier between Y and UV */
+    VkImageMemoryBarrier mid_barrier = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .image = entry->image,
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+    };
+    vkCmdPipelineBarrier(cmd,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         0, 0, NULL, 0, NULL, 1, &mid_barrier);
+
+    /* UV pass */
+    VkRenderingAttachmentInfo uv_attach = {
+        .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        .imageView = entry->view2,
+        .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+    };
+    VkRenderingInfo uv_render = {
+        .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+        .renderArea = { {0, 0}, {dst_width / 2, dst_height / 2} },
+        .layerCount = 1,
+        .colorAttachmentCount = 1,
+        .pColorAttachments = &uv_attach,
+    };
+    vk->cmd_begin_rendering(cmd, &uv_render);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk->gfx_pipeline_tbdr_nv12_uv);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            vk->gfx_pipeline_layout_tbdr, 0, 1,
+                            &vk->gfx_descriptor_set_tbdr, 0, NULL);
+    vkCmdPushConstants(cmd, vk->gfx_pipeline_layout_tbdr,
+                       VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push_data), push_data);
+    VkViewport vp_uv = { 0.0f, 0.0f, (float)(dst_width / 2), (float)(dst_height / 2), 0.0f, 1.0f };
+    VkRect2D sc_uv = { {0, 0}, {dst_width / 2, dst_height / 2} };
+    vkCmdSetViewport(cmd, 0, 1, &vp_uv);
+    vkCmdSetScissor(cmd, 0, 1, &sc_uv);
+    vkCmdDraw(cmd, 3, 1, 0, 0);
+    vk->cmd_end_rendering(cmd);
+
+    /* Final barrier */
+    VkImageMemoryBarrier final_barrier = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        .dstAccessMask = 0,
+        .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .image = entry->image,
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+    };
+    vkCmdPipelineBarrier(cmd,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                         0, 0, NULL, 0, NULL, 1, &final_barrier);
+
+    result = vkEndCommandBuffer(cmd);
+    if (result != VK_SUCCESS) {
+        output_pool_release(afbc_pool, entry);
+        return -1;
+    }
+
+    VkSubmitInfo submit_info = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &cmd,
+    };
+    result = vkQueueSubmit(vk->graphics_queue, 1, &submit_info, vk->fence);
+    if (result != VK_SUCCESS) {
+        output_pool_release(afbc_pool, entry);
+        return -1;
+    }
+
+    vkWaitForFences(vk->device, 1, &vk->fence, VK_TRUE, UINT64_MAX);
+    vkResetFences(vk->device, 1, &vk->fence);
+    vkDeviceWaitIdle(vk->device);
+
+    struct dma_buf_sync sync_end_rd = {
+        .flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ,
+    };
+    ioctl(in_fd, DMA_BUF_IOCTL_SYNC, &sync_end_rd);
+
+    vk->frame_count++;
+
+    *out_fd = entry->dmabuf_fd;
+    *out_modifier = entry->modifier;
+    return 0;
+}
+
 int vfmcap_vk_render_10bit_and_wait(VulkanCtx *vk, int in_fd,
                                      uint32_t src_width, uint32_t src_height,
                                      uint32_t dst_width, uint32_t dst_height,
@@ -4213,6 +4783,13 @@ int vfmcap_vk_reconfig_pools(VulkanCtx *vk, uint32_t src_width, uint32_t src_hei
                                &vk->pool_nv12_uv) != 0) {
             snprintf(vk->last_error, sizeof(vk->last_error),
                      "Failed to recreate NV12 pools at %ux%u", dst_width, dst_height);
+            return -1;
+        }
+    } else if (fmt == VFMCAP_VK_FMT_NV12_AFBC) {
+        if (output_pool_create_afbc_nv12(vk, 4, dst_width, dst_height,
+                                          &vk->pool_nv12_afbc) != 0) {
+            snprintf(vk->last_error, sizeof(vk->last_error),
+                     "Failed to recreate NV12 AFBC pool at %ux%u", dst_width, dst_height);
             return -1;
         }
     } else if (fmt == VFMCAP_VK_FMT_P010) {

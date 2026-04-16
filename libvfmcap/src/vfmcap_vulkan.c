@@ -205,7 +205,8 @@ typedef struct {
     VkImageView     view;
     VkImageView     view2;           /* Second plane view (UV for multi-planar AFBC) */
     int             dmabuf_fd;       /* DMA-buf fd for image (dmabuf pool) or buffer (copy pool) */
-    int             dmabuf_fd2;      /* Second DMA-buf fd (unused for AFBC, -1) */
+    int             dmabuf_fd2;      /* Second DMA-buf fd (for multi-planar linear outputs) */
+    int             vulkan_fd;       /* Dup'd fd passed to vkAllocateMemory (Vulkan import) */
     int             in_use;
     int             is_internal;     /* 1 = pure GPU-local image, no DMA-buf */
     uint64_t        modifier;        /* DRM format modifier (0 = linear) */
@@ -579,7 +580,7 @@ static int import_dmabuf_image(VulkanCtx *vk, int fd, uint32_t width, uint32_t h
 static int create_dmabuf_image(VulkanCtx *vk, uint32_t width, uint32_t height,
                                VkFormat format, uint64_t modifier,
                                VkImage *image, VkDeviceMemory *memory,
-                               VkImageView *view, int *out_fd)
+                               VkImageView *view, int *out_fd, int *out_vulkan_fd)
 {
     (void)modifier;
     VkExternalMemoryImageCreateInfo ext_mem_info = {
@@ -662,6 +663,7 @@ static int create_dmabuf_image(VulkanCtx *vk, uint32_t width, uint32_t height,
     if (alloc_info.memoryTypeIndex == (uint32_t)-1) {
         snprintf(vk->last_error, sizeof(vk->last_error), "No suitable memory type for image");
         close(dmabuf_fd);
+        close(fd_for_vulkan);
         vkDestroyImage(vk->device, *image, NULL);
         return -1;
     }
@@ -671,6 +673,7 @@ static int create_dmabuf_image(VulkanCtx *vk, uint32_t width, uint32_t height,
         snprintf(vk->last_error, sizeof(vk->last_error),
                  "vkAllocateMemory(image) failed: %d", result);
         close(dmabuf_fd);
+        close(fd_for_vulkan);
         vkDestroyImage(vk->device, *image, NULL);
         return -1;
     }
@@ -681,6 +684,7 @@ static int create_dmabuf_image(VulkanCtx *vk, uint32_t width, uint32_t height,
                  "vkBindImageMemory failed: %d", result);
         vkFreeMemory(vk->device, *memory, NULL);
         close(dmabuf_fd);
+        close(fd_for_vulkan);
         vkDestroyImage(vk->device, *image, NULL);
         return -1;
     }
@@ -705,11 +709,14 @@ static int create_dmabuf_image(VulkanCtx *vk, uint32_t width, uint32_t height,
                  "vkCreateImageView failed: %d", result);
         vkFreeMemory(vk->device, *memory, NULL);
         close(dmabuf_fd);
+        close(fd_for_vulkan);
         vkDestroyImage(vk->device, *image, NULL);
         return -1;
     }
 
     *out_fd = dmabuf_fd;
+    if (out_vulkan_fd)
+        *out_vulkan_fd = fd_for_vulkan;
     return 0;
 }
 
@@ -975,6 +982,8 @@ static void image_cache_entry_destroy(VulkanCtx *vk, ImageCacheEntry *entry)
         vkDestroyImage(vk->device, entry->image, NULL);
     if (entry->memory != VK_NULL_HANDLE)
         vkFreeMemory(vk->device, entry->memory, NULL);
+    if (entry->fd_dup >= 0)
+        close(entry->fd_dup);
     entry->valid = 0;
     entry->fd = -1;
     entry->fd_dup = -1;
@@ -1093,6 +1102,8 @@ static void output_pool_destroy(VulkanCtx *vk, OutputPool *pool)
             close(e->dmabuf_fd);
         if (e->dmabuf_fd2 >= 0)
             close(e->dmabuf_fd2);
+        if (e->vulkan_fd >= 0)
+            close(e->vulkan_fd);
     }
     free(pool->entries);
     pool->entries = NULL;
@@ -1114,8 +1125,9 @@ static int output_pool_create(VulkanCtx *vk, int capacity, uint32_t width, uint3
     for (int i = 0; i < capacity; i++) {
         OutputPoolEntry *e = &pool->entries[i];
         e->dmabuf_fd = -1;
+        e->vulkan_fd = -1;
         if (create_dmabuf_image(vk, width, height, format, 0,
-                                &e->image, &e->memory, &e->view, &e->dmabuf_fd) != 0) {
+                                &e->image, &e->memory, &e->view, &e->dmabuf_fd, &e->vulkan_fd) != 0) {
             output_pool_destroy(vk, pool);
             return -1;
         }
@@ -1194,6 +1206,7 @@ static int output_pool_create_copyout(VulkanCtx *vk, int capacity, uint32_t widt
     for (int i = 0; i < capacity; i++) {
         OutputPoolEntry *e = &pool->entries[i];
         e->dmabuf_fd = -1;
+        e->vulkan_fd = -1;
 
         /* Create internal image for rendering */
         VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
@@ -1265,6 +1278,7 @@ static int output_pool_create_copyout(VulkanCtx *vk, int capacity, uint32_t widt
         };
 
         if (alloc_info.memoryTypeIndex == (uint32_t)-1) {
+            close(fd_for_vulkan);
             close(dmabuf_fd);
             vkDestroyBuffer(vk->device, e->copy_buffer, NULL);
             e->copy_buffer = VK_NULL_HANDLE;
@@ -1276,6 +1290,7 @@ static int output_pool_create_copyout(VulkanCtx *vk, int capacity, uint32_t widt
 
         result = vkAllocateMemory(vk->device, &alloc_info, NULL, &e->copy_buffer_memory);
         if (result != VK_SUCCESS) {
+            close(fd_for_vulkan);
             close(dmabuf_fd);
             vkDestroyBuffer(vk->device, e->copy_buffer, NULL);
             e->copy_buffer = VK_NULL_HANDLE;
@@ -1287,6 +1302,7 @@ static int output_pool_create_copyout(VulkanCtx *vk, int capacity, uint32_t widt
 
         result = vkBindBufferMemory(vk->device, e->copy_buffer, e->copy_buffer_memory, 0);
         if (result != VK_SUCCESS) {
+            close(fd_for_vulkan);
             close(dmabuf_fd);
             snprintf(vk->last_error, sizeof(vk->last_error),
                      "vkBindBufferMemory(copyout) failed: %d", result);
@@ -1295,6 +1311,7 @@ static int output_pool_create_copyout(VulkanCtx *vk, int capacity, uint32_t widt
         }
 
         e->dmabuf_fd = dmabuf_fd;
+        e->vulkan_fd = fd_for_vulkan;
         e->copy_buffer_size = buf_size;
         e->has_copy_buffer = 1;
         e->is_internal = 0;  /* has DMA-buf fd for downstream */
@@ -1319,6 +1336,7 @@ static int output_pool_create_afbc(VulkanCtx *vk, int capacity, uint32_t width,
         OutputPoolEntry *e = &pool->entries[i];
         e->dmabuf_fd = -1;
         e->dmabuf_fd2 = -1;
+        e->vulkan_fd = -1;
         e->modifier = modifier;
 
         VkImageDrmFormatModifierListCreateInfoEXT mod_list = {
@@ -1381,6 +1399,7 @@ static int output_pool_create_afbc(VulkanCtx *vk, int capacity, uint32_t width,
             .memoryTypeIndex = find_memory_type(vk, mem_reqs.memoryTypeBits, 0),
         };
         if (alloc_info.memoryTypeIndex == (uint32_t)-1) {
+            close(fd_for_vulkan);
             close(dmabuf_fd);
             output_pool_destroy(vk, pool);
             return -1;
@@ -1388,6 +1407,7 @@ static int output_pool_create_afbc(VulkanCtx *vk, int capacity, uint32_t width,
 
         result = vkAllocateMemory(vk->device, &alloc_info, NULL, &e->memory);
         if (result != VK_SUCCESS) {
+            close(fd_for_vulkan);
             close(dmabuf_fd);
             output_pool_destroy(vk, pool);
             return -1;
@@ -1403,12 +1423,14 @@ static int output_pool_create_afbc(VulkanCtx *vk, int capacity, uint32_t width,
         };
         result = vkCreateImageView(vk->device, &view_info, NULL, &e->view);
         if (result != VK_SUCCESS) {
+            close(fd_for_vulkan);
             close(dmabuf_fd);
             output_pool_destroy(vk, pool);
             return -1;
         }
 
         e->dmabuf_fd = dmabuf_fd;
+        e->vulkan_fd = fd_for_vulkan;
         pool->count++;
     }
     return 0;
@@ -1433,6 +1455,7 @@ static int output_pool_create_afbc_nv12(VulkanCtx *vk, int capacity, uint32_t wi
         OutputPoolEntry *e = &pool->entries[i];
         e->dmabuf_fd = -1;
         e->dmabuf_fd2 = -1;
+        e->vulkan_fd = -1;
         e->modifier = afbc_mod;
 
         VkImageDrmFormatModifierListCreateInfoEXT mod_list = {
@@ -1497,6 +1520,7 @@ static int output_pool_create_afbc_nv12(VulkanCtx *vk, int capacity, uint32_t wi
             .memoryTypeIndex = find_memory_type(vk, mem_reqs.memoryTypeBits, 0),
         };
         if (alloc_info.memoryTypeIndex == (uint32_t)-1) {
+            close(fd_for_vulkan);
             close(dmabuf_fd);
             output_pool_destroy(vk, pool);
             return -1;
@@ -1504,6 +1528,7 @@ static int output_pool_create_afbc_nv12(VulkanCtx *vk, int capacity, uint32_t wi
 
         result = vkAllocateMemory(vk->device, &alloc_info, NULL, &e->memory);
         if (result != VK_SUCCESS) {
+            close(fd_for_vulkan);
             close(dmabuf_fd);
             output_pool_destroy(vk, pool);
             return -1;
@@ -1519,6 +1544,7 @@ static int output_pool_create_afbc_nv12(VulkanCtx *vk, int capacity, uint32_t wi
         };
         result = vkCreateImageView(vk->device, &y_view_info, NULL, &e->view);
         if (result != VK_SUCCESS) {
+            close(fd_for_vulkan);
             close(dmabuf_fd);
             output_pool_destroy(vk, pool);
             return -1;
@@ -1533,12 +1559,14 @@ static int output_pool_create_afbc_nv12(VulkanCtx *vk, int capacity, uint32_t wi
         };
         result = vkCreateImageView(vk->device, &uv_view_info, NULL, &e->view2);
         if (result != VK_SUCCESS) {
+            close(fd_for_vulkan);
             close(dmabuf_fd);
             output_pool_destroy(vk, pool);
             return -1;
         }
 
         e->dmabuf_fd = dmabuf_fd;
+        e->vulkan_fd = fd_for_vulkan;
         pool->count++;
     }
     return 0;
@@ -3522,10 +3550,21 @@ int vfmcap_vk_render_afbc_nv12_and_wait(VulkanCtx *vk, int in_fd,
     if (vk->frame_count == 0)
         vkResetFences(vk->device, 1, &vk->fence);
 
+    result = vkResetCommandPool(vk->device, vk->command_pool, 0);
+    if (result != VK_SUCCESS) {
+        output_pool_release(afbc_pool, entry);
+        return -1;
+    }
+
     struct dma_buf_sync sync_start_rd = {
         .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ,
     };
     ioctl(in_fd, DMA_BUF_IOCTL_SYNC, &sync_start_rd);
+
+    struct dma_buf_sync sync_start_wr = {
+        .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE,
+    };
+    ioctl(entry->dmabuf_fd, DMA_BUF_IOCTL_SYNC, &sync_start_wr);
 
     VkCommandBufferBeginInfo begin_info = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -3681,11 +3720,17 @@ int vfmcap_vk_render_afbc_nv12_and_wait(VulkanCtx *vk, int in_fd,
 
     vkWaitForFences(vk->device, 1, &vk->fence, VK_TRUE, UINT64_MAX);
     vkResetFences(vk->device, 1, &vk->fence);
+    vkDeviceWaitIdle(vk->device);
 
     struct dma_buf_sync sync_end_rd = {
         .flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ,
     };
     ioctl(in_fd, DMA_BUF_IOCTL_SYNC, &sync_end_rd);
+
+    struct dma_buf_sync sync_end_wr = {
+        .flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE,
+    };
+    ioctl(entry->dmabuf_fd, DMA_BUF_IOCTL_SYNC, &sync_end_wr);
 
     vk->frame_count++;
 
@@ -4281,6 +4326,11 @@ int vfmcap_vk_render_10bit_afbc_nv12_and_wait(VulkanCtx *vk, int in_fd,
     };
     ioctl(in_fd, DMA_BUF_IOCTL_SYNC, &sync_start_rd);
 
+    struct dma_buf_sync sync_start_wr = {
+        .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE
+    };
+    ioctl(entry->dmabuf_fd, DMA_BUF_IOCTL_SYNC, &sync_start_wr);
+
     VkResult result;
     if (vk->frame_count == 0)
         vkResetFences(vk->device, 1, &vk->fence);
@@ -4454,6 +4504,11 @@ int vfmcap_vk_render_10bit_afbc_nv12_and_wait(VulkanCtx *vk, int in_fd,
     };
     ioctl(in_fd, DMA_BUF_IOCTL_SYNC, &sync_end_rd);
 
+    struct dma_buf_sync sync_end_wr = {
+        .flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE,
+    };
+    ioctl(entry->dmabuf_fd, DMA_BUF_IOCTL_SYNC, &sync_end_wr);
+
     vk->frame_count++;
 
     *out_fd = entry->dmabuf_fd;
@@ -4490,6 +4545,11 @@ int vfmcap_vk_render_10bit_afbc_a2b10g10r10_and_wait(VulkanCtx *vk, int in_fd,
         .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ
     };
     ioctl(in_fd, DMA_BUF_IOCTL_SYNC, &sync_start_rd);
+
+    struct dma_buf_sync sync_start_wr = {
+        .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE
+    };
+    ioctl(entry->dmabuf_fd, DMA_BUF_IOCTL_SYNC, &sync_start_wr);
 
     VkResult result;
     if (vk->frame_count == 0)
@@ -4619,6 +4679,11 @@ int vfmcap_vk_render_10bit_afbc_a2b10g10r10_and_wait(VulkanCtx *vk, int in_fd,
         .flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ,
     };
     ioctl(in_fd, DMA_BUF_IOCTL_SYNC, &sync_end_rd);
+
+    struct dma_buf_sync sync_end_wr = {
+        .flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE,
+    };
+    ioctl(entry->dmabuf_fd, DMA_BUF_IOCTL_SYNC, &sync_end_wr);
 
     vk->frame_count++;
 

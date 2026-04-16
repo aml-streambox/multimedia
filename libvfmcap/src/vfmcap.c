@@ -591,9 +591,9 @@ int vfmcap_acquire_frame(vfmcap_ctx_t *ctx, vfmcap_frame_t *frame, int timeout_m
                  (vk_fmt == VFMCAP_VK_FMT_NV12 || vk_fmt == VFMCAP_VK_FMT_P010)) {
             int out_y_fd = -1, out_uv_fd = -1;
             int ret = vfmcap_vk_render_10bit_and_wait(ctx->vk, dmabuf_req.fd,
-                                                      ctx->width, ctx->height,
-                                                      dst_w, dst_h, vk_fmt,
-                                                      &out_y_fd, &out_uv_fd);
+                                                       ctx->width, ctx->height,
+                                                       dst_w, dst_h, vk_fmt,
+                                                       &out_y_fd, &out_uv_fd);
             if (ret != 0) {
                 snprintf(ctx->last_error, sizeof(ctx->last_error),
                          "Vulkan 10-bit render failed: %s", vfmcap_vk_last_error(ctx->vk));

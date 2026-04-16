@@ -142,6 +142,28 @@ int vfmcap_vk_render_10bit_and_wait(VulkanCtx *vk, int in_fd,
                                     int *out_y_fd, int *out_uv_fd);
 
 /**
+ * vfmcap_vk_render_predecode_and_wait - Strategy A: compute pre-decode + fragment tonemap
+ * @vk: Vulkan context
+ * @in_fd: Input AMLY DMA-buf fd
+ * @src_width: Source frame width
+ * @src_height: Source frame height
+ * @dst_width: Output frame width
+ * @dst_height: Output frame height
+ * @fmt: Output format (NV12 or P010)
+ * @out_y_fd: Output Y plane DMA-buf fd
+ * @out_uv_fd: Output UV plane DMA-buf fd
+ *
+ * Hybrid pipeline: compute shader unpacks AMLY to intermediate textures,
+ * then fragment shaders do texture fetch + 3D LUT tone mapping.
+ * Returns 0 on success, -1 on failure.
+ */
+int vfmcap_vk_render_predecode_and_wait(VulkanCtx *vk, int in_fd,
+                                         uint32_t src_width, uint32_t src_height,
+                                         uint32_t dst_width, uint32_t dst_height,
+                                         vfmcap_vk_fmt_t fmt,
+                                         int *out_y_fd, int *out_uv_fd);
+
+/**
  * vfmcap_vk_cleanup - Destroy all Vulkan resources
  * @vk: Vulkan context
  */

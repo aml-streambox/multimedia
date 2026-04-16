@@ -160,6 +160,12 @@ typedef void (VKAPI_PTR *PFN_vkCmdEndRenderingKHR)(VkCommandBuffer commandBuffer
 #include "../shaders/amly_nv12_y_spv.h"
 #include "../shaders/amly_nv12_uv_spv.h"
 
+/* Strategy A: compute pre-decode -> fragment tonemap shaders */
+#include "../shaders/predecode_p010_y_spv.h"
+#include "../shaders/predecode_p010_uv_spv.h"
+#include "../shaders/predecode_nv12_y_spv.h"
+#include "../shaders/predecode_nv12_uv_spv.h"
+
 /* ---------- DMA-buf import cache (legacy VkBuffer for compute) ---------- */
 
 typedef struct {
@@ -273,6 +279,25 @@ struct VulkanCtx {
     VkDescriptorSetLayout   gfx_descriptor_set_layout_tbdr;
     VkDescriptorSet         gfx_descriptor_set_tbdr;
     VkPipelineLayout        gfx_pipeline_layout_tbdr;
+
+    /* Strategy A: compute pre-decode -> fragment tonemap */
+    VkImage                 predecode_y_image;
+    VkDeviceMemory          predecode_y_memory;
+    VkImageView             predecode_y_view;
+    VkImage                 predecode_uv_image;
+    VkDeviceMemory          predecode_uv_memory;
+    VkImageView             predecode_uv_view;
+    VkDescriptorSetLayout   predecode_gfx_descriptor_set_layout;
+    VkDescriptorSet         predecode_gfx_descriptor_set;
+    VkPipelineLayout        predecode_gfx_pipeline_layout;
+    VkPipeline              predecode_gfx_pipeline_p010_y;
+    VkPipeline              predecode_gfx_pipeline_p010_uv;
+    VkPipeline              predecode_gfx_pipeline_nv12_y;
+    VkPipeline              predecode_gfx_pipeline_nv12_uv;
+    VkShaderModule          predecode_shader_p010_y;
+    VkShaderModule          predecode_shader_p010_uv;
+    VkShaderModule          predecode_shader_nv12_y;
+    VkShaderModule          predecode_shader_nv12_uv;
 
     /* 3D LUT for HDR-to-SDR tone mapping */
     VkImage                 lut_3d_image;
@@ -1766,13 +1791,13 @@ int vfmcap_vk_init(VulkanCtx **vk_out, uint32_t width, uint32_t height,
     /* Descriptor pool */
     VkDescriptorPoolSize pool_sizes[] = {
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6 },
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8 },
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3 },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 11 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 5 },
     };
 
     VkDescriptorPoolCreateInfo desc_pool_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .maxSets = 7,
+        .maxSets = 8,
         .poolSizeCount = 3,
         .pPoolSizes = pool_sizes,
     };
@@ -2061,6 +2086,58 @@ int vfmcap_vk_init(VulkanCtx **vk_out, uint32_t width, uint32_t height,
                                     &vk->gfx_pipeline_layout_tbdr);
     VK_CHECK(result, "vkCreatePipelineLayout(tbdr)");
 
+    /* Strategy A predecode descriptor set layout: 3 combined image samplers (Y, UV, LUT) */
+    VkDescriptorSetLayoutBinding predecode_bindings[] = {
+        { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+          .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+          .pImmutableSamplers = &vk->regular_sampler },
+        { .binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+          .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+          .pImmutableSamplers = &vk->regular_sampler },
+        { .binding = 2, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+          .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+    };
+
+    VkDescriptorSetLayoutCreateInfo predecode_layout_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 3,
+        .pBindings = predecode_bindings,
+    };
+
+    result = vkCreateDescriptorSetLayout(vk->device, &predecode_layout_info, NULL,
+                                         &vk->predecode_gfx_descriptor_set_layout);
+    VK_CHECK(result, "vkCreateDescriptorSetLayout(predecode)");
+
+    VkDescriptorSetAllocateInfo predecode_desc_alloc = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = vk->descriptor_pool,
+        .descriptorSetCount = 1,
+        .pSetLayouts = &vk->predecode_gfx_descriptor_set_layout,
+    };
+
+    result = vkAllocateDescriptorSets(vk->device, &predecode_desc_alloc,
+                                      &vk->predecode_gfx_descriptor_set);
+    VK_CHECK(result, "vkAllocateDescriptorSets(predecode)");
+
+    /* Predecode pipeline layout: push constant = { color_mode } at FRAGMENT stage */
+    VkPushConstantRange predecode_push_constant = {
+        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+        .offset = 0,
+        .size = sizeof(uint32_t),  /* color_mode only */
+    };
+
+    VkPipelineLayoutCreateInfo predecode_pl_layout_info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1,
+        .pSetLayouts = &vk->predecode_gfx_descriptor_set_layout,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &predecode_push_constant,
+    };
+
+    result = vkCreatePipelineLayout(vk->device, &predecode_pl_layout_info, NULL,
+                                    &vk->predecode_gfx_pipeline_layout);
+    VK_CHECK(result, "vkCreatePipelineLayout(predecode)");
+
     /* Load shaders */
     if (load_shader(vk, amly_to_p010_spv, sizeof(amly_to_p010_spv),
                     &vk->shader_p010) != 0) {
@@ -2197,6 +2274,32 @@ int vfmcap_vk_init(VulkanCtx **vk_out, uint32_t width, uint32_t height,
     }
     if (load_shader(vk, amly_nv12_uv_spv, sizeof(amly_nv12_uv_spv),
                     &vk->gfx_shader_tbdr_nv12_uv) != 0) {
+        *vk_out = NULL;
+        vfmcap_vk_cleanup(vk);
+        return -1;
+    }
+
+    /* Load Strategy A predecode fragment shaders */
+    if (load_shader(vk, predecode_p010_y_spv, sizeof(predecode_p010_y_spv),
+                    &vk->predecode_shader_p010_y) != 0) {
+        *vk_out = NULL;
+        vfmcap_vk_cleanup(vk);
+        return -1;
+    }
+    if (load_shader(vk, predecode_p010_uv_spv, sizeof(predecode_p010_uv_spv),
+                    &vk->predecode_shader_p010_uv) != 0) {
+        *vk_out = NULL;
+        vfmcap_vk_cleanup(vk);
+        return -1;
+    }
+    if (load_shader(vk, predecode_nv12_y_spv, sizeof(predecode_nv12_y_spv),
+                    &vk->predecode_shader_nv12_y) != 0) {
+        *vk_out = NULL;
+        vfmcap_vk_cleanup(vk);
+        return -1;
+    }
+    if (load_shader(vk, predecode_nv12_uv_spv, sizeof(predecode_nv12_uv_spv),
+                    &vk->predecode_shader_nv12_uv) != 0) {
         *vk_out = NULL;
         vfmcap_vk_cleanup(vk);
         return -1;
@@ -2430,6 +2533,51 @@ int vfmcap_vk_init(VulkanCtx **vk_out, uint32_t width, uint32_t height,
                                        NULL, &vk->gfx_pipeline_tbdr_p010_uv);
     VK_CHECK(result, "vkCreateGraphicsPipelines(TBDR P010 UV)");
 
+    /* Create Strategy A predecode graphics pipelines (fragment samples intermediates + LUT) */
+    gfx_info.pNext = &nv12_y_render;  /* R8_UNORM */
+    gfx_info.pStages = (VkPipelineShaderStageCreateInfo[]){
+        vert_stage,
+        { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0,
+          VK_SHADER_STAGE_FRAGMENT_BIT, vk->predecode_shader_nv12_y, "main", NULL },
+    };
+    gfx_info.layout = vk->predecode_gfx_pipeline_layout;
+    result = vkCreateGraphicsPipelines(vk->device, VK_NULL_HANDLE, 1, &gfx_info,
+                                       NULL, &vk->predecode_gfx_pipeline_nv12_y);
+    VK_CHECK(result, "vkCreateGraphicsPipelines(predecode NV12 Y)");
+
+    gfx_info.pNext = &nv12_uv_render;  /* R8G8_UNORM */
+    gfx_info.pStages = (VkPipelineShaderStageCreateInfo[]){
+        vert_stage,
+        { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0,
+          VK_SHADER_STAGE_FRAGMENT_BIT, vk->predecode_shader_nv12_uv, "main", NULL },
+    };
+    gfx_info.layout = vk->predecode_gfx_pipeline_layout;
+    result = vkCreateGraphicsPipelines(vk->device, VK_NULL_HANDLE, 1, &gfx_info,
+                                       NULL, &vk->predecode_gfx_pipeline_nv12_uv);
+    VK_CHECK(result, "vkCreateGraphicsPipelines(predecode NV12 UV)");
+
+    gfx_info.pNext = &p010_y_render;  /* R16_UNORM */
+    gfx_info.pStages = (VkPipelineShaderStageCreateInfo[]){
+        vert_stage,
+        { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0,
+          VK_SHADER_STAGE_FRAGMENT_BIT, vk->predecode_shader_p010_y, "main", NULL },
+    };
+    gfx_info.layout = vk->predecode_gfx_pipeline_layout;
+    result = vkCreateGraphicsPipelines(vk->device, VK_NULL_HANDLE, 1, &gfx_info,
+                                       NULL, &vk->predecode_gfx_pipeline_p010_y);
+    VK_CHECK(result, "vkCreateGraphicsPipelines(predecode P010 Y)");
+
+    gfx_info.pNext = &p010_uv_render;  /* R16G16_UNORM */
+    gfx_info.pStages = (VkPipelineShaderStageCreateInfo[]){
+        vert_stage,
+        { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0,
+          VK_SHADER_STAGE_FRAGMENT_BIT, vk->predecode_shader_p010_uv, "main", NULL },
+    };
+    gfx_info.layout = vk->predecode_gfx_pipeline_layout;
+    result = vkCreateGraphicsPipelines(vk->device, VK_NULL_HANDLE, 1, &gfx_info,
+                                       NULL, &vk->predecode_gfx_pipeline_p010_uv);
+    VK_CHECK(result, "vkCreateGraphicsPipelines(predecode P010 UV)");
+
     /* Create output pools based on requested format */
     if (fmt == VFMCAP_VK_FMT_NV12 || fmt == VFMCAP_VK_FMT_NV21) {
         if (output_pool_create(vk, 4, width, height, VK_FORMAT_R8_UNORM,
@@ -2457,6 +2605,70 @@ int vfmcap_vk_init(VulkanCtx **vk_out, uint32_t width, uint32_t height,
         fprintf(stderr, "[vfmcap-vk] Failed to create 3D LUT: %s\n", vk->last_error);
         vfmcap_vk_cleanup(vk);
         return -1;
+    }
+
+    /* Create Strategy A intermediate images (compute writes, fragment reads) */
+    if (create_internal_image(vk, width, height, VK_FORMAT_R16_UNORM,
+                              VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                              &vk->predecode_y_image, &vk->predecode_y_memory,
+                              &vk->predecode_y_view) != 0) {
+        fprintf(stderr, "[vfmcap-vk] Failed to create predecode Y intermediate: %s\n",
+                vk->last_error);
+        vfmcap_vk_cleanup(vk);
+        return -1;
+    }
+    if (create_internal_image(vk, width / 2, height / 2, VK_FORMAT_R16G16_UNORM,
+                              VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                              &vk->predecode_uv_image, &vk->predecode_uv_memory,
+                              &vk->predecode_uv_view) != 0) {
+        fprintf(stderr, "[vfmcap-vk] Failed to create predecode UV intermediate: %s\n",
+                vk->last_error);
+        vfmcap_vk_cleanup(vk);
+        return -1;
+    }
+
+    /* Write static predecode descriptor set bindings (Y, UV intermediates + LUT) */
+    {
+        VkDescriptorImageInfo pd_y_info = {
+            .imageView = vk->predecode_y_view,
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        };
+        VkDescriptorImageInfo pd_uv_info = {
+            .imageView = vk->predecode_uv_view,
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        };
+        VkDescriptorImageInfo pd_lut_info = {
+            .sampler = vk->lut_3d_sampler,
+            .imageView = vk->lut_3d_view,
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        };
+        VkWriteDescriptorSet pd_writes[] = {
+            {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = vk->predecode_gfx_descriptor_set,
+                .dstBinding = 0,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pImageInfo = &pd_y_info,
+            },
+            {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = vk->predecode_gfx_descriptor_set,
+                .dstBinding = 1,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pImageInfo = &pd_uv_info,
+            },
+            {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = vk->predecode_gfx_descriptor_set,
+                .dstBinding = 2,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pImageInfo = &pd_lut_info,
+            },
+        };
+        vkUpdateDescriptorSets(vk->device, 3, pd_writes, 0, NULL);
     }
 
     vk->initialized = 1;
@@ -3059,6 +3271,458 @@ void vfmcap_vk_release_output(VulkanCtx *vk, int y_fd, int uv_fd, vfmcap_vk_fmt_
     }
 }
 
+/* ---------- Strategy A: compute pre-decode -> fragment tonemap render ---------- */
+
+int vfmcap_vk_render_predecode_and_wait(VulkanCtx *vk, int in_fd,
+                                         uint32_t src_width, uint32_t src_height,
+                                         uint32_t dst_width, uint32_t dst_height,
+                                         vfmcap_vk_fmt_t fmt,
+                                         int *out_y_fd, int *out_uv_fd)
+{
+    if (!vk || !vk->initialized) {
+        if (vk) snprintf(vk->last_error, sizeof(vk->last_error), "Not initialized");
+        return -1;
+    }
+
+    VkPipeline y_pipeline, uv_pipeline;
+    OutputPool *y_pool = NULL;
+    OutputPool *uv_pool = NULL;
+
+    if (fmt == VFMCAP_VK_FMT_NV12 || fmt == VFMCAP_VK_FMT_NV21) {
+        y_pipeline = vk->predecode_gfx_pipeline_nv12_y;
+        uv_pipeline = vk->predecode_gfx_pipeline_nv12_uv;
+        y_pool = &vk->pool_nv12_y;
+        uv_pool = &vk->pool_nv12_uv;
+    } else if (fmt == VFMCAP_VK_FMT_P010) {
+        y_pipeline = vk->predecode_gfx_pipeline_p010_y;
+        uv_pipeline = vk->predecode_gfx_pipeline_p010_uv;
+        y_pool = &vk->pool_p010_y;
+        uv_pool = &vk->pool_p010_uv;
+    } else {
+        snprintf(vk->last_error, sizeof(vk->last_error), "Unsupported render format");
+        return -1;
+    }
+
+    /* Import AMLY input buffer */
+    VkDeviceSize input_size = (VkDeviceSize)src_width * src_height * 5 / 2;
+    int in_idx = input_cache_get(vk, in_fd, input_size);
+    if (in_idx < 0) return -1;
+    VkBuffer in_buffer = vk->input_cache[in_idx].buffer;
+
+    /* DMA-buf sync: start read access on input */
+    struct dma_buf_sync sync_start_rd = {
+        .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ
+    };
+    ioctl(in_fd, DMA_BUF_IOCTL_SYNC, &sync_start_rd);
+
+    /* Acquire output pool entries */
+    OutputPoolEntry *y_entry = output_pool_acquire(y_pool);
+    OutputPoolEntry *uv_entry = output_pool_acquire(uv_pool);
+    if (!y_entry || !uv_entry) {
+        if (y_entry) output_pool_release(y_pool, y_entry);
+        if (uv_entry) output_pool_release(uv_pool, uv_entry);
+        snprintf(vk->last_error, sizeof(vk->last_error), "Output pool exhausted");
+        return -1;
+    }
+
+    VkImage out_y_image = y_entry->image;
+    VkImageView out_y_view = y_entry->view;
+    VkImage out_uv_image = uv_entry->image;
+    VkImageView out_uv_view = uv_entry->view;
+    int uses_copyout = y_entry->has_copy_buffer;
+
+    VkResult result;
+
+    /* Fence management */
+    if (vk->frame_count == 0) {
+        vkResetFences(vk->device, 1, &vk->fence);
+    }
+
+    /* Record command buffer */
+    VkCommandBuffer cmd = vk->command_buffer;
+
+    result = vkResetCommandPool(vk->device, vk->command_pool, 0);
+    VK_CHECK(result, "vkResetCommandPool(predecode)");
+
+    VkCommandBufferBeginInfo begin_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+
+    result = vkBeginCommandBuffer(cmd, &begin_info);
+    VK_CHECK(result, "vkBeginCommandBuffer(predecode)");
+
+    /* Update compute decode descriptor set with AMLY input + intermediate images */
+    VkDescriptorBufferInfo decode_buffer_info = { in_buffer, 0, input_size };
+    VkDescriptorImageInfo decode_y_info = {
+        .imageView = vk->predecode_y_view,
+        .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+    };
+    VkDescriptorImageInfo decode_uv_info = {
+        .imageView = vk->predecode_uv_view,
+        .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+    };
+    VkWriteDescriptorSet decode_writes[] = {
+        {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = vk->compute_descriptor_set_decode,
+            .dstBinding = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .pBufferInfo = &decode_buffer_info,
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = vk->compute_descriptor_set_decode,
+            .dstBinding = 1,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .pImageInfo = &decode_y_info,
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = vk->compute_descriptor_set_decode,
+            .dstBinding = 2,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .pImageInfo = &decode_uv_info,
+        },
+    };
+    vkUpdateDescriptorSets(vk->device, 3, decode_writes, 0, NULL);
+
+    /* Barrier: intermediate images UNDEFINED -> GENERAL for compute imageStore */
+    VkImageMemoryBarrier inter_to_general[] = {
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = 0,
+            .dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .image = vk->predecode_y_image,
+            .subresourceRange = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0, .levelCount = 1,
+                .baseArrayLayer = 0, .layerCount = 1,
+            },
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = 0,
+            .dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .image = vk->predecode_uv_image,
+            .subresourceRange = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0, .levelCount = 1,
+                .baseArrayLayer = 0, .layerCount = 1,
+            },
+        },
+    };
+    vkCmdPipelineBarrier(cmd,
+                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 0, NULL, 0, NULL, 2, inter_to_general);
+
+    /* ---- Compute dispatch: AMLY SSBO -> R16 Y + R16G16 UV intermediates ---- */
+    uint32_t pairs_per_row = src_width / 2;
+    uint32_t decode_push[] = { src_width, src_height, pairs_per_row, 0 };
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipeline_amly_decode);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            vk->pipeline_layout_decode, 0, 1,
+                            &vk->compute_descriptor_set_decode, 0, NULL);
+    vkCmdPushConstants(cmd, vk->pipeline_layout_decode,
+                       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(decode_push), decode_push);
+
+    /* Dispatch: 128 threads/workgroup, each handles 1 pixel pair per row */
+    uint32_t wg_x = (pairs_per_row + 127) / 128;
+    uint32_t wg_y = src_height;
+    vkCmdDispatch(cmd, wg_x, wg_y, 1);
+
+    /* Barrier: intermediates GENERAL -> SHADER_READ_ONLY (compute -> fragment) */
+    VkImageMemoryBarrier inter_to_read[] = {
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .image = vk->predecode_y_image,
+            .subresourceRange = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0, .levelCount = 1,
+                .baseArrayLayer = 0, .layerCount = 1,
+            },
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .image = vk->predecode_uv_image,
+            .subresourceRange = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0, .levelCount = 1,
+                .baseArrayLayer = 0, .layerCount = 1,
+            },
+        },
+    };
+    vkCmdPipelineBarrier(cmd,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                         0, 0, NULL, 0, NULL, 2, inter_to_read);
+
+    /* Transition output Y to COLOR_ATTACHMENT_OPTIMAL */
+    VkImageMemoryBarrier out_y_barrier = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = 0,
+        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .image = out_y_image,
+        .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0, .levelCount = 1,
+            .baseArrayLayer = 0, .layerCount = 1,
+        },
+    };
+
+    vkCmdPipelineBarrier(cmd,
+                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         0, 0, NULL, 0, NULL, 1, &out_y_barrier);
+
+    /* Push constant for fragment: color_mode */
+    uint32_t frag_push = vk->color_mode;
+
+    /* ---- Y pass: fragment samples intermediates + LUT, writes Y output ---- */
+    VkRenderingAttachmentInfo y_attach = {
+        .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        .imageView = out_y_view,
+        .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+    };
+
+    VkRenderingInfo y_render = {
+        .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+        .renderArea = { {0, 0}, {dst_width, dst_height} },
+        .layerCount = 1,
+        .colorAttachmentCount = 1,
+        .pColorAttachments = &y_attach,
+    };
+
+    vk->cmd_begin_rendering(cmd, &y_render);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, y_pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            vk->predecode_gfx_pipeline_layout, 0, 1,
+                            &vk->predecode_gfx_descriptor_set, 0, NULL);
+    vkCmdPushConstants(cmd, vk->predecode_gfx_pipeline_layout,
+                       VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(frag_push), &frag_push);
+    VkViewport viewport_y = { 0.0f, 0.0f, (float)dst_width, (float)dst_height, 0.0f, 1.0f };
+    VkRect2D scissor_y = { {0, 0}, {dst_width, dst_height} };
+    vkCmdSetViewport(cmd, 0, 1, &viewport_y);
+    vkCmdSetScissor(cmd, 0, 1, &scissor_y);
+    vkCmdDraw(cmd, 3, 1, 0, 0);
+    vk->cmd_end_rendering(cmd);
+
+    /* Transition Y output + UV output for UV pass */
+    VkImageLayout y_final_layout = uses_copyout ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+                                                : VK_IMAGE_LAYOUT_GENERAL;
+    VkAccessFlags y_final_access = uses_copyout ? VK_ACCESS_TRANSFER_READ_BIT : 0;
+    VkPipelineStageFlags y_final_stage = uses_copyout ? VK_PIPELINE_STAGE_TRANSFER_BIT
+                                                      : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+
+    VkImageMemoryBarrier y_post_render = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        .dstAccessMask = y_final_access,
+        .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .newLayout = y_final_layout,
+        .image = out_y_image,
+        .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0, .levelCount = 1,
+            .baseArrayLayer = 0, .layerCount = 1,
+        },
+    };
+
+    VkImageMemoryBarrier out_uv_barrier = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = 0,
+        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .image = out_uv_image,
+        .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0, .levelCount = 1,
+            .baseArrayLayer = 0, .layerCount = 1,
+        },
+    };
+
+    VkImageMemoryBarrier barriers[2] = { y_post_render, out_uv_barrier };
+    vkCmdPipelineBarrier(cmd,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | y_final_stage,
+                         0, 0, NULL, 0, NULL, 2, barriers);
+
+    /* ---- UV pass: fragment samples intermediates + LUT, writes UV output ---- */
+    VkRenderingAttachmentInfo uv_attach = {
+        .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        .imageView = out_uv_view,
+        .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+    };
+
+    VkRenderingInfo uv_render = {
+        .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+        .renderArea = { {0, 0}, {dst_width / 2, dst_height / 2} },
+        .layerCount = 1,
+        .colorAttachmentCount = 1,
+        .pColorAttachments = &uv_attach,
+    };
+
+    vk->cmd_begin_rendering(cmd, &uv_render);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, uv_pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            vk->predecode_gfx_pipeline_layout, 0, 1,
+                            &vk->predecode_gfx_descriptor_set, 0, NULL);
+    vkCmdPushConstants(cmd, vk->predecode_gfx_pipeline_layout,
+                       VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(frag_push), &frag_push);
+    VkViewport viewport_uv = { 0.0f, 0.0f, (float)(dst_width / 2), (float)(dst_height / 2), 0.0f, 1.0f };
+    VkRect2D scissor_uv = { {0, 0}, {dst_width / 2, dst_height / 2} };
+    vkCmdSetViewport(cmd, 0, 1, &viewport_uv);
+    vkCmdSetScissor(cmd, 0, 1, &scissor_uv);
+    vkCmdDraw(cmd, 3, 1, 0, 0);
+    vk->cmd_end_rendering(cmd);
+
+    if (uses_copyout) {
+        /* Copyout path: transition UV to TRANSFER_SRC, then copy both planes */
+        VkImageMemoryBarrier uv_to_transfer = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .image = out_uv_image,
+            .subresourceRange = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0, .levelCount = 1,
+                .baseArrayLayer = 0, .layerCount = 1,
+            },
+        };
+
+        vkCmdPipelineBarrier(cmd,
+                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 0, NULL, 0, NULL, 1, &uv_to_transfer);
+
+        /* Copy Y image -> Y buffer */
+        VkBufferImageCopy y_copy = {
+            .bufferOffset = 0,
+            .bufferRowLength = dst_width,
+            .bufferImageHeight = dst_height,
+            .imageSubresource = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1,
+            },
+            .imageOffset = {0, 0, 0},
+            .imageExtent = {dst_width, dst_height, 1},
+        };
+        vkCmdCopyImageToBuffer(cmd, out_y_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               y_entry->copy_buffer, 1, &y_copy);
+
+        /* Copy UV image -> UV buffer */
+        VkBufferImageCopy uv_copy = {
+            .bufferOffset = 0,
+            .bufferRowLength = dst_width / 2,
+            .bufferImageHeight = dst_height / 2,
+            .imageSubresource = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1,
+            },
+            .imageOffset = {0, 0, 0},
+            .imageExtent = {dst_width / 2, dst_height / 2, 1},
+        };
+        vkCmdCopyImageToBuffer(cmd, out_uv_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               uv_entry->copy_buffer, 1, &uv_copy);
+
+        /* Memory barrier for transfer visibility */
+        VkMemoryBarrier transfer_done = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
+        };
+        vkCmdPipelineBarrier(cmd,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             0, 1, &transfer_done, 0, NULL, 0, NULL);
+    } else {
+        /* Regular DMA-buf image path: transition UV to GENERAL */
+        VkImageMemoryBarrier uv_to_general = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .image = out_uv_image,
+            .subresourceRange = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0, .levelCount = 1,
+                .baseArrayLayer = 0, .layerCount = 1,
+            },
+        };
+
+        vkCmdPipelineBarrier(cmd,
+                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             0, 0, NULL, 0, NULL, 1, &uv_to_general);
+    }
+
+    result = vkEndCommandBuffer(cmd);
+    VK_CHECK(result, "vkEndCommandBuffer(predecode)");
+
+    /* DMA-buf sync: start write access on output copyout buffers */
+    if (uses_copyout) {
+        struct dma_buf_sync sync_start_wr = {
+            .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE
+        };
+        ioctl(y_entry->dmabuf_fd, DMA_BUF_IOCTL_SYNC, &sync_start_wr);
+        ioctl(uv_entry->dmabuf_fd, DMA_BUF_IOCTL_SYNC, &sync_start_wr);
+    }
+
+    /* Submit to graphics queue */
+    VkSubmitInfo submit_info = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &cmd,
+    };
+
+    result = vkQueueSubmit(vk->graphics_queue, 1, &submit_info, vk->fence);
+    VK_CHECK(result, "vkQueueSubmit(predecode)");
+
+    vk->pending_in_fd = in_fd;
+    vk->pending_out_fd = y_entry->dmabuf_fd;
+    vk->pending_out_fd2 = uv_entry->dmabuf_fd;
+    vk->has_pending = 1;
+
+    /* Wait for completion */
+    int ret = vfmcap_vk_convert_wait(vk);
+    if (ret != 0) {
+        output_pool_release(y_pool, y_entry);
+        output_pool_release(uv_pool, uv_entry);
+        return -1;
+    }
+
+    *out_y_fd = y_entry->dmabuf_fd;
+    *out_uv_fd = uv_entry->dmabuf_fd;
+    return 0;
+}
+
 /* ---------- 10-bit compute-to-graphics render ---------- */
 
 int vfmcap_vk_render_10bit_and_wait(VulkanCtx *vk, int in_fd,
@@ -3578,6 +4242,39 @@ void vfmcap_vk_cleanup(VulkanCtx *vk)
         vkDestroyShaderModule(vk->device, vk->gfx_shader_tbdr_nv12_y, NULL);
     if (vk->gfx_shader_tbdr_nv12_uv != VK_NULL_HANDLE)
         vkDestroyShaderModule(vk->device, vk->gfx_shader_tbdr_nv12_uv, NULL);
+    /* Strategy A predecode resources */
+    if (vk->predecode_gfx_pipeline_p010_y != VK_NULL_HANDLE)
+        vkDestroyPipeline(vk->device, vk->predecode_gfx_pipeline_p010_y, NULL);
+    if (vk->predecode_gfx_pipeline_p010_uv != VK_NULL_HANDLE)
+        vkDestroyPipeline(vk->device, vk->predecode_gfx_pipeline_p010_uv, NULL);
+    if (vk->predecode_gfx_pipeline_nv12_y != VK_NULL_HANDLE)
+        vkDestroyPipeline(vk->device, vk->predecode_gfx_pipeline_nv12_y, NULL);
+    if (vk->predecode_gfx_pipeline_nv12_uv != VK_NULL_HANDLE)
+        vkDestroyPipeline(vk->device, vk->predecode_gfx_pipeline_nv12_uv, NULL);
+    if (vk->predecode_shader_p010_y != VK_NULL_HANDLE)
+        vkDestroyShaderModule(vk->device, vk->predecode_shader_p010_y, NULL);
+    if (vk->predecode_shader_p010_uv != VK_NULL_HANDLE)
+        vkDestroyShaderModule(vk->device, vk->predecode_shader_p010_uv, NULL);
+    if (vk->predecode_shader_nv12_y != VK_NULL_HANDLE)
+        vkDestroyShaderModule(vk->device, vk->predecode_shader_nv12_y, NULL);
+    if (vk->predecode_shader_nv12_uv != VK_NULL_HANDLE)
+        vkDestroyShaderModule(vk->device, vk->predecode_shader_nv12_uv, NULL);
+    if (vk->predecode_gfx_pipeline_layout != VK_NULL_HANDLE)
+        vkDestroyPipelineLayout(vk->device, vk->predecode_gfx_pipeline_layout, NULL);
+    if (vk->predecode_gfx_descriptor_set_layout != VK_NULL_HANDLE)
+        vkDestroyDescriptorSetLayout(vk->device, vk->predecode_gfx_descriptor_set_layout, NULL);
+    if (vk->predecode_y_view != VK_NULL_HANDLE)
+        vkDestroyImageView(vk->device, vk->predecode_y_view, NULL);
+    if (vk->predecode_y_image != VK_NULL_HANDLE)
+        vkDestroyImage(vk->device, vk->predecode_y_image, NULL);
+    if (vk->predecode_y_memory != VK_NULL_HANDLE)
+        vkFreeMemory(vk->device, vk->predecode_y_memory, NULL);
+    if (vk->predecode_uv_view != VK_NULL_HANDLE)
+        vkDestroyImageView(vk->device, vk->predecode_uv_view, NULL);
+    if (vk->predecode_uv_image != VK_NULL_HANDLE)
+        vkDestroyImage(vk->device, vk->predecode_uv_image, NULL);
+    if (vk->predecode_uv_memory != VK_NULL_HANDLE)
+        vkFreeMemory(vk->device, vk->predecode_uv_memory, NULL);
     if (vk->pipeline_p010 != VK_NULL_HANDLE)
         vkDestroyPipeline(vk->device, vk->pipeline_p010, NULL);
     if (vk->pipeline_nv12 != VK_NULL_HANDLE)

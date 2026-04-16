@@ -99,6 +99,8 @@ struct vfmcap_ctx {
     /* Dynamic reconfiguration state */
     int                  reconfig_pending; /* 1 if reconfig occurred, next acquire returns RECONFIGURED */
     int                  signal_lost;      /* 1 if signal currently lost */
+    uint32_t             prev_width;       /* Dimensions before reconfig (for comparison) */
+    uint32_t             prev_height;
 
     /* Error message */
     char                 last_error[VFMCAP_ERROR_SIZE];
@@ -149,6 +151,104 @@ static vfmcap_vk_fmt_t to_vk_fmt(vfmcap_output_fmt_t fmt)
     case VFMCAP_FMT_A2B10G10R10_AFBC: return VFMCAP_VK_FMT_A2B10G10R10_AFBC;
     default: return VFMCAP_VK_FMT_NV12;
     }
+}
+
+/* ---------- Dynamic reconfiguration ---------- */
+
+static int vfmcap_do_reconfig(vfmcap_ctx_t *ctx)
+{
+    uint32_t old_w = ctx->prev_width;
+    uint32_t old_h = ctx->prev_height;
+
+    fprintf(stderr, "[vfmcap] Reconfiguring: %ux%u -> %ux%u\n",
+            old_w, old_h, ctx->width, ctx->height);
+
+    /* 12.3: V4L2 reconfiguration cycle */
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    xioctl(ctx->fd, VIDIOC_STREAMOFF, &type);
+
+    struct v4l2_requestbuffers reqbufs;
+    memset(&reqbufs, 0, sizeof(reqbufs));
+    reqbufs.count = 0;
+    reqbufs.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    reqbufs.memory = V4L2_MEMORY_MMAP;
+    xioctl(ctx->fd, VIDIOC_REQBUFS, &reqbufs);
+
+    {
+        struct v4l2_format fmt;
+        memset(&fmt, 0, sizeof(fmt));
+        fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+        xioctl(ctx->fd, VIDIOC_G_FMT, &fmt);
+        ctx->width = fmt.fmt.pix_mp.width;
+        ctx->height = fmt.fmt.pix_mp.height;
+        ctx->pixelformat = fmt.fmt.pix_mp.pixelformat;
+        ctx->bytesperline = fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
+        ctx->sizeimage = fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
+        if (ctx->pixelformat == v4l2_fourcc('A', 'M', 'L', 'Y'))
+            ctx->bitdepth = 10;
+        else if (ctx->pixelformat == V4L2_PIX_FMT_NV12 ||
+                 ctx->pixelformat == V4L2_PIX_FMT_NV21)
+            ctx->bitdepth = 8;
+        else if (ctx->pixelformat == v4l2_fourcc('P', '0', '1', '0'))
+            ctx->bitdepth = 10;
+        else
+            ctx->bitdepth = 8;
+    }
+
+    memset(&reqbufs, 0, sizeof(reqbufs));
+    reqbufs.count = ctx->num_buffers ? ctx->num_buffers : 6;
+    reqbufs.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    reqbufs.memory = V4L2_MEMORY_MMAP;
+    if (xioctl(ctx->fd, VIDIOC_REQBUFS, &reqbufs) < 0) {
+        snprintf(ctx->last_error, sizeof(ctx->last_error),
+                 "REQBUFS after reconfig failed: %s", strerror(errno));
+        return VFMCAP_ERR_IOCTL;
+    }
+    ctx->num_buffers = reqbufs.count;
+
+    for (unsigned int i = 0; i < ctx->num_buffers; i++) {
+        struct v4l2_buffer buf;
+        struct v4l2_plane plane;
+        memset(&buf, 0, sizeof(buf));
+        memset(&plane, 0, sizeof(plane));
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+        buf.memory = V4L2_MEMORY_MMAP;
+        buf.index = i;
+        buf.length = 1;
+        buf.m.planes = &plane;
+        if (xioctl(ctx->fd, VIDIOC_QBUF, &buf) < 0) {
+            snprintf(ctx->last_error, sizeof(ctx->last_error),
+                     "QBUF(%u) after reconfig failed: %s", i, strerror(errno));
+            return VFMCAP_ERR_IOCTL;
+        }
+    }
+
+    type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    if (xioctl(ctx->fd, VIDIOC_STREAMON, &type) < 0) {
+        snprintf(ctx->last_error, sizeof(ctx->last_error),
+                 "STREAMON after reconfig failed: %s", strerror(errno));
+        return VFMCAP_ERR_IOCTL;
+    }
+
+    /* 12.4+12.5+12.8: Reconfigure Vulkan pools if dimensions changed */
+    if (needs_vulkan(&ctx->config) && ctx->vk) {
+        uint32_t dst_w = ctx->config.target_width ? ctx->config.target_width : ctx->width;
+        uint32_t dst_h = ctx->config.target_height ? ctx->config.target_height : ctx->height;
+        if (vfmcap_vk_reconfig_pools(ctx->vk, ctx->width, ctx->height,
+                                      dst_w, dst_h,
+                                      to_vk_fmt(ctx->config.output_format)) != 0) {
+            fprintf(stderr, "[vfmcap] WARNING: Vulkan pool reconfig failed: %s\n",
+                    vfmcap_vk_last_error(ctx->vk));
+        }
+    }
+
+    /* Reset framerate accumulator */
+    ctx->ts_accum_us = 0;
+
+    fprintf(stderr, "[vfmcap] Reconfigured: %ux%u -> %ux%u pixfmt=%.4s\n",
+            old_w, old_h, ctx->width, ctx->height, (char *)&ctx->pixelformat);
+
+    return VFMCAP_OK;
 }
 
 /* ---------- Lifecycle ---------- */
@@ -429,6 +529,70 @@ int vfmcap_acquire_frame(vfmcap_ctx_t *ctx, vfmcap_frame_t *frame, int timeout_m
     frame->dmabuf_fd = -1;
 
 again:
+    /* Signal loss recovery: poll for signal restoration */
+    if (ctx->signal_lost) {
+        for (;;) {
+            struct pollfd pfd;
+            pfd.fd = ctx->fd;
+            pfd.events = POLLPRI;
+            pfd.revents = 0;
+            int pret = poll(&pfd, 1, timeout_ms > 0 ? timeout_ms : 1000);
+            if (pret == 0)
+                return VFMCAP_ERR_NOSIG;
+            if (pret < 0) {
+                if (errno == EINTR) continue;
+                snprintf(ctx->last_error, sizeof(ctx->last_error),
+                         "poll() during signal recovery failed: %s", strerror(errno));
+                return VFMCAP_ERR_IOCTL;
+            }
+            if (pfd.revents & POLLPRI) {
+                struct v4l2_event event;
+                memset(&event, 0, sizeof(event));
+                while (xioctl(ctx->fd, VIDIOC_DQEVENT, &event) == 0) {
+                    if (event.type == V4L2_EVENT_SOURCE_CHANGE) {
+                        struct vfm_cap_signal_info_kern *sig =
+                            (struct vfm_cap_signal_info_kern *)event.u.data;
+                        if (sig->status == 1) {
+                            memset(&event, 0, sizeof(event));
+                            continue;
+                        }
+                        ctx->signal_lost = 0;
+                        ctx->prev_width = ctx->width;
+                        ctx->prev_height = ctx->height;
+                        struct v4l2_format fmt;
+                        memset(&fmt, 0, sizeof(fmt));
+                        fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+                        if (xioctl(ctx->fd, VIDIOC_G_FMT, &fmt) == 0) {
+                            ctx->width = fmt.fmt.pix_mp.width;
+                            ctx->height = fmt.fmt.pix_mp.height;
+                            ctx->pixelformat = fmt.fmt.pix_mp.pixelformat;
+                            ctx->bytesperline = fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
+                            ctx->sizeimage = fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
+                            if (ctx->pixelformat == v4l2_fourcc('A', 'M', 'L', 'Y'))
+                                ctx->bitdepth = 10;
+                            else if (ctx->pixelformat == V4L2_PIX_FMT_NV12 ||
+                                     ctx->pixelformat == V4L2_PIX_FMT_NV21)
+                                ctx->bitdepth = 8;
+                            else if (ctx->pixelformat == v4l2_fourcc('P', '0', '1', '0'))
+                                ctx->bitdepth = 10;
+                            else
+                                ctx->bitdepth = 8;
+                        }
+                        vfmcap_do_reconfig(ctx);
+                        ctx->reconfig_pending = 1;
+                        fprintf(stderr, "[vfmcap] Signal restored: %ux%u\n",
+                                ctx->width, ctx->height);
+                        break;
+                    }
+                    memset(&event, 0, sizeof(event));
+                }
+                if (!ctx->signal_lost)
+                    break;
+            }
+        }
+        goto again;
+    }
+
     /* Poll for buffer ready */
     if (timeout_ms != 0) {
         int64_t deadline = now_ms_mono() + timeout_ms;
@@ -462,11 +626,13 @@ again:
                     if (event.type == V4L2_EVENT_SOURCE_CHANGE) {
                         struct vfm_cap_signal_info_kern *sig =
                             (struct vfm_cap_signal_info_kern *)event.u.data;
-                        if (sig->status == 1) { /* NOSIG */
+                        if (sig->status == 1) {
                             ctx->signal_lost = 1;
                             return VFMCAP_ERR_NOSIG;
                         }
-                        /* Signal changed — update cached format */
+                        /* Signal changed — save prev dims, read new format, reconfig */
+                        ctx->prev_width = ctx->width;
+                        ctx->prev_height = ctx->height;
                         struct v4l2_format fmt;
                         memset(&fmt, 0, sizeof(fmt));
                         fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
@@ -486,9 +652,12 @@ again:
                             else
                                 ctx->bitdepth = 8;
                         }
+                        int rc = vfmcap_do_reconfig(ctx);
+                        if (rc != VFMCAP_OK) {
+                            ctx->reconfig_pending = 1;
+                            return rc;
+                        }
                         ctx->reconfig_pending = 1;
-                        fprintf(stderr, "[vfmcap] Source changed: %ux%u\n",
-                                ctx->width, ctx->height);
                     }
                     memset(&event, 0, sizeof(event));
                 }

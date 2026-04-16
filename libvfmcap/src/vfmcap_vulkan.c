@@ -4145,6 +4145,156 @@ int vfmcap_vk_compute_10bit_and_wait(VulkanCtx *vk, int in_fd,
 
 /* ---------- Cleanup ---------- */
 
+int vfmcap_vk_reconfig_pools(VulkanCtx *vk, uint32_t src_width, uint32_t src_height,
+                              uint32_t dst_width, uint32_t dst_height,
+                              vfmcap_vk_fmt_t fmt)
+{
+    if (!vk || !vk->initialized) {
+        if (vk) snprintf(vk->last_error, sizeof(vk->last_error),
+                         "vfmcap_vk_reconfig_pools: not initialized");
+        return -1;
+    }
+
+    fprintf(stderr, "[vfmcap-vk] Reconfiguring pools: %ux%u -> %ux%u\n",
+            src_width, src_height, dst_width, dst_height);
+
+    vkDeviceWaitIdle(vk->device);
+
+    for (int i = 0; i < vk->input_cache_count; i++) {
+        cache_entry_destroy(vk, &vk->input_cache[i]);
+    }
+    vk->input_cache_count = 0;
+
+    for (int i = 0; i < vk->image_cache_count; i++) {
+        image_cache_entry_destroy(vk, &vk->image_cache[i]);
+    }
+    vk->image_cache_count = 0;
+
+    cache_entry_destroy(vk, &vk->cached_output);
+
+    output_pool_destroy(vk, &vk->pool_nv12_y);
+    output_pool_destroy(vk, &vk->pool_nv12_uv);
+    output_pool_destroy(vk, &vk->pool_p010_y);
+    output_pool_destroy(vk, &vk->pool_p010_uv);
+    output_pool_destroy(vk, &vk->pool_nv12_afbc);
+    output_pool_destroy(vk, &vk->pool_a2b10g10r10_afbc);
+    output_pool_destroy(vk, &vk->pool_intermediate_y);
+    output_pool_destroy(vk, &vk->pool_intermediate_uv);
+
+    if (vk->predecode_y_view != VK_NULL_HANDLE) {
+        vkDestroyImageView(vk->device, vk->predecode_y_view, NULL);
+        vk->predecode_y_view = VK_NULL_HANDLE;
+    }
+    if (vk->predecode_y_image != VK_NULL_HANDLE) {
+        vkDestroyImage(vk->device, vk->predecode_y_image, NULL);
+        vk->predecode_y_image = VK_NULL_HANDLE;
+    }
+    if (vk->predecode_y_memory != VK_NULL_HANDLE) {
+        vkFreeMemory(vk->device, vk->predecode_y_memory, NULL);
+        vk->predecode_y_memory = VK_NULL_HANDLE;
+    }
+    if (vk->predecode_uv_view != VK_NULL_HANDLE) {
+        vkDestroyImageView(vk->device, vk->predecode_uv_view, NULL);
+        vk->predecode_uv_view = VK_NULL_HANDLE;
+    }
+    if (vk->predecode_uv_image != VK_NULL_HANDLE) {
+        vkDestroyImage(vk->device, vk->predecode_uv_image, NULL);
+        vk->predecode_uv_image = VK_NULL_HANDLE;
+    }
+    if (vk->predecode_uv_memory != VK_NULL_HANDLE) {
+        vkFreeMemory(vk->device, vk->predecode_uv_memory, NULL);
+        vk->predecode_uv_memory = VK_NULL_HANDLE;
+    }
+
+    if (fmt == VFMCAP_VK_FMT_NV12 || fmt == VFMCAP_VK_FMT_NV21) {
+        if (output_pool_create(vk, 4, dst_width, dst_height, VK_FORMAT_R8_UNORM,
+                               &vk->pool_nv12_y) != 0 ||
+            output_pool_create(vk, 4, dst_width / 2, dst_height / 2, VK_FORMAT_R8G8_UNORM,
+                               &vk->pool_nv12_uv) != 0) {
+            snprintf(vk->last_error, sizeof(vk->last_error),
+                     "Failed to recreate NV12 pools at %ux%u", dst_width, dst_height);
+            return -1;
+        }
+    } else if (fmt == VFMCAP_VK_FMT_P010) {
+        if (output_pool_create_copyout(vk, 4, dst_width, dst_height, VK_FORMAT_R16_UNORM,
+                                       &vk->pool_p010_y) != 0 ||
+            output_pool_create_copyout(vk, 4, dst_width / 2, dst_height / 2, VK_FORMAT_R16G16_UNORM,
+                                       &vk->pool_p010_uv) != 0) {
+            snprintf(vk->last_error, sizeof(vk->last_error),
+                     "Failed to recreate P010 pools at %ux%u", dst_width, dst_height);
+            return -1;
+        }
+    }
+
+    if (create_internal_image(vk, src_width, src_height, VK_FORMAT_R16_UNORM,
+                              VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                              &vk->predecode_y_image, &vk->predecode_y_memory,
+                              &vk->predecode_y_view) != 0) {
+        snprintf(vk->last_error, sizeof(vk->last_error),
+                 "Failed to recreate predecode Y intermediate at %ux%u", src_width, src_height);
+        return -1;
+    }
+    if (create_internal_image(vk, src_width / 2, src_height / 2, VK_FORMAT_R16G16_UNORM,
+                              VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                              &vk->predecode_uv_image, &vk->predecode_uv_memory,
+                              &vk->predecode_uv_view) != 0) {
+        snprintf(vk->last_error, sizeof(vk->last_error),
+                 "Failed to recreate predecode UV intermediate at %ux%u", src_width / 2, src_height / 2);
+        return -1;
+    }
+
+    {
+        VkDescriptorImageInfo pd_y_info = {
+            .imageView = vk->predecode_y_view,
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        };
+        VkDescriptorImageInfo pd_uv_info = {
+            .imageView = vk->predecode_uv_view,
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        };
+        VkDescriptorImageInfo pd_lut_info = {
+            .sampler = vk->lut_3d_sampler,
+            .imageView = vk->lut_3d_view,
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        };
+        VkWriteDescriptorSet pd_writes[] = {
+            {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = vk->predecode_gfx_descriptor_set,
+                .dstBinding = 0,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pImageInfo = &pd_y_info,
+            },
+            {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = vk->predecode_gfx_descriptor_set,
+                .dstBinding = 1,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pImageInfo = &pd_uv_info,
+            },
+            {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = vk->predecode_gfx_descriptor_set,
+                .dstBinding = 2,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pImageInfo = &pd_lut_info,
+            },
+        };
+        vkUpdateDescriptorSets(vk->device, 3, pd_writes, 0, NULL);
+    }
+
+    vk->width = dst_width;
+    vk->height = dst_height;
+    vk->frame_count = 0;
+
+    fprintf(stderr, "[vfmcap-vk] Reconfigured pools: %ux%u -> %ux%u\n",
+            src_width, src_height, dst_width, dst_height);
+    return 0;
+}
+
 void vfmcap_vk_cleanup(VulkanCtx *vk)
 {
     if (!vk) return;

@@ -167,6 +167,23 @@ int vfmcap_vk_render_predecode_and_wait(VulkanCtx *vk, int in_fd,
                                          int *out_y_fd, int *out_uv_fd);
 
 /**
+ * vfmcap_vk_reconfig_pools - Reconfigure output pools for new dimensions
+ * @vk: Vulkan context
+ * @src_width: New source width
+ * @src_height: New source height
+ * @dst_width: New target width
+ * @dst_height: New target height
+ * @fmt: Output format
+ *
+ * Drains GPU, invalidates caches, destroys and recreates output pools
+ * and intermediate images at new dimensions. Pipelines/shaders/LUT stay alive.
+ * Returns 0 on success, -1 on failure.
+ */
+int vfmcap_vk_reconfig_pools(VulkanCtx *vk, uint32_t src_width, uint32_t src_height,
+                              uint32_t dst_width, uint32_t dst_height,
+                              vfmcap_vk_fmt_t fmt);
+
+/**
  * vfmcap_vk_cleanup - Destroy all Vulkan resources
  * @vk: Vulkan context
  */

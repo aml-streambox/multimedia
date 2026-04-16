@@ -33,14 +33,17 @@ typedef enum {
 /**
  * vfmcap_vk_init - Initialize Vulkan pipeline for a context
  * @vk: Pointer to store the allocated VulkanCtx
- * @width: Initial frame width
- * @height: Initial frame height
+ * @src_width: Source frame width (for intermediate image sizing)
+ * @src_height: Source frame height
+ * @dst_width: Target output width (for output pool sizing)
+ * @dst_height: Target output height
  * @fmt: Output format (determines which pipelines to create)
  * @color_mode: HDR/color conversion mode (0=passthrough, 1=HDR10->SDR, 2=HLG->SDR)
  *
  * Returns 0 on success, -1 on failure.
  */
-int vfmcap_vk_init(VulkanCtx **vk, uint32_t width, uint32_t height,
+int vfmcap_vk_init(VulkanCtx **vk, uint32_t src_width, uint32_t src_height,
+                    uint32_t dst_width, uint32_t dst_height,
                     vfmcap_vk_fmt_t fmt, uint32_t color_mode);
 
 /**

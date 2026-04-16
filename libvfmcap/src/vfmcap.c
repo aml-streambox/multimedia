@@ -336,7 +336,10 @@ int vfmcap_start(vfmcap_ctx_t *ctx, unsigned int num_buffers)
 
     /* Initialize Vulkan if conversion is requested */
     if (needs_vulkan(&ctx->config) && !ctx->vk && ctx->width > 0 && ctx->height > 0) {
+        uint32_t dst_w = ctx->config.target_width ? ctx->config.target_width : ctx->width;
+        uint32_t dst_h = ctx->config.target_height ? ctx->config.target_height : ctx->height;
         if (vfmcap_vk_init(&ctx->vk, ctx->width, ctx->height,
+                            dst_w, dst_h,
                             to_vk_fmt(ctx->config.output_format),
                             (uint32_t)ctx->config.color_mode) == 0) {
             /* success */
@@ -425,6 +428,7 @@ int vfmcap_acquire_frame(vfmcap_ctx_t *ctx, vfmcap_frame_t *frame, int timeout_m
     memset(frame, 0, sizeof(*frame));
     frame->dmabuf_fd = -1;
 
+again:
     /* Poll for buffer ready */
     if (timeout_ms != 0) {
         int64_t deadline = now_ms_mono() + timeout_ms;
@@ -541,6 +545,23 @@ int vfmcap_acquire_frame(vfmcap_ctx_t *ctx, vfmcap_frame_t *frame, int timeout_m
     frame->drm_modifier = 0;
     frame->is_repeated = 0;
     frame->priv = NULL;
+
+    /* Framerate conversion: drop frames to achieve target_fps */
+    if (ctx->config.target_fps > 0.0f && !ctx->reconfig_pending) {
+        uint64_t frame_interval_us = (uint64_t)(1000000.0f / ctx->config.target_fps);
+
+        if (ctx->ts_accum_us == 0) {
+            ctx->ts_accum_us = frame->timestamp_us;
+        }
+
+        int64_t ahead = (int64_t)ctx->ts_accum_us - (int64_t)frame->timestamp_us;
+        if (ahead > (int64_t)(frame_interval_us / 2)) {
+            close(dmabuf_req.fd);
+            xioctl(ctx->fd, VIDIOC_QBUF, &buf);
+            goto again;
+        }
+        ctx->ts_accum_us += frame_interval_us;
+    }
 
     /* GPU conversion path (integrated into acquire) */
     if (needs_vulkan(&ctx->config) && ctx->vk) {

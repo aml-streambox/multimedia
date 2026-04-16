@@ -152,7 +152,6 @@ typedef void (VKAPI_PTR *PFN_vkCmdEndRenderingKHR)(VkCommandBuffer commandBuffer
 #include "../shaders/nv12_uv_from_r16g16.frag_spv.h"
 #include "../shaders/p010_y_from_r16.frag_spv.h"
 #include "../shaders/p010_uv_from_r16g16.frag_spv.h"
-#include "../shaders/yuv_from_yuva.frag_spv.h"
 
 /* TBDR-optimized shaders: fragment reads AMLY SSBO directly, no intermediate images */
 #include "../shaders/amly_p010_y_spv.h"
@@ -1605,7 +1604,8 @@ static int create_lut3d_resources(VulkanCtx *vk)
 
 /* ---------- Initialization ---------- */
 
-int vfmcap_vk_init(VulkanCtx **vk_out, uint32_t width, uint32_t height,
+int vfmcap_vk_init(VulkanCtx **vk_out, uint32_t src_width, uint32_t src_height,
+                    uint32_t dst_width, uint32_t dst_height,
                     vfmcap_vk_fmt_t fmt, uint32_t color_mode)
 {
     (void)fmt;
@@ -1613,9 +1613,25 @@ int vfmcap_vk_init(VulkanCtx **vk_out, uint32_t width, uint32_t height,
     if (!vk) return -1;
     *vk_out = vk;  /* Set early so error messages are retrievable */
 
-    vk->width = width;
-    vk->height = height;
-    vk->color_mode = color_mode;
+    vk->width = dst_width;
+    vk->height = dst_height;
+
+    if (dst_width == 0 || dst_height == 0 || dst_width > 16384 || dst_height > 16384) {
+        snprintf(vk->last_error, sizeof(vk->last_error),
+                 "Invalid target resolution %ux%u (max 16384)", dst_width, dst_height);
+        return -1;
+    }
+    if (dst_width % 2 != 0 || dst_height % 2 != 0) {
+        snprintf(vk->last_error, sizeof(vk->last_error),
+                 "Odd target dimensions not supported for YUV 4:2:0: %ux%u", dst_width, dst_height);
+        return -1;
+    }
+    if (src_width % 2 != 0 || src_height % 2 != 0) {
+        snprintf(vk->last_error, sizeof(vk->last_error),
+                 "Odd source dimensions: %ux%u", src_width, src_height);
+        return -1;
+    }
+
     vk->input_cache_count = 0;
     vk->image_cache_count = 0;
     vk->cached_output.valid = 0;
@@ -2321,8 +2337,8 @@ int vfmcap_vk_init(VulkanCtx **vk_out, uint32_t width, uint32_t height,
         .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
     };
 
-    VkViewport viewport = { 0, 0, (float)width, (float)height, 0.0f, 1.0f };
-    VkRect2D scissor = { {0, 0}, {width, height} };
+    VkViewport viewport = { 0, 0, (float)dst_width, (float)dst_height, 0.0f, 1.0f };
+    VkRect2D scissor = { {0, 0}, {dst_width, dst_height} };
     VkPipelineViewportStateCreateInfo vp = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
         .viewportCount = 1,
@@ -2578,22 +2594,19 @@ int vfmcap_vk_init(VulkanCtx **vk_out, uint32_t width, uint32_t height,
                                        NULL, &vk->predecode_gfx_pipeline_p010_uv);
     VK_CHECK(result, "vkCreateGraphicsPipelines(predecode P010 UV)");
 
-    /* Create output pools based on requested format */
+    /* Create output pools based on requested format (at target resolution) */
     if (fmt == VFMCAP_VK_FMT_NV12 || fmt == VFMCAP_VK_FMT_NV21) {
-        if (output_pool_create(vk, 4, width, height, VK_FORMAT_R8_UNORM,
+        if (output_pool_create(vk, 4, dst_width, dst_height, VK_FORMAT_R8_UNORM,
                                &vk->pool_nv12_y) != 0 ||
-            output_pool_create(vk, 4, width / 2, height / 2, VK_FORMAT_R8G8_UNORM,
+            output_pool_create(vk, 4, dst_width / 2, dst_height / 2, VK_FORMAT_R8G8_UNORM,
                                &vk->pool_nv12_uv) != 0) {
             vfmcap_vk_cleanup(vk);
             return -1;
         }
     } else if (fmt == VFMCAP_VK_FMT_P010) {
-        /* Mali-G52 cannot create DMA-buf-exportable VkImages for R16_UNORM /
-         * R16G16_UNORM.  Use copyout pools: render to internal image, then
-         * vkCmdCopyImageToBuffer into a DMA-buf backed VkBuffer. */
-        if (output_pool_create_copyout(vk, 4, width, height, VK_FORMAT_R16_UNORM,
+        if (output_pool_create_copyout(vk, 4, dst_width, dst_height, VK_FORMAT_R16_UNORM,
                                        &vk->pool_p010_y) != 0 ||
-            output_pool_create_copyout(vk, 4, width / 2, height / 2, VK_FORMAT_R16G16_UNORM,
+            output_pool_create_copyout(vk, 4, dst_width / 2, dst_height / 2, VK_FORMAT_R16G16_UNORM,
                                        &vk->pool_p010_uv) != 0) {
             vfmcap_vk_cleanup(vk);
             return -1;
@@ -2608,7 +2621,7 @@ int vfmcap_vk_init(VulkanCtx **vk_out, uint32_t width, uint32_t height,
     }
 
     /* Create Strategy A intermediate images (compute writes, fragment reads) */
-    if (create_internal_image(vk, width, height, VK_FORMAT_R16_UNORM,
+    if (create_internal_image(vk, src_width, src_height, VK_FORMAT_R16_UNORM,
                               VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                               &vk->predecode_y_image, &vk->predecode_y_memory,
                               &vk->predecode_y_view) != 0) {
@@ -2617,7 +2630,7 @@ int vfmcap_vk_init(VulkanCtx **vk_out, uint32_t width, uint32_t height,
         vfmcap_vk_cleanup(vk);
         return -1;
     }
-    if (create_internal_image(vk, width / 2, height / 2, VK_FORMAT_R16G16_UNORM,
+    if (create_internal_image(vk, src_width / 2, src_height / 2, VK_FORMAT_R16G16_UNORM,
                               VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                               &vk->predecode_uv_image, &vk->predecode_uv_memory,
                               &vk->predecode_uv_view) != 0) {
@@ -2674,8 +2687,8 @@ int vfmcap_vk_init(VulkanCtx **vk_out, uint32_t width, uint32_t height,
     vk->initialized = 1;
     vk->frame_count = 0;
 
-    fprintf(stderr, "[vfmcap-vk] Initialized: %ux%u, P010+NV12+GFX pipelines ready\n",
-            width, height);
+    fprintf(stderr, "[vfmcap-vk] Initialized: %ux%u -> %ux%u, P010+NV12+GFX pipelines ready\n",
+            src_width, src_height, dst_width, dst_height);
 
     return 0;
 }

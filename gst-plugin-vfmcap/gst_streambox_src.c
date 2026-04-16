@@ -2202,9 +2202,15 @@ create_path_a(GstStreamboxSrc *self, GstBuffer **buf)
             vfmcap_release_frame(self->cap_ctx, &frame);
             return GST_FLOW_ERROR;
         }
+        gsize plane2_size;
+        if (frame.pixelformat == V4L2_PIX_FMT_NV12)
+            plane2_size = (gsize)frame.width * frame.height / 2;
+        else if (frame.pixelformat == v4l2_fourcc('P', '0', '1', '0'))
+            plane2_size = (gsize)frame.width * frame.height * 2;
+        else
+            plane2_size = frame.size / 2;
         dmabuf_alloc = gst_dmabuf_allocator_new();
-        GstMemory *mem2 = gst_dmabuf_allocator_alloc(dmabuf_alloc, dup_fd2,
-                                                      frame.size / 2); /* approximate */
+        GstMemory *mem2 = gst_dmabuf_allocator_alloc(dmabuf_alloc, dup_fd2, plane2_size);
         gst_object_unref(dmabuf_alloc);
         if (!mem2) {
             GST_ERROR_OBJECT(self, "Failed to wrap DMA-buf fd2 as GstMemory");

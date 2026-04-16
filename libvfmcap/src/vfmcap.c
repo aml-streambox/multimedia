@@ -888,6 +888,43 @@ again:
             frame->drm_modifier = out_modifier;
             frame->priv = priv;
         }
+        /* 10-bit input -> AFBC A2B10G10R10 via TBDR pipeline */
+        else if (ctx->bitdepth == 10 && vk_fmt == VFMCAP_VK_FMT_A2B10G10R10_AFBC) {
+            int out_fd = -1;
+            uint64_t out_modifier = 0;
+            int ret = vfmcap_vk_render_10bit_afbc_a2b10g10r10_and_wait(ctx->vk, dmabuf_req.fd,
+                                                                        ctx->width, ctx->height,
+                                                                        dst_w, dst_h,
+                                                                        &out_fd, &out_modifier);
+            if (ret != 0) {
+                snprintf(ctx->last_error, sizeof(ctx->last_error),
+                         "Vulkan 10-bit AFBC A2B10G10R10 render failed: %s", vfmcap_vk_last_error(ctx->vk));
+                close(dmabuf_req.fd);
+                xioctl(ctx->fd, VIDIOC_QBUF, &buf);
+                return VFMCAP_ERR_VULKAN;
+            }
+
+            vfmcap_frame_priv_t *priv = calloc(1, sizeof(*priv));
+            if (!priv) {
+                vfmcap_vk_release_afbc_output(ctx->vk, out_fd, vk_fmt);
+                close(dmabuf_req.fd);
+                xioctl(ctx->fd, VIDIOC_QBUF, &buf);
+                return VFMCAP_ERR_NOMEM;
+            }
+            priv->vdin_fd = dmabuf_req.fd;
+            priv->out_y_fd = out_fd;
+            priv->out_uv_fd = -1;
+            priv->vk_fmt = vk_fmt;
+
+            frame->dmabuf_fd = out_fd;
+            frame->dmabuf_fd2 = -1;
+            frame->width = dst_w;
+            frame->height = dst_h;
+            frame->size = vfmcap_output_size(dst_w, dst_h, ctx->config.output_format);
+            frame->pixelformat = v4l2_fourcc('A', 'B', '3', '0');
+            frame->drm_modifier = out_modifier;
+            frame->priv = priv;
+        }
     }
 
     /* Handle reconfig notification */
@@ -906,7 +943,8 @@ void vfmcap_release_frame(vfmcap_ctx_t *ctx, vfmcap_frame_t *frame)
     if (frame->priv) {
         vfmcap_frame_priv_t *priv = (vfmcap_frame_priv_t *)frame->priv;
         if (ctx->vk) {
-            if (priv->vk_fmt == VFMCAP_VK_FMT_NV12_AFBC)
+            if (priv->vk_fmt == VFMCAP_VK_FMT_NV12_AFBC ||
+                priv->vk_fmt == VFMCAP_VK_FMT_A2B10G10R10_AFBC)
                 vfmcap_vk_release_afbc_output(ctx->vk, priv->out_y_fd, priv->vk_fmt);
             else
                 vfmcap_vk_release_output(ctx->vk, priv->out_y_fd, priv->out_uv_fd, priv->vk_fmt);

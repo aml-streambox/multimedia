@@ -578,7 +578,7 @@ int main(int argc, char *argv[])
     const char *device = NULL;
     const char *output_path = NULL;
     int num_frames = 100;
-    int do_p010 = 0, do_nv12 = 0, do_nv12_afbc = 0;
+    int do_p010 = 0, do_nv12 = 0, do_nv12_afbc = 0, do_a2b10_afbc = 0;
     int do_profile = 0;
     int color_mode = 0;  /* 0=passthrough, 1=HDR10->SDR, 2=HLG->SDR */
     int target_w = 0, target_h = 0;
@@ -600,6 +600,7 @@ int main(int argc, char *argv[])
             if (strcmp(optarg, "p010") == 0) do_p010 = 1;
             else if (strcmp(optarg, "nv12") == 0) do_nv12 = 1;
             else if (strcmp(optarg, "nv12-afbc") == 0) do_nv12_afbc = 1;
+            else if (strcmp(optarg, "a2b10g10r10-afbc") == 0) do_a2b10_afbc = 1;
             else if (strcmp(optarg, "both") == 0) { do_p010 = 1; do_nv12 = 1; }
             else {
                 fprintf(stderr, "Unknown convert format: %s\n", optarg);
@@ -636,10 +637,10 @@ int main(int argc, char *argv[])
         case 'h':
         default:
             fprintf(stderr,
-                "Usage: %s [-d device] [-n frames] [-c p010|nv12|nv12-afbc|both] [-o outfile] [-r rawfile] [-m pass|hdr10|hlg] [-W width] [-H height] [-F fps] [-p]\n"
+                "Usage: %s [-d device] [-n frames] [-c p010|nv12|nv12-afbc|a2b10g10r10-afbc|both] [-o outfile] [-r rawfile] [-m pass|hdr10|hlg] [-W width] [-H height] [-F fps] [-p]\n"
                 "  -d  Device path (default: /dev/video_cap)\n"
                 "  -n  Number of frames to capture (default: 100)\n"
-                "  -c  GPU convert: p010, nv12, nv12-afbc, or both\n"
+                "  -c  GPU convert: p010, nv12, nv12-afbc, a2b10g10r10-afbc, or both\n"
                 "  -o  Dump converted frame to file (raw P010/NV12)\n"
                 "  -r  Dump raw AMLY input frame to file\n"
                 "  -m  Color mode: pass (default), hdr10 (HDR10->SDR), hlg (HLG->SDR)\n"
@@ -658,9 +659,9 @@ int main(int argc, char *argv[])
     fprintf(stderr, "=== vfmcap-demo ===\n");
     fprintf(stderr, "Device: %s\n", device ? device : "(default)");
     fprintf(stderr, "Frames: %d\n", num_frames);
-    fprintf(stderr, "Convert: %s%s%s\n",
-                do_p010 ? "P010 " : "", do_nv12 ? "NV12 " : "", do_nv12_afbc ? "NV12-AFBC " : "",
-                (!do_p010 && !do_nv12 && !do_nv12_afbc) ? "none" : "");
+    fprintf(stderr, "Convert: %s%s%s%s%s\n",
+                do_p010 ? "P010 " : "", do_nv12 ? "NV12 " : "", do_nv12_afbc ? "NV12-AFBC " : "", do_a2b10_afbc ? "A2B10G10R10-AFBC " : "",
+                (!do_p010 && !do_nv12 && !do_nv12_afbc && !do_a2b10_afbc) ? "none" : "");
     if (color_mode) fprintf(stderr, "Color: %s\n",
                             color_mode == 1 ? "HDR10->SDR" :
                             color_mode == 2 ? "HLG->SDR" : "unknown");
@@ -671,6 +672,7 @@ int main(int argc, char *argv[])
     /* Open */
     vfmcap_config_t cfg = {0};
     if (do_p010) cfg.output_format = VFMCAP_FMT_P010;
+    else if (do_a2b10_afbc) cfg.output_format = VFMCAP_FMT_A2B10G10R10_AFBC;
     else if (do_nv12_afbc) cfg.output_format = VFMCAP_FMT_NV12_AFBC;
     else if (do_nv12) cfg.output_format = VFMCAP_FMT_NV12;
     else cfg.output_format = VFMCAP_FMT_RAW;

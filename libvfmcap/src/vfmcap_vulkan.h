@@ -183,6 +183,14 @@ int vfmcap_vk_render_10bit_afbc_nv12_and_wait(VulkanCtx *vk, int in_fd,
                                                 int *out_fd, uint64_t *out_modifier);
 
 /**
+ * vfmcap_vk_render_10bit_afbc_a2b10g10r10_and_wait - Render AMLY to AFBC A2B10G10R10 output (10-bit input)
+ */
+int vfmcap_vk_render_10bit_afbc_a2b10g10r10_and_wait(VulkanCtx *vk, int in_fd,
+                                                       uint32_t src_width, uint32_t src_height,
+                                                       uint32_t dst_width, uint32_t dst_height,
+                                                       int *out_fd, uint64_t *out_modifier);
+
+/**
  * vfmcap_vk_release_afbc_output - Release AFBC output pool entry
  */
 void vfmcap_vk_release_afbc_output(VulkanCtx *vk, int fd, vfmcap_vk_fmt_t fmt);

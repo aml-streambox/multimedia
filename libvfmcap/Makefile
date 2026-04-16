@@ -56,7 +56,8 @@ src/vfmcap_vulkan.o: shaders/amly_to_p010_spv.h shaders/amly_to_nv12_spv.h \
     shaders/nv12_y_from_r16.frag_spv.h shaders/nv12_uv_from_r16g16.frag_spv.h \
     shaders/p010_y_from_r16.frag_spv.h shaders/p010_uv_from_r16g16.frag_spv.h \
     shaders/amly_p010_y_spv.h shaders/amly_p010_uv_spv.h \
-    shaders/amly_nv12_y_spv.h shaders/amly_nv12_uv_spv.h
+    shaders/amly_nv12_y_spv.h shaders/amly_nv12_uv_spv.h \
+    shaders/amly_a2b10g10r10_spv.h
 
 clean:
 	rm -f $(LIB_OBJS) $(DEMO_OBJS) $(LIB_TARGET) $(DEMO_TARGET)

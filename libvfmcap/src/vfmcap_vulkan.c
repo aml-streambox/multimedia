@@ -193,6 +193,7 @@ typedef struct {
     uint32_t        height;
     VkFormat        format;
     uint64_t        modifier;
+    uint32_t        plane0_offset;
     int             valid;
     uint64_t        last_used;
 } ImageCacheEntry;
@@ -329,6 +330,8 @@ struct VulkanCtx {
     /* Ycbcr sampler for NV12/NV21 input images */
     VkSampler               ycbcr_sampler;
     VkSamplerYcbcrConversion ycbcr_conversion;
+    VkSampler               ycbcr_sampler_422;
+    VkSamplerYcbcrConversion ycbcr_conversion_422;
 
     /* Regular linear sampler for 10-bit intermediate */
     VkSampler               regular_sampler;
@@ -387,6 +390,41 @@ static int find_memory_type(VulkanCtx *vk, uint32_t type_filter, VkMemoryPropert
         }
     }
     return -1;
+}
+
+static void log_afbc_import_support(VulkanCtx *vk, VkFormat format, uint64_t modifier,
+                                    uint32_t width, uint32_t height)
+{
+    VkPhysicalDeviceImageDrmFormatModifierInfoEXT mod_info = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT,
+        .drmFormatModifier = modifier,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+    VkPhysicalDeviceExternalImageFormatInfo ext_info = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
+        .pNext = &mod_info,
+        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+    };
+    VkPhysicalDeviceImageFormatInfo2 fmt_info = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
+        .pNext = &ext_info,
+        .format = format,
+        .type = VK_IMAGE_TYPE_2D,
+        .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+        .flags = 0,
+    };
+    VkImageFormatProperties2 props = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
+    };
+    VkResult result = vkGetPhysicalDeviceImageFormatProperties2(vk->physical_device,
+                                                                &fmt_info, &props);
+
+    fprintf(stderr,
+            "[vfmcap-vk] AFBC support probe: format=%d modifier=%#llx size=%ux%u result=%d max=%ux%u\n",
+            format, (unsigned long long)modifier, width, height, result,
+            props.imageFormatProperties.maxExtent.width,
+            props.imageFormatProperties.maxExtent.height);
 }
 
 /* ---------- DMA-buf import ---------- */
@@ -466,7 +504,7 @@ static int import_dmabuf(VulkanCtx *vk, int fd, VkDeviceSize size, VkBuffer *buf
 /* ---------- DMA-buf VkImage import ---------- */
 
 static int import_dmabuf_image(VulkanCtx *vk, int fd, uint32_t width, uint32_t height,
-                               VkFormat format, uint64_t modifier,
+                               VkFormat format, uint64_t modifier, uint32_t plane0_offset,
                                VkImage *image, VkDeviceMemory *memory, VkImageView *view)
 {
     VkExternalMemoryImageCreateInfo ext_mem_info = {
@@ -489,16 +527,15 @@ static int import_dmabuf_image(VulkanCtx *vk, int fd, uint32_t width, uint32_t h
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
     };
 
-    VkImageDrmFormatModifierExplicitCreateInfoEXT modifier_info = {0};
-    uint32_t drm_plane_count = 1;
-    VkSubresourceLayout plane_layouts[4] = {0};
+    VkImageDrmFormatModifierListCreateInfoEXT modifier_list = {0};
 
     if (modifier != 0) {
-        modifier_info.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT;
-        modifier_info.drmFormatModifier = modifier;
-        modifier_info.drmFormatModifierPlaneCount = drm_plane_count;
-        modifier_info.pPlaneLayouts = plane_layouts;
-        image_info.pNext = &modifier_info;
+        (void)plane0_offset;
+        modifier_list.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT;
+        modifier_list.drmFormatModifierCount = 1;
+        modifier_list.pDrmFormatModifiers = &modifier;
+        modifier_list.pNext = &ext_mem_info;
+        image_info.pNext = &modifier_list;
     }
 
     VkResult result = vkCreateImage(vk->device, &image_info, NULL, image);
@@ -990,7 +1027,7 @@ static void image_cache_entry_destroy(VulkanCtx *vk, ImageCacheEntry *entry)
 }
 
 static int image_cache_get(VulkanCtx *vk, int fd, uint32_t width, uint32_t height,
-                           VkFormat format, uint64_t modifier,
+                           VkFormat format, uint64_t modifier, uint32_t plane0_offset,
                            VkImage *image, VkImageView *view)
 {
     ino_t fd_ino = get_fd_inode(fd);
@@ -1000,7 +1037,8 @@ static int image_cache_get(VulkanCtx *vk, int fd, uint32_t width, uint32_t heigh
             vk->image_cache[i].width == width &&
             vk->image_cache[i].height == height &&
             vk->image_cache[i].format == format &&
-            vk->image_cache[i].modifier == modifier) {
+            vk->image_cache[i].modifier == modifier &&
+            vk->image_cache[i].plane0_offset == plane0_offset) {
             if (fd_ino != 0 && vk->image_cache[i].inode != 0 &&
                 vk->image_cache[i].inode != fd_ino) {
                 image_cache_entry_destroy(vk, &vk->image_cache[i]);
@@ -1011,6 +1049,7 @@ static int image_cache_get(VulkanCtx *vk, int fd, uint32_t width, uint32_t heigh
                     return -1;
                 }
                 if (import_dmabuf_image(vk, fd_dup, width, height, format, modifier,
+                                        plane0_offset,
                                         &vk->image_cache[i].image,
                                         &vk->image_cache[i].memory,
                                         &vk->image_cache[i].view) != 0) {
@@ -1023,6 +1062,7 @@ static int image_cache_get(VulkanCtx *vk, int fd, uint32_t width, uint32_t heigh
                 vk->image_cache[i].height = height;
                 vk->image_cache[i].format = format;
                 vk->image_cache[i].modifier = modifier;
+                vk->image_cache[i].plane0_offset = plane0_offset;
                 vk->image_cache[i].valid = 1;
                 vk->image_cache[i].last_used = vk->frame_count;
                 *image = vk->image_cache[i].image;
@@ -1058,6 +1098,7 @@ static int image_cache_get(VulkanCtx *vk, int fd, uint32_t width, uint32_t heigh
     }
 
     if (import_dmabuf_image(vk, fd_dup, width, height, format, modifier,
+                            plane0_offset,
                             &vk->image_cache[slot].image,
                             &vk->image_cache[slot].memory,
                             &vk->image_cache[slot].view) != 0) {
@@ -1071,6 +1112,7 @@ static int image_cache_get(VulkanCtx *vk, int fd, uint32_t width, uint32_t heigh
     vk->image_cache[slot].height = height;
     vk->image_cache[slot].format = format;
     vk->image_cache[slot].modifier = modifier;
+    vk->image_cache[slot].plane0_offset = plane0_offset;
     vk->image_cache[slot].valid = 1;
     vk->image_cache[slot].last_used = vk->frame_count;
 
@@ -2243,6 +2285,52 @@ int vfmcap_vk_init(VulkanCtx **vk_out, uint32_t src_width, uint32_t src_height,
         vk->ycbcr_sampler = VK_NULL_HANDLE;
     }
 
+    /* Ycbcr sampler for vdin0 AFBC source images. */
+    VkSamplerYcbcrConversionCreateInfo ycbcr_422_info = {
+        .sType = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_CREATE_INFO,
+        .format = VK_FORMAT_G8B8G8R8_422_UNORM,
+        .ycbcrModel = VK_SAMPLER_YCBCR_MODEL_CONVERSION_YCBCR_601,
+        .ycbcrRange = VK_SAMPLER_YCBCR_RANGE_ITU_FULL,
+        .components = {
+            .r = VK_COMPONENT_SWIZZLE_IDENTITY,
+            .g = VK_COMPONENT_SWIZZLE_IDENTITY,
+            .b = VK_COMPONENT_SWIZZLE_IDENTITY,
+            .a = VK_COMPONENT_SWIZZLE_IDENTITY,
+        },
+        .xChromaOffset = VK_CHROMA_LOCATION_COSITED_EVEN,
+        .yChromaOffset = VK_CHROMA_LOCATION_COSITED_EVEN,
+        .chromaFilter = VK_FILTER_LINEAR,
+        .forceExplicitReconstruction = VK_FALSE,
+    };
+
+    result = vkCreateSamplerYcbcrConversion(vk->device, &ycbcr_422_info, NULL,
+                                            &vk->ycbcr_conversion_422);
+    if (result != VK_SUCCESS) {
+        vk->ycbcr_conversion_422 = VK_NULL_HANDLE;
+    }
+
+    VkSamplerYcbcrConversionInfo ycbcr_sampler_422_info = {
+        .sType = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO,
+        .conversion = vk->ycbcr_conversion_422,
+    };
+
+    VkSamplerCreateInfo sampler_422_info = {
+        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        .pNext = (vk->ycbcr_conversion_422 != VK_NULL_HANDLE) ? &ycbcr_sampler_422_info : NULL,
+        .magFilter = VK_FILTER_LINEAR,
+        .minFilter = VK_FILTER_LINEAR,
+        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+        .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK,
+    };
+
+    result = vkCreateSampler(vk->device, &sampler_422_info, NULL, &vk->ycbcr_sampler_422);
+    if (result != VK_SUCCESS) {
+        vk->ycbcr_sampler_422 = VK_NULL_HANDLE;
+    }
+
     /* Graphics descriptor set layout: combined image sampler at binding 0 */
     VkDescriptorSetLayoutBinding gfx_bindings[] = {
         { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
@@ -3291,7 +3379,7 @@ int vfmcap_vk_render_submit(VulkanCtx *vk, int in_fd,
     VkImageView in_view;
     VkFormat in_fmt = (fmt == VFMCAP_VK_FMT_NV21) ? VK_FORMAT_G8_B8R8_2PLANE_420_UNORM
                                                     : VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
-    if (image_cache_get(vk, in_fd, src_width, src_height, in_fmt, 0,
+    if (image_cache_get(vk, in_fd, src_width, src_height, in_fmt, 0, 0,
                         &in_image, &in_view) != 0) {
         return -1;
     }
@@ -3299,11 +3387,11 @@ int vfmcap_vk_render_submit(VulkanCtx *vk, int in_fd,
     /* Import output DMA-buf fds as VkImages */
     VkImage out_y_image, out_uv_image;
     VkImageView out_y_view, out_uv_view;
-    if (image_cache_get(vk, out_y_fd, dst_width, dst_height, out_y_fmt, 0,
+    if (image_cache_get(vk, out_y_fd, dst_width, dst_height, out_y_fmt, 0, 0,
                         &out_y_image, &out_y_view) != 0) {
         return -1;
     }
-    if (image_cache_get(vk, out_uv_fd, dst_width / 2, dst_height / 2, out_uv_fmt, 0,
+    if (image_cache_get(vk, out_uv_fd, dst_width / 2, dst_height / 2, out_uv_fmt, 0, 0,
                         &out_uv_image, &out_uv_view) != 0) {
         return -1;
     }
@@ -3540,7 +3628,7 @@ int vfmcap_vk_render_afbc_nv12_and_wait(VulkanCtx *vk, int in_fd,
     VkImage in_image;
     VkImageView in_view;
     if (image_cache_get(vk, in_fd, src_width, src_height,
-                        VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, 0,
+                        VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, 0, 0,
                         &in_image, &in_view) != 0) {
         output_pool_release(afbc_pool, entry);
         return -1;
@@ -3801,6 +3889,355 @@ int vfmcap_vk_render_and_wait(VulkanCtx *vk, int in_fd,
 
     ret = vfmcap_vk_convert_wait(vk);
     if (ret != 0) {
+        output_pool_release(y_pool, y_entry);
+        output_pool_release(uv_pool, uv_entry);
+        return -1;
+    }
+
+    *out_y_fd = y_entry->dmabuf_fd;
+    *out_uv_fd = uv_entry->dmabuf_fd;
+    return 0;
+}
+
+int vfmcap_vk_render_afbc_input_and_wait(VulkanCtx *vk, int in_fd,
+                                         uint32_t src_width, uint32_t src_height,
+                                         uint64_t modifier, uint32_t header_offset,
+                                         uint32_t table_offset,
+                                         uint32_t dst_width, uint32_t dst_height,
+                                         vfmcap_vk_fmt_t fmt,
+                                         int *out_y_fd, int *out_uv_fd)
+{
+    VkPipeline y_pipeline, uv_pipeline;
+    OutputPool *y_pool = NULL;
+    OutputPool *uv_pool = NULL;
+
+    if (!vk || !vk->initialized) {
+        if (vk)
+            snprintf(vk->last_error, sizeof(vk->last_error), "Not initialized");
+        return -1;
+    }
+
+    if (header_offset != 0 && table_offset <= header_offset) {
+        snprintf(vk->last_error, sizeof(vk->last_error),
+                 "Invalid AFBC layout offsets: header=%u table=%u",
+                 header_offset, table_offset);
+        return -1;
+    }
+
+    log_afbc_import_support(vk, VK_FORMAT_G8B8G8R8_422_UNORM,
+                            modifier, src_width, src_height);
+    log_afbc_import_support(vk, VK_FORMAT_G10X6B10X6G10X6R10X6_422_UNORM_4PACK16,
+                            modifier, src_width, src_height);
+    log_afbc_import_support(vk, VK_FORMAT_B10X6G10X6R10X6G10X6_422_UNORM_4PACK16,
+                            modifier, src_width, src_height);
+
+    if (fmt == VFMCAP_VK_FMT_NV12 || fmt == VFMCAP_VK_FMT_NV21) {
+        y_pipeline = vk->gfx_pipeline_nv12_y;
+        uv_pipeline = vk->gfx_pipeline_nv12_uv;
+        y_pool = &vk->pool_nv12_y;
+        uv_pool = &vk->pool_nv12_uv;
+    } else if (fmt == VFMCAP_VK_FMT_P010) {
+        y_pipeline = vk->gfx_pipeline_p010_y;
+        uv_pipeline = vk->gfx_pipeline_p010_uv;
+        y_pool = &vk->pool_p010_y;
+        uv_pool = &vk->pool_p010_uv;
+    } else {
+        snprintf(vk->last_error, sizeof(vk->last_error),
+                 "Unsupported AFBC input render format");
+        return -1;
+    }
+
+    VkImage in_image;
+    VkImageView in_view;
+    if (image_cache_get(vk, in_fd, src_width, src_height,
+                        VK_FORMAT_G8B8G8R8_422_UNORM,
+                        modifier, header_offset,
+                        &in_image, &in_view) != 0) {
+        return -1;
+    }
+
+    struct dma_buf_sync sync_start_rd = {
+        .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ,
+    };
+    ioctl(in_fd, DMA_BUF_IOCTL_SYNC, &sync_start_rd);
+
+    OutputPoolEntry *y_entry = output_pool_acquire(y_pool);
+    OutputPoolEntry *uv_entry = output_pool_acquire(uv_pool);
+    if (!y_entry || !uv_entry) {
+        if (y_entry) output_pool_release(y_pool, y_entry);
+        if (uv_entry) output_pool_release(uv_pool, uv_entry);
+        snprintf(vk->last_error, sizeof(vk->last_error), "Output pool exhausted");
+        return -1;
+    }
+
+    VkImage out_y_image = y_entry->image;
+    VkImageView out_y_view = y_entry->view;
+    VkImage out_uv_image = uv_entry->image;
+    VkImageView out_uv_view = uv_entry->view;
+    int uses_copyout = y_entry->has_copy_buffer;
+
+    VkResult result;
+    if (vk->frame_count == 0)
+        vkResetFences(vk->device, 1, &vk->fence);
+
+    VkCommandBuffer cmd = vk->command_buffer;
+    result = vkResetCommandPool(vk->device, vk->command_pool, 0);
+    VK_CHECK(result, "vkResetCommandPool(afbc-input)");
+
+    VkCommandBufferBeginInfo begin_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    result = vkBeginCommandBuffer(cmd, &begin_info);
+    VK_CHECK(result, "vkBeginCommandBuffer(afbc-input)");
+
+    VkDescriptorImageInfo in_img_info = {
+        .sampler = vk->ycbcr_sampler_422,
+        .imageView = in_view,
+        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+    };
+    VkWriteDescriptorSet gfx_write = {
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = vk->gfx_descriptor_set,
+        .dstBinding = 0,
+        .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+        .pImageInfo = &in_img_info,
+    };
+    vkUpdateDescriptorSets(vk->device, 1, &gfx_write, 0, NULL);
+
+    VkImageMemoryBarrier in_barrier = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = 0,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        .image = in_image,
+        .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0, .levelCount = 1,
+            .baseArrayLayer = 0, .layerCount = 1,
+        },
+    };
+    VkImageMemoryBarrier out_y_barrier = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = 0,
+        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .image = out_y_image,
+        .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0, .levelCount = 1,
+            .baseArrayLayer = 0, .layerCount = 1,
+        },
+    };
+    VkImageMemoryBarrier barriers1[] = { in_barrier, out_y_barrier };
+    vkCmdPipelineBarrier(cmd,
+                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         0, 0, NULL, 0, NULL, 2, barriers1);
+
+    {
+        VkRenderingAttachmentInfo y_attach = {
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .imageView = out_y_view,
+            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+        };
+        VkRenderingInfo y_render = {
+            .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+            .renderArea = { {0, 0}, {dst_width, dst_height} },
+            .layerCount = 1,
+            .colorAttachmentCount = 1,
+            .pColorAttachments = &y_attach,
+        };
+
+        vk->cmd_begin_rendering(cmd, &y_render);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, y_pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                vk->gfx_pipeline_layout, 0, 1,
+                                &vk->gfx_descriptor_set, 0, NULL);
+        VkViewport viewport_y = { 0.0f, 0.0f, (float)dst_width, (float)dst_height, 0.0f, 1.0f };
+        VkRect2D scissor_y = { {0, 0}, {dst_width, dst_height} };
+        vkCmdSetViewport(cmd, 0, 1, &viewport_y);
+        vkCmdSetScissor(cmd, 0, 1, &scissor_y);
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+        vk->cmd_end_rendering(cmd);
+    }
+
+    VkImageLayout y_final_layout = uses_copyout ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+                                                : VK_IMAGE_LAYOUT_GENERAL;
+    VkAccessFlags y_final_access = uses_copyout ? VK_ACCESS_TRANSFER_READ_BIT : 0;
+    VkPipelineStageFlags y_final_stage = uses_copyout ? VK_PIPELINE_STAGE_TRANSFER_BIT
+                                                      : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+
+    VkImageMemoryBarrier y_post = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        .dstAccessMask = y_final_access,
+        .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .newLayout = y_final_layout,
+        .image = out_y_image,
+        .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0, .levelCount = 1,
+            .baseArrayLayer = 0, .layerCount = 1,
+        },
+    };
+    VkImageMemoryBarrier out_uv_barrier = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = 0,
+        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .image = out_uv_image,
+        .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0, .levelCount = 1,
+            .baseArrayLayer = 0, .layerCount = 1,
+        },
+    };
+    VkImageMemoryBarrier barriers2[] = { y_post, out_uv_barrier };
+    vkCmdPipelineBarrier(cmd,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | y_final_stage,
+                         0, 0, NULL, 0, NULL, 2, barriers2);
+
+    {
+        VkRenderingAttachmentInfo uv_attach = {
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .imageView = out_uv_view,
+            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+        };
+        VkRenderingInfo uv_render = {
+            .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+            .renderArea = { {0, 0}, {dst_width / 2, dst_height / 2} },
+            .layerCount = 1,
+            .colorAttachmentCount = 1,
+            .pColorAttachments = &uv_attach,
+        };
+
+        vk->cmd_begin_rendering(cmd, &uv_render);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, uv_pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                vk->gfx_pipeline_layout, 0, 1,
+                                &vk->gfx_descriptor_set, 0, NULL);
+        VkViewport viewport_uv = { 0.0f, 0.0f, (float)(dst_width / 2), (float)(dst_height / 2), 0.0f, 1.0f };
+        VkRect2D scissor_uv = { {0, 0}, {dst_width / 2, dst_height / 2} };
+        vkCmdSetViewport(cmd, 0, 1, &viewport_uv);
+        vkCmdSetScissor(cmd, 0, 1, &scissor_uv);
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+        vk->cmd_end_rendering(cmd);
+    }
+
+    if (uses_copyout) {
+        VkImageMemoryBarrier uv_to_transfer = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .image = out_uv_image,
+            .subresourceRange = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0, .levelCount = 1,
+                .baseArrayLayer = 0, .layerCount = 1,
+            },
+        };
+        vkCmdPipelineBarrier(cmd,
+                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 0, NULL, 0, NULL, 1, &uv_to_transfer);
+
+        VkBufferImageCopy y_copy = {
+            .bufferOffset = 0,
+            .bufferRowLength = dst_width,
+            .bufferImageHeight = dst_height,
+            .imageSubresource = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1,
+            },
+            .imageOffset = {0, 0, 0},
+            .imageExtent = {dst_width, dst_height, 1},
+        };
+        vkCmdCopyImageToBuffer(cmd, out_y_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               y_entry->copy_buffer, 1, &y_copy);
+
+        VkBufferImageCopy uv_copy = {
+            .bufferOffset = 0,
+            .bufferRowLength = dst_width / 2,
+            .bufferImageHeight = dst_height / 2,
+            .imageSubresource = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1,
+            },
+            .imageOffset = {0, 0, 0},
+            .imageExtent = {dst_width / 2, dst_height / 2, 1},
+        };
+        vkCmdCopyImageToBuffer(cmd, out_uv_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               uv_entry->copy_buffer, 1, &uv_copy);
+
+        VkMemoryBarrier transfer_done = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
+        };
+        vkCmdPipelineBarrier(cmd,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             0, 1, &transfer_done, 0, NULL, 0, NULL);
+    } else {
+        VkImageMemoryBarrier uv_to_general = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .image = out_uv_image,
+            .subresourceRange = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0, .levelCount = 1,
+                .baseArrayLayer = 0, .layerCount = 1,
+            },
+        };
+        vkCmdPipelineBarrier(cmd,
+                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             0, 0, NULL, 0, NULL, 1, &uv_to_general);
+    }
+
+    result = vkEndCommandBuffer(cmd);
+    VK_CHECK(result, "vkEndCommandBuffer(afbc-input)");
+
+    if (uses_copyout) {
+        struct dma_buf_sync sync_start_wr = {
+            .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE,
+        };
+        ioctl(y_entry->dmabuf_fd, DMA_BUF_IOCTL_SYNC, &sync_start_wr);
+        ioctl(uv_entry->dmabuf_fd, DMA_BUF_IOCTL_SYNC, &sync_start_wr);
+    }
+
+    VkSubmitInfo submit_info = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &cmd,
+    };
+
+    result = vkQueueSubmit(vk->graphics_queue, 1, &submit_info, vk->fence);
+    VK_CHECK(result, "vkQueueSubmit(afbc-input)");
+
+    vk->pending_in_fd = in_fd;
+    vk->pending_out_fd = y_entry->dmabuf_fd;
+    vk->pending_out_fd2 = uv_entry->dmabuf_fd;
+    vk->has_pending = 1;
+
+    if (vfmcap_vk_convert_wait(vk) != 0) {
         output_pool_release(y_pool, y_entry);
         output_pool_release(uv_pool, uv_entry);
         return -1;
@@ -5287,8 +5724,12 @@ void vfmcap_vk_cleanup(VulkanCtx *vk)
 
     if (vk->fence != VK_NULL_HANDLE)
         vkDestroyFence(vk->device, vk->fence, NULL);
+    if (vk->ycbcr_sampler_422 != VK_NULL_HANDLE)
+        vkDestroySampler(vk->device, vk->ycbcr_sampler_422, NULL);
     if (vk->ycbcr_sampler != VK_NULL_HANDLE)
         vkDestroySampler(vk->device, vk->ycbcr_sampler, NULL);
+    if (vk->ycbcr_conversion_422 != VK_NULL_HANDLE)
+        vkDestroySamplerYcbcrConversion(vk->device, vk->ycbcr_conversion_422, NULL);
     if (vk->ycbcr_conversion != VK_NULL_HANDLE)
         vkDestroySamplerYcbcrConversion(vk->device, vk->ycbcr_conversion, NULL);
     if (vk->regular_sampler != VK_NULL_HANDLE)

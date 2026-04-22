@@ -31,10 +31,25 @@ struct vfm_cap_dmabuf_req {
     __u32 index;
     __s32 fd;
     __u32 size;
-    __u32 reserved;
+    __u32 flags;
+    __u64 drm_modifier;
+    __u64 comp_head_addr;
+    __u64 comp_table_addr;
+    __u64 comp_body_addr;
+    __u32 comp_width;
+    __u32 comp_height;
+    __u32 comp_head_size;
+    __u32 comp_table_size;
+    __u32 comp_body_size;
+    __u32 reserved0;
+    __u32 reserved1;
+    __u32 reserved2;
+    __u32 reserved3;
 };
 
 #define VFM_CAP_IOC_GET_DMABUF _IOWR('V', 192, struct vfm_cap_dmabuf_req)
+
+#define VFM_CAP_DMABUF_FLAG_AFBC (1U << 0)
 
 /* ---------- Private signal info struct (matches kernel header) ---------- */
 
@@ -711,7 +726,7 @@ again:
     frame->sequence = buf.sequence;
     frame->timestamp_us = (uint64_t)buf.timestamp.tv_sec * 1000000ULL +
                           (uint64_t)buf.timestamp.tv_usec;
-    frame->drm_modifier = 0;
+    frame->drm_modifier = dmabuf_req.drm_modifier;
     frame->is_repeated = 0;
     frame->priv = NULL;
 
@@ -738,8 +753,72 @@ again:
         uint32_t dst_h = ctx->config.target_height ? ctx->config.target_height : ctx->height;
         vfmcap_vk_fmt_t vk_fmt = to_vk_fmt(ctx->config.output_format);
 
+        /* AFBC source input from vdin0: kernel repacks as [header][body] standard AFBC. */
+        if ((dmabuf_req.flags & VFM_CAP_DMABUF_FLAG_AFBC) &&
+            dmabuf_req.drm_modifier != 0 &&
+            dmabuf_req.comp_width != 0 &&
+            dmabuf_req.comp_height != 0 &&
+            dmabuf_req.comp_head_size != 0 &&
+            dmabuf_req.comp_body_size != 0 &&
+            (vk_fmt == VFMCAP_VK_FMT_NV12 || vk_fmt == VFMCAP_VK_FMT_P010)) {
+            int out_y_fd = -1, out_uv_fd = -1;
+            fprintf(stderr,
+                    "[vfmcap] AFBC import (repacked): v4l2=%ux%u coded=%ux%u "
+                    "head_size=%u body_size=%u mod=%#llx\n",
+                    ctx->width, ctx->height,
+                    dmabuf_req.comp_width, dmabuf_req.comp_height,
+                    dmabuf_req.comp_head_size,
+                    dmabuf_req.comp_body_size,
+                    (unsigned long long)dmabuf_req.drm_modifier);
+            /*
+             * The kernel DMA-buf is now repacked: [header][body] in standard
+             * ARM AFBC order. Header starts at offset 0, body follows at
+             * head_size. Pass header_offset=0 since the DMA-buf already
+             * has the standard layout.
+             */
+            int ret = vfmcap_vk_render_afbc_input_and_wait(ctx->vk, dmabuf_req.fd,
+                                                           dmabuf_req.comp_width,
+                                                           dmabuf_req.comp_height,
+                                                           dmabuf_req.drm_modifier,
+                                                           0, /* header_offset: 0 (standard layout) */
+                                                           dmabuf_req.comp_head_size, /* table_offset: body starts here */
+                                                           dst_w, dst_h, vk_fmt,
+                                                           &out_y_fd, &out_uv_fd);
+            if (ret != 0) {
+                snprintf(ctx->last_error, sizeof(ctx->last_error),
+                         "Vulkan AFBC input render failed: %s",
+                         vfmcap_vk_last_error(ctx->vk));
+                close(dmabuf_req.fd);
+                xioctl(ctx->fd, VIDIOC_QBUF, &buf);
+                return VFMCAP_ERR_VULKAN;
+            }
+
+            vfmcap_frame_priv_t *priv = calloc(1, sizeof(*priv));
+            if (!priv) {
+                vfmcap_vk_release_output(ctx->vk, out_y_fd, out_uv_fd, vk_fmt);
+                close(dmabuf_req.fd);
+                xioctl(ctx->fd, VIDIOC_QBUF, &buf);
+                return VFMCAP_ERR_NOMEM;
+            }
+            priv->vdin_fd = dmabuf_req.fd;
+            priv->out_y_fd = out_y_fd;
+            priv->out_uv_fd = out_uv_fd;
+            priv->vk_fmt = vk_fmt;
+
+            frame->dmabuf_fd = out_y_fd;
+            frame->dmabuf_fd2 = out_uv_fd;
+            frame->width = dst_w;
+            frame->height = dst_h;
+            frame->size = vfmcap_output_size(dst_w, dst_h, ctx->config.output_format);
+            frame->pixelformat = (vk_fmt == VFMCAP_VK_FMT_NV12) ?
+                                 V4L2_PIX_FMT_NV12 :
+                                 v4l2_fourcc('P', '0', '1', '0');
+            frame->drm_modifier = 0;
+            frame->priv = priv;
+        }
+
         /* For now, only use graphics path for 8-bit input -> NV12/P010 */
-        if (ctx->bitdepth == 8 &&
+        else if (ctx->bitdepth == 8 &&
             (vk_fmt == VFMCAP_VK_FMT_NV12 || vk_fmt == VFMCAP_VK_FMT_P010)) {
             int out_y_fd = -1, out_uv_fd = -1;
             int ret = vfmcap_vk_render_and_wait(ctx->vk, dmabuf_req.fd,

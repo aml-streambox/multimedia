@@ -116,6 +116,29 @@ int vfmcap_vk_render_and_wait(VulkanCtx *vk, int in_fd,
                               int *out_y_fd, int *out_uv_fd);
 
 /**
+ * vfmcap_vk_render_afbc_input_and_wait - Import AFBC source and render to NV12/P010
+ * @vk: Vulkan context
+ * @in_fd: Input DMA-buf fd whose base address matches AFBC body start
+ * @src_width: Source width
+ * @src_height: Source height
+ * @modifier: Source DRM modifier
+ * @header_offset: Byte offset from DMA-buf base (body) to AFBC header region
+ * @table_offset: Byte offset from DMA-buf base (body) to AFBC table region
+ * @dst_width: Output width
+ * @dst_height: Output height
+ * @fmt: Output format (NV12 or P010)
+ * @out_y_fd: Output Y plane DMA-buf fd
+ * @out_uv_fd: Output UV plane DMA-buf fd
+ */
+int vfmcap_vk_render_afbc_input_and_wait(VulkanCtx *vk, int in_fd,
+                                         uint32_t src_width, uint32_t src_height,
+                                         uint64_t modifier, uint32_t header_offset,
+                                         uint32_t table_offset,
+                                         uint32_t dst_width, uint32_t dst_height,
+                                         vfmcap_vk_fmt_t fmt,
+                                         int *out_y_fd, int *out_uv_fd);
+
+/**
  * vfmcap_vk_release_output - Release output pool entries back to pool
  * @vk: Vulkan context
  * @y_fd: Y plane DMA-buf fd

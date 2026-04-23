@@ -131,6 +131,18 @@ typedef void (VKAPI_PTR *PFN_vkCmdEndRenderingKHR)(VkCommandBuffer commandBuffer
 
 #define DMABUF_CACHE_SIZE 2
 
+/* Output pool capacity. Must exceed max in-flight buffers downstream
+ * across the whole pipeline (encoder queue + gst queues + muxer + sink).
+ * With audio added, the muxer holds video frames waiting for matching-PTS
+ * audio, amplifying demand. A brief retry loop in vfmcap_vk_render_and_wait
+ * tolerates transient exhaustion bursts; this capacity is steady-state.
+ * At 4K60 P010: ~16 MB/entry Y + ~8 MB/entry UV, so 8 => ~192 MB total. */
+#define VFMCAP_OUTPUT_POOL_CAPACITY 8
+
+/* Max time to wait for a pool entry to be released by downstream before
+ * giving up. At 60 fps one frame is ~16 ms; 500 ms ~30 frames of grace. */
+#define VFMCAP_OUTPUT_POOL_WAIT_MS  500
+
 #define VK_CHECK(result, msg) do { \
     if (result != VK_SUCCESS) { \
         snprintf(vk->last_error, sizeof(vk->last_error), "%s: %d", msg, result); \
@@ -2989,15 +3001,15 @@ int vfmcap_vk_init(VulkanCtx **vk_out, uint32_t src_width, uint32_t src_height,
 
     /* Create output pools based on requested format (at target resolution) */
     if (fmt == VFMCAP_VK_FMT_NV12 || fmt == VFMCAP_VK_FMT_NV21) {
-        if (output_pool_create(vk, 4, dst_width, dst_height, VK_FORMAT_R8_UNORM,
+        if (output_pool_create(vk, VFMCAP_OUTPUT_POOL_CAPACITY, dst_width, dst_height, VK_FORMAT_R8_UNORM,
                                &vk->pool_nv12_y) != 0 ||
-            output_pool_create(vk, 4, dst_width / 2, dst_height / 2, VK_FORMAT_R8G8_UNORM,
+            output_pool_create(vk, VFMCAP_OUTPUT_POOL_CAPACITY, dst_width / 2, dst_height / 2, VK_FORMAT_R8G8_UNORM,
                                &vk->pool_nv12_uv) != 0) {
             vfmcap_vk_cleanup(vk);
             return -1;
         }
     } else if (fmt == VFMCAP_VK_FMT_NV12_AFBC) {
-        if (output_pool_create_afbc_nv12(vk, 4, dst_width, dst_height,
+        if (output_pool_create_afbc_nv12(vk, VFMCAP_OUTPUT_POOL_CAPACITY, dst_width, dst_height,
                                           &vk->pool_nv12_afbc) != 0) {
             vfmcap_vk_cleanup(vk);
             return -1;
@@ -3006,16 +3018,16 @@ int vfmcap_vk_init(VulkanCtx **vk_out, uint32_t src_width, uint32_t src_height,
         uint64_t afbc_mod = DRM_FORMAT_MOD_ARM_AFBC(AFBC_FORMAT_MOD_BLOCK_SIZE_16x16 |
                                                      AFBC_FORMAT_MOD_SPARSE |
                                                      AFBC_FORMAT_MOD_SPLIT);
-        if (output_pool_create_afbc(vk, 4, dst_width, dst_height,
+        if (output_pool_create_afbc(vk, VFMCAP_OUTPUT_POOL_CAPACITY, dst_width, dst_height,
                                      VK_FORMAT_A2B10G10R10_UNORM_PACK32,
                                      afbc_mod, &vk->pool_a2b10g10r10_afbc) != 0) {
             vfmcap_vk_cleanup(vk);
             return -1;
         }
     } else if (fmt == VFMCAP_VK_FMT_P010) {
-        if (output_pool_create_copyout(vk, 4, dst_width, dst_height, VK_FORMAT_R16_UNORM,
+        if (output_pool_create_copyout(vk, VFMCAP_OUTPUT_POOL_CAPACITY, dst_width, dst_height, VK_FORMAT_R16_UNORM,
                                        &vk->pool_p010_y) != 0 ||
-            output_pool_create_copyout(vk, 4, dst_width / 2, dst_height / 2, VK_FORMAT_R16G16_UNORM,
+            output_pool_create_copyout(vk, VFMCAP_OUTPUT_POOL_CAPACITY, dst_width / 2, dst_height / 2, VK_FORMAT_R16G16_UNORM,
                                        &vk->pool_p010_uv) != 0) {
             vfmcap_vk_cleanup(vk);
             return -1;
@@ -3873,10 +3885,27 @@ int vfmcap_vk_render_and_wait(VulkanCtx *vk, int in_fd,
     OutputPoolEntry *y_entry = output_pool_acquire(y_pool);
     OutputPoolEntry *uv_entry = output_pool_acquire(uv_pool);
     if (!y_entry || !uv_entry) {
+        /* Downstream may briefly hold many buffers (muxer latency, queues,
+         * encoder command queue). Wait up to VFMCAP_OUTPUT_POOL_WAIT_MS
+         * polling for a release before giving up. */
         if (y_entry) output_pool_release(y_pool, y_entry);
         if (uv_entry) output_pool_release(uv_pool, uv_entry);
-        snprintf(vk->last_error, sizeof(vk->last_error), "Output pool exhausted");
-        return -1;
+        int wait_steps = (VFMCAP_OUTPUT_POOL_WAIT_MS * 1000) / 500;  /* 500us per poll */
+        for (int i = 0; i < wait_steps; i++) {
+            usleep(500);
+            y_entry = output_pool_acquire(y_pool);
+            uv_entry = output_pool_acquire(uv_pool);
+            if (y_entry && uv_entry) break;
+            if (y_entry) { output_pool_release(y_pool, y_entry); y_entry = NULL; }
+            if (uv_entry) { output_pool_release(uv_pool, uv_entry); uv_entry = NULL; }
+        }
+        if (!y_entry || !uv_entry) {
+            if (y_entry) output_pool_release(y_pool, y_entry);
+            if (uv_entry) output_pool_release(uv_pool, uv_entry);
+            snprintf(vk->last_error, sizeof(vk->last_error),
+                     "Output pool exhausted after %d ms wait", VFMCAP_OUTPUT_POOL_WAIT_MS);
+            return -1;
+        }
     }
 
     int ret = vfmcap_vk_render_submit(vk, in_fd, y_entry->dmabuf_fd, uv_entry->dmabuf_fd,
@@ -5598,25 +5627,25 @@ int vfmcap_vk_reconfig_pools(VulkanCtx *vk, uint32_t src_width, uint32_t src_hei
     }
 
     if (fmt == VFMCAP_VK_FMT_NV12 || fmt == VFMCAP_VK_FMT_NV21) {
-        if (output_pool_create(vk, 4, dst_width, dst_height, VK_FORMAT_R8_UNORM,
+        if (output_pool_create(vk, VFMCAP_OUTPUT_POOL_CAPACITY, dst_width, dst_height, VK_FORMAT_R8_UNORM,
                                &vk->pool_nv12_y) != 0 ||
-            output_pool_create(vk, 4, dst_width / 2, dst_height / 2, VK_FORMAT_R8G8_UNORM,
+            output_pool_create(vk, VFMCAP_OUTPUT_POOL_CAPACITY, dst_width / 2, dst_height / 2, VK_FORMAT_R8G8_UNORM,
                                &vk->pool_nv12_uv) != 0) {
             snprintf(vk->last_error, sizeof(vk->last_error),
                      "Failed to recreate NV12 pools at %ux%u", dst_width, dst_height);
             return -1;
         }
     } else if (fmt == VFMCAP_VK_FMT_NV12_AFBC) {
-        if (output_pool_create_afbc_nv12(vk, 4, dst_width, dst_height,
+        if (output_pool_create_afbc_nv12(vk, VFMCAP_OUTPUT_POOL_CAPACITY, dst_width, dst_height,
                                           &vk->pool_nv12_afbc) != 0) {
             snprintf(vk->last_error, sizeof(vk->last_error),
                      "Failed to recreate NV12 AFBC pool at %ux%u", dst_width, dst_height);
             return -1;
         }
     } else if (fmt == VFMCAP_VK_FMT_P010) {
-        if (output_pool_create_copyout(vk, 4, dst_width, dst_height, VK_FORMAT_R16_UNORM,
+        if (output_pool_create_copyout(vk, VFMCAP_OUTPUT_POOL_CAPACITY, dst_width, dst_height, VK_FORMAT_R16_UNORM,
                                        &vk->pool_p010_y) != 0 ||
-            output_pool_create_copyout(vk, 4, dst_width / 2, dst_height / 2, VK_FORMAT_R16G16_UNORM,
+            output_pool_create_copyout(vk, VFMCAP_OUTPUT_POOL_CAPACITY, dst_width / 2, dst_height / 2, VK_FORMAT_R16G16_UNORM,
                                        &vk->pool_p010_uv) != 0) {
             snprintf(vk->last_error, sizeof(vk->last_error),
                      "Failed to recreate P010 pools at %ux%u", dst_width, dst_height);

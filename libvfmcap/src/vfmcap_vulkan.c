@@ -217,6 +217,8 @@ typedef struct {
     VkDeviceMemory  memory;
     VkImageView     view;
     VkImageView     view2;           /* Second plane view (UV for multi-planar AFBC) */
+    VkImage         uv_image;        /* UV image for contiguous P010 (bound at uv_offset) */
+    VkDeviceSize    uv_offset;       /* Offset of UV image within shared memory */
     int             dmabuf_fd;       /* DMA-buf fd for image (dmabuf pool) or buffer (copy pool) */
     int             dmabuf_fd2;      /* Second DMA-buf fd (for multi-planar linear outputs) */
     int             vulkan_fd;       /* Dup'd fd passed to vkAllocateMemory (Vulkan import) */
@@ -1248,6 +1250,8 @@ static void output_pool_destroy(VulkanCtx *vk, OutputPool *pool)
             vkDestroyImageView(vk->device, e->view2, NULL);
         if (e->image != VK_NULL_HANDLE)
             vkDestroyImage(vk->device, e->image, NULL);
+        if (e->uv_image != VK_NULL_HANDLE)
+            vkDestroyImage(vk->device, e->uv_image, NULL);
         if (e->memory != VK_NULL_HANDLE)
             vkFreeMemory(vk->device, e->memory, NULL);
         if (e->copy_buffer != VK_NULL_HANDLE)
@@ -1476,27 +1480,49 @@ static int output_pool_create_copyout(VulkanCtx *vk, int capacity, uint32_t widt
     return 0;
 }
 
+static int output_pool_create_p010_contiguous(VulkanCtx *vk, int capacity,
+                                               uint32_t width, uint32_t height,
+                                               OutputPool *pool);
+
 static int output_pool_create_p010(VulkanCtx *vk, int capacity, uint32_t width,
                                    uint32_t height, OutputPool *y_pool,
                                    OutputPool *uv_pool)
 {
     const char *env = getenv("VFMCAP_P010_COPYOUT");
     int copyout_only = env && env[0] == '1';
+    const char *sep_env = getenv("VFMCAP_P010_SEPARATE");
+    int separate_only = sep_env && sep_env[0] == '1';
+
+    memset(uv_pool, 0, sizeof(*uv_pool));
+
+    if (!copyout_only && !separate_only) {
+        fprintf(stderr,
+                "[vfmcap-vk] P010 output strategy: trying contiguous single-dmabuf export\n");
+        if (output_pool_create_p010_contiguous(vk, capacity, width, height, y_pool) == 0) {
+            fprintf(stderr,
+                    "[vfmcap-vk] P010 output strategy: contiguous single-dmabuf export active\n");
+            return 0;
+        }
+        fprintf(stderr,
+                "[vfmcap-vk] P010 contiguous export failed (%s), trying separate planes\n",
+                vk->last_error[0] ? vk->last_error : "unknown error");
+        output_pool_destroy(vk, y_pool);
+    }
 
     if (!copyout_only) {
         fprintf(stderr,
-                "[vfmcap-vk] P010 output strategy: trying direct dma-buf image export\n");
+                "[vfmcap-vk] P010 output strategy: trying separate-plane dma-buf export\n");
         if (output_pool_create(vk, capacity, width, height, VK_FORMAT_R16_UNORM,
                                y_pool) == 0 &&
             output_pool_create(vk, capacity, width / 2, height / 2,
                                VK_FORMAT_R16G16_UNORM, uv_pool) == 0) {
             fprintf(stderr,
-                    "[vfmcap-vk] P010 output strategy: direct dma-buf image export active\n");
+                    "[vfmcap-vk] P010 output strategy: separate-plane export active\n");
             return 0;
         }
 
         fprintf(stderr,
-                "[vfmcap-vk] P010 direct dma-buf image export failed: %s\n",
+                "[vfmcap-vk] P010 separate-plane export failed: %s\n",
                 vk->last_error[0] ? vk->last_error : "unknown error");
         output_pool_destroy(vk, y_pool);
         output_pool_destroy(vk, uv_pool);
@@ -1513,6 +1539,228 @@ static int output_pool_create_p010(VulkanCtx *vk, int capacity, uint32_t width,
         return -1;
     }
 
+    return 0;
+}
+
+static int output_pool_create_p010_contiguous(VulkanCtx *vk, int capacity,
+                                               uint32_t width, uint32_t height,
+                                               OutputPool *pool)
+{
+    memset(pool, 0, sizeof(*pool));
+    pool->entries = calloc(capacity, sizeof(OutputPoolEntry));
+    if (!pool->entries) return -1;
+    pool->capacity = capacity;
+    pool->width = width;
+    pool->height = height;
+    pool->format = VK_FORMAT_R16_UNORM;
+
+    VkExternalMemoryImageCreateInfo ext_mem_info = {
+        .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+    };
+    uint64_t mod_linear = 0;
+    VkImageDrmFormatModifierListCreateInfoEXT modifier_list = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
+        .pNext = &ext_mem_info,
+        .drmFormatModifierCount = 1,
+        .pDrmFormatModifiers = &mod_linear,
+    };
+
+    VkImageCreateInfo y_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .pNext = &modifier_list,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = VK_FORMAT_R16_UNORM,
+        .extent = { width, height, 1 },
+        .mipLevels = 1, .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    VkImageCreateInfo uv_info = y_info;
+    uv_info.format = VK_FORMAT_R16G16_UNORM;
+    uv_info.extent.width = width / 2;
+    uv_info.extent.height = height / 2;
+
+    for (int i = 0; i < capacity; i++) {
+        OutputPoolEntry *e = &pool->entries[i];
+        e->dmabuf_fd = -1;
+        e->dmabuf_fd2 = -1;
+        e->vulkan_fd = -1;
+
+        VkImage y_image = VK_NULL_HANDLE, uv_image = VK_NULL_HANDLE;
+        VkResult result;
+
+        result = vkCreateImage(vk->device, &y_info, NULL, &y_image);
+        if (result != VK_SUCCESS) {
+            y_info.tiling = VK_IMAGE_TILING_LINEAR;
+            y_info.pNext = &ext_mem_info;
+            result = vkCreateImage(vk->device, &y_info, NULL, &y_image);
+            y_info.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+            y_info.pNext = &modifier_list;
+        }
+        if (result != VK_SUCCESS) {
+            snprintf(vk->last_error, sizeof(vk->last_error),
+                     "contiguous P010: vkCreateImage(Y) failed: %d", result);
+            goto fail_entry;
+        }
+
+        result = vkCreateImage(vk->device, &uv_info, NULL, &uv_image);
+        if (result != VK_SUCCESS) {
+            uv_info.tiling = VK_IMAGE_TILING_LINEAR;
+            uv_info.pNext = &ext_mem_info;
+            result = vkCreateImage(vk->device, &uv_info, NULL, &uv_image);
+            uv_info.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+            uv_info.pNext = &modifier_list;
+        }
+        if (result != VK_SUCCESS) {
+            snprintf(vk->last_error, sizeof(vk->last_error),
+                     "contiguous P010: vkCreateImage(UV) failed: %d", result);
+            vkDestroyImage(vk->device, y_image, NULL);
+            goto fail_entry;
+        }
+
+        VkMemoryRequirements y_reqs, uv_reqs;
+        vkGetImageMemoryRequirements(vk->device, y_image, &y_reqs);
+        vkGetImageMemoryRequirements(vk->device, uv_image, &uv_reqs);
+
+        VkDeviceSize y_offset = 0;
+        VkDeviceSize uv_offset = (y_reqs.size + uv_reqs.alignment - 1) & ~(uv_reqs.alignment - 1);
+        VkDeviceSize total_size = uv_offset + uv_reqs.size;
+
+        uint32_t mem_type_bits = y_reqs.memoryTypeBits & uv_reqs.memoryTypeBits;
+        if (mem_type_bits == 0) mem_type_bits = y_reqs.memoryTypeBits;
+
+        int dmabuf_fd = dmabuf_heap_alloc(total_size);
+        if (dmabuf_fd < 0) {
+            snprintf(vk->last_error, sizeof(vk->last_error),
+                     "contiguous P010: dmabuf_heap_alloc(%zu) failed", (size_t)total_size);
+            vkDestroyImage(vk->device, y_image, NULL);
+            vkDestroyImage(vk->device, uv_image, NULL);
+            goto fail_entry;
+        }
+
+        int fd_for_vulkan = dup(dmabuf_fd);
+        if (fd_for_vulkan < 0) {
+            close(dmabuf_fd);
+            vkDestroyImage(vk->device, y_image, NULL);
+            vkDestroyImage(vk->device, uv_image, NULL);
+            goto fail_entry;
+        }
+
+        VkImportMemoryFdInfoKHR import_info = {
+            .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
+            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+            .fd = fd_for_vulkan,
+        };
+        uint32_t mem_type = find_memory_type(vk, mem_type_bits, 0);
+        if (mem_type == (uint32_t)-1) {
+            close(dmabuf_fd);
+            close(fd_for_vulkan);
+            vkDestroyImage(vk->device, y_image, NULL);
+            vkDestroyImage(vk->device, uv_image, NULL);
+            goto fail_entry;
+        }
+
+        VkMemoryAllocateInfo alloc_info = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .pNext = &import_info,
+            .allocationSize = total_size,
+            .memoryTypeIndex = mem_type,
+        };
+
+        VkDeviceMemory memory;
+        result = vkAllocateMemory(vk->device, &alloc_info, NULL, &memory);
+        if (result != VK_SUCCESS) {
+            snprintf(vk->last_error, sizeof(vk->last_error),
+                     "contiguous P010: vkAllocateMemory(%zu) failed: %d",
+                     (size_t)total_size, result);
+            close(dmabuf_fd);
+            vkDestroyImage(vk->device, y_image, NULL);
+            vkDestroyImage(vk->device, uv_image, NULL);
+            goto fail_entry;
+        }
+
+        result = vkBindImageMemory(vk->device, y_image, memory, y_offset);
+        if (result != VK_SUCCESS) {
+            snprintf(vk->last_error, sizeof(vk->last_error),
+                     "contiguous P010: vkBindImageMemory(Y at 0) failed: %d", result);
+            vkFreeMemory(vk->device, memory, NULL);
+            close(dmabuf_fd);
+            vkDestroyImage(vk->device, y_image, NULL);
+            vkDestroyImage(vk->device, uv_image, NULL);
+            goto fail_entry;
+        }
+
+        result = vkBindImageMemory(vk->device, uv_image, memory, uv_offset);
+        if (result != VK_SUCCESS) {
+            snprintf(vk->last_error, sizeof(vk->last_error),
+                     "contiguous P010: vkBindImageMemory(UV at %zu) failed: %d",
+                     (size_t)uv_offset, result);
+            vkFreeMemory(vk->device, memory, NULL);
+            close(dmabuf_fd);
+            vkDestroyImage(vk->device, y_image, NULL);
+            vkDestroyImage(vk->device, uv_image, NULL);
+            goto fail_entry;
+        }
+
+        e->image = y_image;
+        e->memory = memory;
+        e->dmabuf_fd = dmabuf_fd;
+        e->vulkan_fd = -1;
+
+        VkImageViewCreateInfo y_view_info = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .image = y_image,
+            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .format = VK_FORMAT_R16_UNORM,
+            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+        };
+        result = vkCreateImageView(vk->device, &y_view_info, NULL, &e->view);
+        if (result != VK_SUCCESS) {
+            snprintf(vk->last_error, sizeof(vk->last_error),
+                     "contiguous P010: vkCreateImageView(Y) failed: %d", result);
+            vkFreeMemory(vk->device, memory, NULL);
+            close(dmabuf_fd);
+            vkDestroyImage(vk->device, y_image, NULL);
+            vkDestroyImage(vk->device, uv_image, NULL);
+            goto fail_entry;
+        }
+
+        VkImageViewCreateInfo uv_view_info = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .image = uv_image,
+            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .format = VK_FORMAT_R16G16_UNORM,
+            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+        };
+        result = vkCreateImageView(vk->device, &uv_view_info, NULL, &e->view2);
+        if (result != VK_SUCCESS) {
+            snprintf(vk->last_error, sizeof(vk->last_error),
+                     "contiguous P010: vkCreateImageView(UV) failed: %d", result);
+            vkDestroyImageView(vk->device, e->view, NULL);
+            vkFreeMemory(vk->device, memory, NULL);
+            close(dmabuf_fd);
+            vkDestroyImage(vk->device, y_image, NULL);
+            vkDestroyImage(vk->device, uv_image, NULL);
+            goto fail_entry;
+        }
+
+        e->uv_image = uv_image;
+        e->uv_offset = uv_offset;
+        pool->count++;
+        continue;
+
+    fail_entry:
+        output_pool_destroy(vk, pool);
+        return -1;
+    }
+
+    fprintf(stderr,
+            "[vfmcap-vk] P010 contiguous output pool: %d entries, single-dmabuf per entry\n",
+            capacity);
     return 0;
 }
 
@@ -5409,9 +5657,12 @@ int vfmcap_vk_render_10bit_and_wait(VulkanCtx *vk, int in_fd,
     ioctl(in_fd, DMA_BUF_IOCTL_SYNC, &sync_start_rd);
 
     /* Acquire output pool entries only — no intermediates needed */
+    int contiguous = (uv_pool->count == 0);
     OutputPoolEntry *y_entry = output_pool_acquire(y_pool);
-    OutputPoolEntry *uv_entry = output_pool_acquire(uv_pool);
-    if (!y_entry || !uv_entry) {
+    OutputPoolEntry *uv_entry = NULL;
+    if (!contiguous)
+        uv_entry = output_pool_acquire(uv_pool);
+    if (!y_entry || (!contiguous && !uv_entry)) {
         if (y_entry) output_pool_release(y_pool, y_entry);
         if (uv_entry) output_pool_release(uv_pool, uv_entry);
         snprintf(vk->last_error, sizeof(vk->last_error), "Output pool exhausted");
@@ -5420,15 +5671,15 @@ int vfmcap_vk_render_10bit_and_wait(VulkanCtx *vk, int in_fd,
 
     VkImage out_y_image = y_entry->image;
     VkImageView out_y_view = y_entry->view;
-    VkImage out_uv_image = uv_entry->image;
-    VkImageView out_uv_view = uv_entry->view;
+    VkImage out_uv_image = contiguous ? y_entry->uv_image : uv_entry->image;
+    VkImageView out_uv_view = contiguous ? y_entry->view2 : uv_entry->view;
     int uses_copyout = y_entry->has_copy_buffer;
 
     VkResult result;
 
     if (pipeline_init(vk, VFMCAP_OUTPUT_POOL_CAPACITY) != 0) {
         output_pool_release(y_pool, y_entry);
-        output_pool_release(uv_pool, uv_entry);
+        if (uv_entry) output_pool_release(uv_pool, uv_entry);
         return -1;
     }
 
@@ -5439,7 +5690,7 @@ int vfmcap_vk_render_10bit_and_wait(VulkanCtx *vk, int in_fd,
     result = vkResetCommandBuffer(cmd, 0);
     if (result != VK_SUCCESS) {
         output_pool_release(y_pool, y_entry);
-        output_pool_release(uv_pool, uv_entry);
+        if (uv_entry) output_pool_release(uv_pool, uv_entry);
         VK_CHECK(result, "vkResetCommandBuffer(pipeline)");
     }
 
@@ -5448,7 +5699,7 @@ int vfmcap_vk_render_10bit_and_wait(VulkanCtx *vk, int in_fd,
     result = vkResetFences(vk->device, 1, &slot_fence);
     if (result != VK_SUCCESS) {
         output_pool_release(y_pool, y_entry);
-        output_pool_release(uv_pool, uv_entry);
+        if (uv_entry) output_pool_release(uv_pool, uv_entry);
         VK_CHECK(result, "vkResetFences(pipeline)");
     }
 
@@ -5721,7 +5972,7 @@ int vfmcap_vk_render_10bit_and_wait(VulkanCtx *vk, int in_fd,
     result = vkQueueSubmit(vk->graphics_queue, 1, &submit_info, slot_fence);
     if (result != VK_SUCCESS) {
         output_pool_release(y_pool, y_entry);
-        output_pool_release(uv_pool, uv_entry);
+        if (uv_entry) output_pool_release(uv_pool, uv_entry);
         VK_CHECK(result, "vkQueueSubmit(pipeline)");
     }
 
@@ -5730,7 +5981,7 @@ int vfmcap_vk_render_10bit_and_wait(VulkanCtx *vk, int in_fd,
     result = vkWaitForFences(vk->device, 1, &slot_fence, VK_TRUE, UINT64_MAX);
     if (result != VK_SUCCESS) {
         output_pool_release(y_pool, y_entry);
-        output_pool_release(uv_pool, uv_entry);
+        if (uv_entry) output_pool_release(uv_pool, uv_entry);
         snprintf(vk->last_error, sizeof(vk->last_error),
                  "vkWaitForFences(pipeline slot %d) failed: %d", slot, result);
         return -1;
@@ -5750,7 +6001,7 @@ int vfmcap_vk_render_10bit_and_wait(VulkanCtx *vk, int in_fd,
     }
 
     *out_y_fd = y_entry->dmabuf_fd;
-    *out_uv_fd = uv_entry->dmabuf_fd;
+    *out_uv_fd = contiguous ? -1 : uv_entry->dmabuf_fd;
 
     /* Debug one-shot dump: VFMCAP_DUMP_P010=1 dumps first P010 frame after
      * fence wait completes.  Writes raw Y (dst_w*dst_h*2 bytes, R16_UNORM)
@@ -5765,20 +6016,25 @@ int vfmcap_vk_render_10bit_and_wait(VulkanCtx *vk, int in_fd,
         if (env && env[0] == '1' && !dumped && fmt == VFMCAP_VK_FMT_P010) {
             dumped = 1;
             size_t y_sz = (size_t)dst_width * dst_height * 2;
-            size_t uv_sz = (size_t)dst_width * dst_height; /* W/2 * H/2 * 4 bytes */
+            size_t uv_sz = (size_t)dst_width * dst_height;
             void *y_map = mmap(NULL, y_sz, PROT_READ, MAP_SHARED, y_entry->dmabuf_fd, 0);
-            void *uv_map = mmap(NULL, uv_sz, PROT_READ, MAP_SHARED, uv_entry->dmabuf_fd, 0);
+            void *uv_map;
+            if (contiguous) {
+                uv_map = mmap(NULL, uv_sz, PROT_READ, MAP_SHARED,
+                              y_entry->dmabuf_fd, y_entry->uv_offset);
+            } else {
+                uv_map = mmap(NULL, uv_sz, PROT_READ, MAP_SHARED,
+                              uv_entry->dmabuf_fd, 0);
+            }
             if (y_map != MAP_FAILED && uv_map != MAP_FAILED) {
                 struct dma_buf_sync s_start = { .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ };
                 struct dma_buf_sync s_end   = { .flags = DMA_BUF_SYNC_END   | DMA_BUF_SYNC_READ };
                 ioctl(y_entry->dmabuf_fd, DMA_BUF_IOCTL_SYNC, &s_start);
-                ioctl(uv_entry->dmabuf_fd, DMA_BUF_IOCTL_SYNC, &s_start);
                 FILE *yf = fopen("/tmp/vfmcap_dump_y.raw", "wb");
                 FILE *uvf = fopen("/tmp/vfmcap_dump_uv.raw", "wb");
                 if (yf) { fwrite(y_map, 1, y_sz, yf); fclose(yf); }
                 if (uvf) { fwrite(uv_map, 1, uv_sz, uvf); fclose(uvf); }
                 ioctl(y_entry->dmabuf_fd, DMA_BUF_IOCTL_SYNC, &s_end);
-                ioctl(uv_entry->dmabuf_fd, DMA_BUF_IOCTL_SYNC, &s_end);
                 fprintf(stderr, "[vfmcap-vk] DUMPED P010 frame: %ux%u, Y=%zu bytes, UV=%zu bytes\n",
                         dst_width, dst_height, y_sz, uv_sz);
             } else {

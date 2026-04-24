@@ -816,15 +816,22 @@ int main(int argc, char *argv[])
 
                 /* Dump to file if requested */
                 if (output_path) {
-                    char y_path[512], uv_path[512];
-                    snprintf(y_path, sizeof(y_path), "%s.y", output_path);
-                    snprintf(uv_path, sizeof(uv_path), "%s.uv", output_path);
-                    dump_dmabuf_to_file(y_path, frame.dmabuf_fd, y_plane_size);
-                    if (frame.dmabuf_fd2 >= 0) {
-                        uint32_t uv_size = already_p010 ?
-                            frame.width * frame.height :
-                            frame.width * frame.height / 2;
-                        dump_dmabuf_to_file(uv_path, frame.dmabuf_fd2, uv_size);
+                    if (already_p010 && frame.dmabuf_fd2 < 0) {
+                        /* Contiguous P010: one dmabuf, Y at 0, UV at W*H*2 */
+                        uint32_t total = frame.width * frame.height * 3;
+                        dump_dmabuf_to_file(output_path, frame.dmabuf_fd, total);
+                        fprintf(stderr, "  (contiguous P010: Y+UV dumped as single %u-byte file)\n", total);
+                    } else {
+                        char y_path[512], uv_path[512];
+                        snprintf(y_path, sizeof(y_path), "%s.y", output_path);
+                        snprintf(uv_path, sizeof(uv_path), "%s.uv", output_path);
+                        dump_dmabuf_to_file(y_path, frame.dmabuf_fd, y_plane_size);
+                        if (frame.dmabuf_fd2 >= 0) {
+                            uint32_t uv_size = already_p010 ?
+                                frame.width * frame.height :
+                                frame.width * frame.height / 2;
+                            dump_dmabuf_to_file(uv_path, frame.dmabuf_fd2, uv_size);
+                        }
                     }
                 }
                 converted++;

@@ -38,30 +38,48 @@
 
 static int dmabuf_heap_alloc(size_t size)
 {
-    int heap_fd = open("/dev/dma_heap/system", O_RDONLY | O_CLOEXEC);
-    if (heap_fd < 0) {
-        heap_fd = open("/dev/dma_heap/heap-system", O_RDONLY | O_CLOEXEC);
-        if (heap_fd < 0) {
-            fprintf(stderr, "[vfmcap-vk] Failed to open dma_heap: %s\n", strerror(errno));
-            return -1;
-        }
-    }
-
-    struct dma_heap_allocation_data alloc_data = {
-        .len = size,
-        .fd = 0,
-        .fd_flags = O_RDWR | O_CLOEXEC,
-        .heap_flags = 0,
+    /* Try VPU-friendly (physically contiguous CMA) heaps first so that
+     * buffers imported into Vulkan AND consumed by the VPU / V4L2 codec
+     * have a valid physical address. Fall back to scattered system heap
+     * only if CMA heaps are unavailable. */
+    static const char *heaps[] = {
+        "/dev/dma_heap/heap-codecmm",
+        "/dev/dma_heap/heap-cached-codecmm",
+        "/dev/dma_heap/heap-gfx",
+        "/dev/dma_heap/system-uncached",
+        "/dev/dma_heap/system",
+        "/dev/dma_heap/heap-system",
+        NULL,
     };
+    static int logged = 0;
 
-    if (ioctl(heap_fd, DMA_HEAP_IOCTL_ALLOC, &alloc_data) < 0) {
-        fprintf(stderr, "[vfmcap-vk] DMA_HEAP_IOCTL_ALLOC failed: %s\n", strerror(errno));
+    for (int i = 0; heaps[i]; i++) {
+        int heap_fd = open(heaps[i], O_RDONLY | O_CLOEXEC);
+        if (heap_fd < 0)
+            continue;
+
+        struct dma_heap_allocation_data alloc_data = {
+            .len = size,
+            .fd = 0,
+            .fd_flags = O_RDWR | O_CLOEXEC,
+            .heap_flags = 0,
+        };
+
+        if (ioctl(heap_fd, DMA_HEAP_IOCTL_ALLOC, &alloc_data) == 0) {
+            close(heap_fd);
+            if (!logged) {
+                fprintf(stderr, "[vfmcap-vk] dma_heap: using %s (size=%zu)\n", heaps[i], size);
+                logged = 1;
+            }
+            return alloc_data.fd;
+        }
+
         close(heap_fd);
-        return -1;
     }
 
-    close(heap_fd);
-    return alloc_data.fd;
+    fprintf(stderr, "[vfmcap-vk] dma_heap: all heaps failed (size=%zu): %s\n",
+            size, strerror(errno));
+    return -1;
 }
 
 /* ---------- Dynamic rendering fallback for Vulkan < 1.3 headers ---------- */
@@ -1629,6 +1647,17 @@ static int output_pool_create_p010_contiguous(VulkanCtx *vk, int capacity,
         VkDeviceSize y_offset = 0;
         VkDeviceSize uv_offset = (y_reqs.size + uv_reqs.alignment - 1) & ~(uv_reqs.alignment - 1);
         VkDeviceSize total_size = uv_offset + uv_reqs.size;
+
+        if (i == 0) {
+            VkDeviceSize expected_uv = (VkDeviceSize)width * height * 2;
+            fprintf(stderr,
+                    "[vfmcap-vk] P010 contig: y_reqs.size=%zu y_align=%zu uv_reqs.size=%zu uv_align=%zu uv_offset=%zu expected_uv_offset(W*H*2)=%zu total=%zu%s\n",
+                    (size_t)y_reqs.size, (size_t)y_reqs.alignment,
+                    (size_t)uv_reqs.size, (size_t)uv_reqs.alignment,
+                    (size_t)uv_offset, (size_t)expected_uv,
+                    (size_t)total_size,
+                    (uv_offset == expected_uv) ? " [MATCH]" : " [MISMATCH!]");
+        }
 
         uint32_t mem_type_bits = y_reqs.memoryTypeBits & uv_reqs.memoryTypeBits;
         if (mem_type_bits == 0) mem_type_bits = y_reqs.memoryTypeBits;

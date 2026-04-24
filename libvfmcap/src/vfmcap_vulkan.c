@@ -439,6 +439,99 @@ static void log_afbc_import_support(VulkanCtx *vk, VkFormat format, uint64_t mod
             props.imageFormatProperties.maxExtent.height);
 }
 
+static const char *vk_format_name(VkFormat format)
+{
+    switch (format) {
+    case VK_FORMAT_R16_UNORM:    return "R16_UNORM";
+    case VK_FORMAT_R16G16_UNORM: return "R16G16_UNORM";
+    case VK_FORMAT_R16_UINT:     return "R16_UINT";
+    case VK_FORMAT_R16G16_UINT:  return "R16G16_UINT";
+    case VK_FORMAT_R8_UNORM:     return "R8_UNORM";
+    case VK_FORMAT_R8G8_UNORM:   return "R8G8_UNORM";
+    default:                     return "unknown";
+    }
+}
+
+static void log_p010_export_format_probe_one(VulkanCtx *vk, VkFormat format,
+                                             uint32_t width, uint32_t height,
+                                             VkImageTiling tiling)
+{
+    uint64_t mod_linear = 0;
+    VkPhysicalDeviceImageDrmFormatModifierInfoEXT mod_info = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT,
+        .drmFormatModifier = mod_linear,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+    VkPhysicalDeviceExternalImageFormatInfo ext_info = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
+        .pNext = tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT ? &mod_info : NULL,
+        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+    };
+    VkExternalImageFormatProperties ext_props = {
+        .sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
+    };
+    VkImageFormatProperties2 props = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
+        .pNext = &ext_props,
+    };
+    VkPhysicalDeviceImageFormatInfo2 fmt_info = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
+        .pNext = &ext_info,
+        .format = format,
+        .type = VK_IMAGE_TYPE_2D,
+        .tiling = tiling,
+        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+        .flags = 0,
+    };
+    VkResult result = vkGetPhysicalDeviceImageFormatProperties2(vk->physical_device,
+                                                                &fmt_info, &props);
+    VkExternalMemoryFeatureFlags features =
+        ext_props.externalMemoryProperties.externalMemoryFeatures;
+    bool usable = result == VK_SUCCESS &&
+                  (features & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) &&
+                  props.imageFormatProperties.maxExtent.width >= width &&
+                  props.imageFormatProperties.maxExtent.height >= height;
+
+    fprintf(stderr,
+            "[vfmcap-vk] P010 export probe: format=%s(%d) tiling=%s size=%ux%u result=%d importable=%d exportable=%d dedicated=%d max=%ux%u usable=%d\n",
+            vk_format_name(format), format,
+            tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT ? "drm-linear" : "linear",
+            width, height, result,
+            !!(features & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT),
+            !!(features & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT),
+            !!(features & VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT),
+            props.imageFormatProperties.maxExtent.width,
+            props.imageFormatProperties.maxExtent.height,
+            usable);
+}
+
+static void log_p010_export_format_probe(VulkanCtx *vk, uint32_t width, uint32_t height)
+{
+    static const VkFormat formats[] = {
+        VK_FORMAT_R16_UNORM,
+        VK_FORMAT_R16G16_UNORM,
+        VK_FORMAT_R16_UINT,
+        VK_FORMAT_R16G16_UINT,
+    };
+
+    fprintf(stderr,
+            "[vfmcap-vk] P010 export probe: checking external dma-buf color-attachment plane formats\n");
+    for (size_t i = 0; i < sizeof(formats) / sizeof(formats[0]); i++) {
+        uint32_t plane_width = width;
+        uint32_t plane_height = height;
+
+        if (formats[i] == VK_FORMAT_R16G16_UNORM || formats[i] == VK_FORMAT_R16G16_UINT) {
+            plane_width /= 2;
+            plane_height /= 2;
+        }
+
+        log_p010_export_format_probe_one(vk, formats[i], plane_width, plane_height,
+                                         VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT);
+        log_p010_export_format_probe_one(vk, formats[i], plane_width, plane_height,
+                                         VK_IMAGE_TILING_LINEAR);
+    }
+}
+
 /* ---------- DMA-buf import ---------- */
 
 static int import_dmabuf(VulkanCtx *vk, int fd, VkDeviceSize size, VkBuffer *buffer, VkDeviceMemory *memory)
@@ -1374,9 +1467,49 @@ static int output_pool_create_copyout(VulkanCtx *vk, int capacity, uint32_t widt
     return 0;
 }
 
+static int output_pool_create_p010(VulkanCtx *vk, int capacity, uint32_t width,
+                                   uint32_t height, OutputPool *y_pool,
+                                   OutputPool *uv_pool)
+{
+    const char *env = getenv("VFMCAP_P010_COPYOUT");
+    int copyout_only = env && env[0] == '1';
+
+    if (!copyout_only) {
+        fprintf(stderr,
+                "[vfmcap-vk] P010 output strategy: trying direct dma-buf image export\n");
+        if (output_pool_create(vk, capacity, width, height, VK_FORMAT_R16_UNORM,
+                               y_pool) == 0 &&
+            output_pool_create(vk, capacity, width / 2, height / 2,
+                               VK_FORMAT_R16G16_UNORM, uv_pool) == 0) {
+            fprintf(stderr,
+                    "[vfmcap-vk] P010 output strategy: direct dma-buf image export active\n");
+            return 0;
+        }
+
+        fprintf(stderr,
+                "[vfmcap-vk] P010 direct dma-buf image export failed: %s\n",
+                vk->last_error[0] ? vk->last_error : "unknown error");
+        output_pool_destroy(vk, y_pool);
+        output_pool_destroy(vk, uv_pool);
+    }
+
+    fprintf(stderr,
+            "[vfmcap-vk] P010 output strategy: copyout fallback active\n");
+    if (output_pool_create_copyout(vk, capacity, width, height, VK_FORMAT_R16_UNORM,
+                                   y_pool) != 0 ||
+        output_pool_create_copyout(vk, capacity, width / 2, height / 2,
+                                   VK_FORMAT_R16G16_UNORM, uv_pool) != 0) {
+        output_pool_destroy(vk, y_pool);
+        output_pool_destroy(vk, uv_pool);
+        return -1;
+    }
+
+    return 0;
+}
+
 static int output_pool_create_afbc(VulkanCtx *vk, int capacity, uint32_t width,
-                                    uint32_t height, VkFormat format, uint64_t modifier,
-                                    OutputPool *pool)
+                                     uint32_t height, VkFormat format, uint64_t modifier,
+                                     OutputPool *pool)
 {
     memset(pool, 0, sizeof(*pool));
     pool->entries = calloc(capacity, sizeof(OutputPoolEntry));
@@ -2047,6 +2180,7 @@ int vfmcap_vk_init(VulkanCtx **vk_out, uint32_t src_width, uint32_t src_height,
     }
 
     vkGetPhysicalDeviceMemoryProperties(vk->physical_device, &vk->memory_props);
+    log_p010_export_format_probe(vk, dst_width, dst_height);
 
     /* Logical device */
     float priority = 1.0f;
@@ -3025,10 +3159,9 @@ int vfmcap_vk_init(VulkanCtx **vk_out, uint32_t src_width, uint32_t src_height,
             return -1;
         }
     } else if (fmt == VFMCAP_VK_FMT_P010) {
-        if (output_pool_create_copyout(vk, VFMCAP_OUTPUT_POOL_CAPACITY, dst_width, dst_height, VK_FORMAT_R16_UNORM,
-                                       &vk->pool_p010_y) != 0 ||
-            output_pool_create_copyout(vk, VFMCAP_OUTPUT_POOL_CAPACITY, dst_width / 2, dst_height / 2, VK_FORMAT_R16G16_UNORM,
-                                       &vk->pool_p010_uv) != 0) {
+        if (output_pool_create_p010(vk, VFMCAP_OUTPUT_POOL_CAPACITY, dst_width,
+                                    dst_height, &vk->pool_p010_y,
+                                    &vk->pool_p010_uv) != 0) {
             vfmcap_vk_cleanup(vk);
             return -1;
         }
@@ -5512,6 +5645,44 @@ int vfmcap_vk_render_10bit_and_wait(VulkanCtx *vk, int in_fd,
 
     *out_y_fd = y_entry->dmabuf_fd;
     *out_uv_fd = uv_entry->dmabuf_fd;
+
+    /* Debug one-shot dump: VFMCAP_DUMP_P010=1 dumps first P010 frame after
+     * fence wait completes.  Writes raw Y (dst_w*dst_h*2 bytes, R16_UNORM)
+     * and UV (dst_w*dst_h bytes, R16G16_UNORM interleaved) to
+     * /tmp/vfmcap_dump_y.raw and /tmp/vfmcap_dump_uv.raw.
+     * Convert with ffmpeg after retrieving:
+     *   ffmpeg -f rawvideo -pix_fmt p010le -s WxH -i combined.raw frame.png
+     */
+    {
+        static int dumped = 0;
+        const char *env = getenv("VFMCAP_DUMP_P010");
+        if (env && env[0] == '1' && !dumped && fmt == VFMCAP_VK_FMT_P010) {
+            dumped = 1;
+            size_t y_sz = (size_t)dst_width * dst_height * 2;
+            size_t uv_sz = (size_t)dst_width * dst_height; /* W/2 * H/2 * 4 bytes */
+            void *y_map = mmap(NULL, y_sz, PROT_READ, MAP_SHARED, y_entry->dmabuf_fd, 0);
+            void *uv_map = mmap(NULL, uv_sz, PROT_READ, MAP_SHARED, uv_entry->dmabuf_fd, 0);
+            if (y_map != MAP_FAILED && uv_map != MAP_FAILED) {
+                struct dma_buf_sync s_start = { .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ };
+                struct dma_buf_sync s_end   = { .flags = DMA_BUF_SYNC_END   | DMA_BUF_SYNC_READ };
+                ioctl(y_entry->dmabuf_fd, DMA_BUF_IOCTL_SYNC, &s_start);
+                ioctl(uv_entry->dmabuf_fd, DMA_BUF_IOCTL_SYNC, &s_start);
+                FILE *yf = fopen("/tmp/vfmcap_dump_y.raw", "wb");
+                FILE *uvf = fopen("/tmp/vfmcap_dump_uv.raw", "wb");
+                if (yf) { fwrite(y_map, 1, y_sz, yf); fclose(yf); }
+                if (uvf) { fwrite(uv_map, 1, uv_sz, uvf); fclose(uvf); }
+                ioctl(y_entry->dmabuf_fd, DMA_BUF_IOCTL_SYNC, &s_end);
+                ioctl(uv_entry->dmabuf_fd, DMA_BUF_IOCTL_SYNC, &s_end);
+                fprintf(stderr, "[vfmcap-vk] DUMPED P010 frame: %ux%u, Y=%zu bytes, UV=%zu bytes\n",
+                        dst_width, dst_height, y_sz, uv_sz);
+            } else {
+                fprintf(stderr, "[vfmcap-vk] DUMP FAILED: mmap error (y=%p uv=%p)\n", y_map, uv_map);
+            }
+            if (y_map != MAP_FAILED) munmap(y_map, y_sz);
+            if (uv_map != MAP_FAILED) munmap(uv_map, uv_sz);
+        }
+    }
+
     return 0;
 }
 
@@ -5643,12 +5814,11 @@ int vfmcap_vk_reconfig_pools(VulkanCtx *vk, uint32_t src_width, uint32_t src_hei
             return -1;
         }
     } else if (fmt == VFMCAP_VK_FMT_P010) {
-        if (output_pool_create_copyout(vk, VFMCAP_OUTPUT_POOL_CAPACITY, dst_width, dst_height, VK_FORMAT_R16_UNORM,
-                                       &vk->pool_p010_y) != 0 ||
-            output_pool_create_copyout(vk, VFMCAP_OUTPUT_POOL_CAPACITY, dst_width / 2, dst_height / 2, VK_FORMAT_R16G16_UNORM,
-                                       &vk->pool_p010_uv) != 0) {
+        if (output_pool_create_p010(vk, VFMCAP_OUTPUT_POOL_CAPACITY, dst_width,
+                                    dst_height, &vk->pool_p010_y,
+                                    &vk->pool_p010_uv) != 0) {
             snprintf(vk->last_error, sizeof(vk->last_error),
-                     "Failed to recreate P010 pools at %ux%u", dst_width, dst_height);
+                      "Failed to recreate P010 pools at %ux%u", dst_width, dst_height);
             return -1;
         }
     }

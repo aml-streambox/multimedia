@@ -227,6 +227,8 @@ typedef struct {
     VkDeviceMemory  copy_buffer_memory;
     VkDeviceSize    copy_buffer_size;
     int             has_copy_buffer; /* 1 = uses copy-out path */
+    VkFence         fence;          /* Per-slot fence for pipelined rendering */
+    int             fence_submitted; /* 1 = fence was submitted and must be waited */
 } OutputPoolEntry;
 
 typedef struct {
@@ -389,6 +391,13 @@ struct VulkanCtx {
     int                     pending_out_fd;
     int                     pending_out_fd2;
     int                     has_pending;
+
+    /* Pipelined rendering: per-slot fences and command buffers */
+    VkCommandPool           pipeline_command_pool;
+    VkCommandBuffer        *pipeline_cmd_buffers;
+    VkFence                *pipeline_fences;
+    int                     pipeline_slot_count;
+    int                     pipeline_initialized;
 };
 
 /* ---------- Helpers ---------- */
@@ -2272,6 +2281,12 @@ int vfmcap_vk_init(VulkanCtx **vk_out, uint32_t src_width, uint32_t src_height,
 
     result = vkCreateFence(vk->device, &fence_info, NULL, &vk->fence);
     VK_CHECK(result, "vkCreateFence");
+
+    vk->pipeline_command_pool = VK_NULL_HANDLE;
+    vk->pipeline_cmd_buffers = NULL;
+    vk->pipeline_fences = NULL;
+    vk->pipeline_slot_count = 0;
+    vk->pipeline_initialized = 0;
 
     /* Descriptor pool */
     VkDescriptorPoolSize pool_sizes[] = {
@@ -5291,6 +5306,66 @@ int vfmcap_vk_render_10bit_afbc_a2b10g10r10_and_wait(VulkanCtx *vk, int in_fd,
     return 0;
 }
 
+static int pipeline_init(VulkanCtx *vk, int slot_count)
+{
+    if (vk->pipeline_initialized)
+        return 0;
+
+    VkCommandPoolCreateInfo pool_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .queueFamilyIndex = vk->graphics_queue_family,
+        .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+    };
+    VkResult result = vkCreateCommandPool(vk->device, &pool_info, NULL,
+                                          &vk->pipeline_command_pool);
+    if (result != VK_SUCCESS) {
+        snprintf(vk->last_error, sizeof(vk->last_error),
+                 "vkCreateCommandPool(pipeline) failed: %d", result);
+        return -1;
+    }
+
+    vk->pipeline_slot_count = slot_count;
+    vk->pipeline_cmd_buffers = calloc(slot_count, sizeof(VkCommandBuffer));
+    vk->pipeline_fences = calloc(slot_count, sizeof(VkFence));
+    if (!vk->pipeline_cmd_buffers || !vk->pipeline_fences) {
+        snprintf(vk->last_error, sizeof(vk->last_error), "OOM for pipeline slots");
+        return -1;
+    }
+
+    VkCommandBufferAllocateInfo cmd_alloc = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = vk->pipeline_command_pool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = slot_count,
+    };
+    result = vkAllocateCommandBuffers(vk->device, &cmd_alloc,
+                                      vk->pipeline_cmd_buffers);
+    if (result != VK_SUCCESS) {
+        snprintf(vk->last_error, sizeof(vk->last_error),
+                 "vkAllocateCommandBuffers(pipeline) failed: %d", result);
+        return -1;
+    }
+
+    VkFenceCreateInfo fence_info = {
+        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+        .flags = VK_FENCE_CREATE_SIGNALED_BIT,
+    };
+    for (int i = 0; i < slot_count; i++) {
+        result = vkCreateFence(vk->device, &fence_info, NULL,
+                               &vk->pipeline_fences[i]);
+        if (result != VK_SUCCESS) {
+            snprintf(vk->last_error, sizeof(vk->last_error),
+                     "vkCreateFence(pipeline %d) failed: %d", i, result);
+            return -1;
+        }
+    }
+
+    vk->pipeline_initialized = 1;
+    fprintf(stderr, "[vfmcap-vk] Pipeline: initialized %d slots with per-slot fences\n",
+            slot_count);
+    return 0;
+}
+
 int vfmcap_vk_render_10bit_and_wait(VulkanCtx *vk, int in_fd,
                                      uint32_t src_width, uint32_t src_height,
                                      uint32_t dst_width, uint32_t dst_height,
@@ -5351,16 +5426,31 @@ int vfmcap_vk_render_10bit_and_wait(VulkanCtx *vk, int in_fd,
 
     VkResult result;
 
-    /* Fence management */
-    if (vk->frame_count == 0) {
-        vkResetFences(vk->device, 1, &vk->fence);
+    if (pipeline_init(vk, VFMCAP_OUTPUT_POOL_CAPACITY) != 0) {
+        output_pool_release(y_pool, y_entry);
+        output_pool_release(uv_pool, uv_entry);
+        return -1;
     }
 
-    /* Record command buffer */
-    VkCommandBuffer cmd = vk->command_buffer;
+    int slot = (int)(vk->frame_count % vk->pipeline_slot_count);
 
-    result = vkResetCommandPool(vk->device, vk->command_pool, 0);
-    VK_CHECK(result, "vkResetCommandPool");
+    VkCommandBuffer cmd = vk->pipeline_cmd_buffers[slot];
+
+    result = vkResetCommandBuffer(cmd, 0);
+    if (result != VK_SUCCESS) {
+        output_pool_release(y_pool, y_entry);
+        output_pool_release(uv_pool, uv_entry);
+        VK_CHECK(result, "vkResetCommandBuffer(pipeline)");
+    }
+
+    VkFence slot_fence = vk->pipeline_fences[slot];
+
+    result = vkResetFences(vk->device, 1, &slot_fence);
+    if (result != VK_SUCCESS) {
+        output_pool_release(y_pool, y_entry);
+        output_pool_release(uv_pool, uv_entry);
+        VK_CHECK(result, "vkResetFences(pipeline)");
+    }
 
     VkCommandBufferBeginInfo begin_info = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -5620,26 +5710,27 @@ int vfmcap_vk_render_10bit_and_wait(VulkanCtx *vk, int in_fd,
         ioctl(uv_entry->dmabuf_fd, DMA_BUF_IOCTL_SYNC, &sync_start_wr);
     }
 
-    /* Submit to graphics queue */
+    /* Submit to graphics queue with per-slot fence */
     VkSubmitInfo submit_info = {
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .commandBufferCount = 1,
         .pCommandBuffers = &cmd,
     };
 
-    result = vkQueueSubmit(vk->graphics_queue, 1, &submit_info, vk->fence);
-    VK_CHECK(result, "vkQueueSubmit(tbdr-10bit)");
-
-    vk->pending_in_fd = in_fd;
-    vk->pending_out_fd = y_entry->dmabuf_fd;
-    vk->pending_out_fd2 = uv_entry->dmabuf_fd;
-    vk->has_pending = 1;
-
-    /* Wait for completion */
-    int ret = vfmcap_vk_convert_wait(vk);
-    if (ret != 0) {
+    result = vkQueueSubmit(vk->graphics_queue, 1, &submit_info, slot_fence);
+    if (result != VK_SUCCESS) {
         output_pool_release(y_pool, y_entry);
         output_pool_release(uv_pool, uv_entry);
+        VK_CHECK(result, "vkQueueSubmit(pipeline)");
+    }
+
+    /* Wait for this slot's fence */
+    result = vkWaitForFences(vk->device, 1, &slot_fence, VK_TRUE, UINT64_MAX);
+    if (result != VK_SUCCESS) {
+        output_pool_release(y_pool, y_entry);
+        output_pool_release(uv_pool, uv_entry);
+        snprintf(vk->last_error, sizeof(vk->last_error),
+                 "vkWaitForFences(pipeline slot %d) failed: %d", slot, result);
         return -1;
     }
 
@@ -5923,6 +6014,18 @@ void vfmcap_vk_cleanup(VulkanCtx *vk)
 
     if (vk->fence != VK_NULL_HANDLE)
         vkDestroyFence(vk->device, vk->fence, NULL);
+
+    if (vk->pipeline_initialized) {
+        for (int i = 0; i < vk->pipeline_slot_count; i++) {
+            if (vk->pipeline_fences && vk->pipeline_fences[i] != VK_NULL_HANDLE)
+                vkDestroyFence(vk->device, vk->pipeline_fences[i], NULL);
+        }
+        free(vk->pipeline_cmd_buffers);
+        free(vk->pipeline_fences);
+        if (vk->pipeline_command_pool != VK_NULL_HANDLE)
+            vkDestroyCommandPool(vk->device, vk->pipeline_command_pool, NULL);
+        vk->pipeline_initialized = 0;
+    }
     if (vk->ycbcr_sampler_422 != VK_NULL_HANDLE)
         vkDestroySampler(vk->device, vk->ycbcr_sampler_422, NULL);
     if (vk->ycbcr_sampler != VK_NULL_HANDLE)

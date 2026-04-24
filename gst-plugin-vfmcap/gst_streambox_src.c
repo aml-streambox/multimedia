@@ -1216,6 +1216,17 @@ hdmirx_detect_colorimetry(GstStreamboxSrc *self)
             GST_INFO_OBJECT(self, "SDR source: colorimetry=bt709");
         }
     }
+
+    /* Debug override: STREAMBOX_COLORIMETRY env var forces a specific string.
+     * Useful to test whether colour corruption is a signalling mismatch
+     * (e.g. STREAMBOX_COLORIMETRY=bt709 while HDMI signals HDR PQ). */
+    {
+        const gchar *ovr = g_getenv("STREAMBOX_COLORIMETRY");
+        if (ovr && *ovr) {
+            g_strlcpy(self->colorimetry, ovr, sizeof(self->colorimetry));
+            GST_WARNING_OBJECT(self, "colorimetry forced by env: %s", ovr);
+        }
+    }
 }
 
 /*
@@ -2206,7 +2217,7 @@ create_path_a(GstStreamboxSrc *self, GstBuffer **buf)
         if (frame.pixelformat == V4L2_PIX_FMT_NV12)
             plane2_size = (gsize)frame.width * frame.height / 2;
         else if (frame.pixelformat == v4l2_fourcc('P', '0', '1', '0'))
-            plane2_size = (gsize)frame.width * frame.height * 2;
+            plane2_size = (gsize)frame.width * frame.height;
         else
             plane2_size = frame.size / 2;
         dmabuf_alloc = gst_dmabuf_allocator_new();
@@ -2239,7 +2250,7 @@ create_path_a(GstStreamboxSrc *self, GstBuffer **buf)
         strides[0] = frame.width * 2;
         strides[1] = frame.width * 2;
         offsets[0] = 0;
-        offsets[1] = (gsize)frame.width * frame.height * 2;
+        offsets[1] = (frame.dmabuf_fd2 < 0) ? (gsize)frame.width * frame.height * 2 : 0;
     } else if (frame.pixelformat == V4L2_PIX_FMT_NV12) {
         gst_fmt = GST_VIDEO_FORMAT_NV12;
         n_planes = 2;
@@ -3182,7 +3193,7 @@ do_dqbuf:
                 p_strides[0] = self->width * 2;
                 p_strides[1] = self->width * 2;
                 p_offsets[0] = 0;
-                p_offsets[1] = (gsize)self->width * self->height * 2;
+                p_offsets[1] = 0;
 
                 gst_buffer_add_video_meta_full(prime_buffer, GST_VIDEO_FRAME_FLAG_NONE,
                                                 GST_VIDEO_FORMAT_P010_10LE,
@@ -3469,7 +3480,7 @@ do_dqbuf:
                 a_strides[0] = self->width * 2;
                 a_strides[1] = self->width * 2;
                 a_offsets[0] = 0;
-                a_offsets[1] = (gsize)self->width * self->height * 2;
+                a_offsets[1] = 0;
 
                 gst_buffer_add_video_meta_full(prev_buffer, GST_VIDEO_FRAME_FLAG_NONE,
                                                 GST_VIDEO_FORMAT_P010_10LE,

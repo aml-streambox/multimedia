@@ -5701,7 +5701,6 @@ int vfmcap_vk_render_10bit_and_wait(VulkanCtx *vk, int in_fd,
     result = vkEndCommandBuffer(cmd);
     VK_CHECK(result, "vkEndCommandBuffer");
 
-    /* DMA-buf sync: start write access on output copyout buffers */
     if (uses_copyout) {
         struct dma_buf_sync sync_start_wr = {
             .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE
@@ -5710,7 +5709,9 @@ int vfmcap_vk_render_10bit_and_wait(VulkanCtx *vk, int in_fd,
         ioctl(uv_entry->dmabuf_fd, DMA_BUF_IOCTL_SYNC, &sync_start_wr);
     }
 
-    /* Submit to graphics queue with per-slot fence */
+    struct timespec t_submit_start, t_submit_end, t_wait_end;
+    clock_gettime(CLOCK_MONOTONIC, &t_submit_start);
+
     VkSubmitInfo submit_info = {
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .commandBufferCount = 1,
@@ -5724,7 +5725,8 @@ int vfmcap_vk_render_10bit_and_wait(VulkanCtx *vk, int in_fd,
         VK_CHECK(result, "vkQueueSubmit(pipeline)");
     }
 
-    /* Wait for this slot's fence */
+    clock_gettime(CLOCK_MONOTONIC, &t_submit_end);
+
     result = vkWaitForFences(vk->device, 1, &slot_fence, VK_TRUE, UINT64_MAX);
     if (result != VK_SUCCESS) {
         output_pool_release(y_pool, y_entry);
@@ -5732,6 +5734,19 @@ int vfmcap_vk_render_10bit_and_wait(VulkanCtx *vk, int in_fd,
         snprintf(vk->last_error, sizeof(vk->last_error),
                  "vkWaitForFences(pipeline slot %d) failed: %d", slot, result);
         return -1;
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &t_wait_end);
+
+    if (vk->frame_count > 0 && (vk->frame_count % 60) == 0) {
+        double submit_ms = (t_submit_end.tv_sec - t_submit_start.tv_sec) * 1000.0 +
+                           (t_submit_end.tv_nsec - t_submit_start.tv_nsec) / 1e6;
+        double wait_ms = (t_wait_end.tv_sec - t_submit_end.tv_sec) * 1000.0 +
+                         (t_wait_end.tv_nsec - t_submit_end.tv_nsec) / 1e6;
+        fprintf(stderr,
+                "[vfmcap-vk] profiling frame %llu slot %d: submit=%.2fms gpu_wait=%.2fms copyout=%d\n",
+                (unsigned long long)vk->frame_count, slot, submit_ms, wait_ms,
+                uses_copyout);
     }
 
     *out_y_fd = y_entry->dmabuf_fd;
@@ -5774,6 +5789,7 @@ int vfmcap_vk_render_10bit_and_wait(VulkanCtx *vk, int in_fd,
         }
     }
 
+    vk->frame_count++;
     return 0;
 }
 

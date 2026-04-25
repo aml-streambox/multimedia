@@ -70,7 +70,7 @@ _get_time_us(void)
 #define DEFAULT_DEVICE_VDIN1   "/dev/video71"
 #define DEFAULT_NUM_BUFFERS    6
 #define DEFAULT_PATHA_POOL_SIZE 12
-#define DEFAULT_OUTPUT_FMT     GST_STREAMBOX_OUTPUT_NV12
+#define DEFAULT_OUTPUT_FMT     GST_STREAMBOX_OUTPUT_AUTO
 #define DEFAULT_SOURCE_MODE    GST_STREAMBOX_SOURCE_VFMCAP
 
 #define DMA_HEAP_PATH          "/dev/dma_heap/system-uncached"
@@ -142,6 +142,7 @@ gst_streambox_output_format_get_type(void)
     static GType type = 0;
     if (g_once_init_enter(&type)) {
         static const GEnumValue values[] = {
+            { GST_STREAMBOX_OUTPUT_AUTO, "Auto (match source bit depth)", "auto" },
             { GST_STREAMBOX_OUTPUT_NV12, "NV12 (8-bit)", "nv12" },
             { GST_STREAMBOX_OUTPUT_P010, "P010 (10-bit)", "p010" },
             { 0, NULL, NULL }
@@ -1928,11 +1929,15 @@ gst_streambox_src_get_caps(GstBaseSrc *basesrc, GstCaps *filter)
     GstCaps *caps;
 
     if (self->streaming && self->width > 0 && self->height > 0) {
+        gint out_w = self->target_width ? (gint)self->target_width : (gint)self->width;
+        gint out_h = self->target_height ? (gint)self->target_height : (gint)self->height;
+        gint out_fps_n = self->target_fps > 0 ? (gint)(self->target_fps + 0.5f) : (gint)self->fps_n;
+        gint out_fps_d = self->target_fps > 0 ? 1 : (gint)self->fps_d;
         caps = gst_caps_new_simple("video/x-raw",
             "format", G_TYPE_STRING, get_caps_format_string(self),
-            "width", G_TYPE_INT, (gint)self->width,
-            "height", G_TYPE_INT, (gint)self->height,
-            "framerate", GST_TYPE_FRACTION, (gint)self->fps_n, (gint)self->fps_d,
+            "width", G_TYPE_INT, out_w,
+            "height", G_TYPE_INT, out_h,
+            "framerate", GST_TYPE_FRACTION, out_fps_n, out_fps_d,
             NULL);
 
         /* Add colorimetry if detected */
@@ -1971,13 +1976,19 @@ gst_streambox_src_fixate(GstBaseSrc *basesrc, GstCaps *caps)
     s = gst_caps_get_structure(caps, 0);
 
     if (self->width > 0 && self->height > 0) {
-        gst_structure_fixate_field_nearest_int(s, "width", self->width);
-        gst_structure_fixate_field_nearest_int(s, "height", self->height);
+        gint out_w = self->target_width ? (gint)self->target_width : (gint)self->width;
+        gint out_h = self->target_height ? (gint)self->target_height : (gint)self->height;
+        gst_structure_fixate_field_nearest_int(s, "width", out_w);
+        gst_structure_fixate_field_nearest_int(s, "height", out_h);
     }
 
-    if (self->fps_n > 0) {
-        gst_structure_fixate_field_nearest_fraction(s, "framerate",
-                                                     self->fps_n, self->fps_d);
+    {
+        gint out_fps_n = self->target_fps > 0 ? (gint)(self->target_fps + 0.5f) : (gint)self->fps_n;
+        gint out_fps_d = self->target_fps > 0 ? 1 : (gint)self->fps_d;
+        if (out_fps_n > 0) {
+            gst_structure_fixate_field_nearest_fraction(s, "framerate",
+                                                         out_fps_n, out_fps_d);
+        }
     }
 
     caps = GST_BASE_SRC_CLASS(parent_class)->fixate(basesrc, caps);
@@ -1992,11 +2003,16 @@ push_current_caps(GstStreamboxSrc *self)
 {
     const gchar *fmt_str = get_caps_format_string(self);
 
+    gint out_w = self->target_width ? (gint)self->target_width : (gint)self->width;
+    gint out_h = self->target_height ? (gint)self->target_height : (gint)self->height;
+    gint out_fps_n = self->target_fps > 0 ? (gint)(self->target_fps + 0.5f) : (gint)self->fps_n;
+    gint out_fps_d = self->target_fps > 0 ? 1 : (gint)self->fps_d;
+
     GstCaps *caps = gst_caps_new_simple("video/x-raw",
         "format", G_TYPE_STRING, fmt_str,
-        "width", G_TYPE_INT, (gint)self->width,
-        "height", G_TYPE_INT, (gint)self->height,
-        "framerate", GST_TYPE_FRACTION, (gint)self->fps_n, (gint)self->fps_d,
+        "width", G_TYPE_INT, out_w,
+        "height", G_TYPE_INT, out_h,
+        "framerate", GST_TYPE_FRACTION, out_fps_n, out_fps_d,
         NULL);
 
     /* Add colorimetry if detected from HDMI RX signal */
@@ -2030,7 +2046,29 @@ start_path_a(GstStreamboxSrc *self)
     const gchar *dev = resolve_device(self);
 
     vfmcap_config_t cfg = {0};
-    cfg.output_format = (self->output_fmt == GST_STREAMBOX_OUTPUT_P010)
+    GstStreamboxOutputFormat resolved_fmt = self->output_fmt;
+
+    if (resolved_fmt == GST_STREAMBOX_OUTPUT_AUTO) {
+        guint color_depth = 8;
+        FILE *f = fopen(HDMIRX_INFO_PATH, "r");
+        if (f) {
+            char line[256];
+            while (fgets(line, sizeof(line), f)) {
+                if (sscanf(line, "Color Depth: %u", &color_depth) == 1)
+                    break;
+            }
+            fclose(f);
+        }
+        resolved_fmt = (color_depth > 8)
+                        ? GST_STREAMBOX_OUTPUT_P010
+                        : GST_STREAMBOX_OUTPUT_NV12;
+        GST_INFO_OBJECT(self, "Auto-detect: HDMI color_depth=%u -> %s",
+                         color_depth,
+                         resolved_fmt == GST_STREAMBOX_OUTPUT_P010 ? "P010" : "NV12");
+        self->output_fmt = resolved_fmt;
+    }
+
+    cfg.output_format = (resolved_fmt == GST_STREAMBOX_OUTPUT_P010)
                          ? VFMCAP_FMT_P010 : VFMCAP_FMT_NV12;
     cfg.target_width = self->target_width;
     cfg.target_height = self->target_height;

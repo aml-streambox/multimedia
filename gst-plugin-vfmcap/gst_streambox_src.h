@@ -40,6 +40,7 @@ typedef enum {
 } GstStreamboxSourceMode;
 
 typedef enum {
+    GST_STREAMBOX_OUTPUT_AUTO = -1,
     GST_STREAMBOX_OUTPUT_NV12 = 0,
     GST_STREAMBOX_OUTPUT_P010 = 1,
 } GstStreamboxOutputFormat;

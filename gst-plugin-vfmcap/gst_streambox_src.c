@@ -1174,7 +1174,17 @@ hdmirx_detect_colorimetry(GstStreamboxSrc *self)
      *   bt601 = "limited/bt601/bt709/bt470bg" -- but bt709 is fine for SD over HDMI
      */
 
-    if (self->source_mode == GST_STREAMBOX_SOURCE_VDIN1 && !self->vdin1_10bit) {
+    if (self->color_mode == 1 || self->color_mode == 2) {
+        /*
+         * GPU HDR->SDR tone mapping active (color-mode=1: HDR10->SDR,
+         * color-mode=2: HLG->SDR).  The 3D LUT shader converts BT.2020/PQ
+         * (or HLG) to BT.709/SDR in YCbCr space.  Output is always BT.709
+         * regardless of the original HDMI source color space.
+         */
+        g_strlcpy(self->colorimetry, "bt709", sizeof(self->colorimetry));
+        GST_INFO_OBJECT(self, "HDR->SDR tone map (color-mode=%u): colorimetry=bt709",
+                         self->color_mode);
+    } else if (self->source_mode == GST_STREAMBOX_SOURCE_VDIN1 && !self->vdin1_10bit) {
         /*
          * Path B 8-bit: VPP has performed HDR->SDR tone mapping and
          * BT.2020->BT.709 gamut mapping.  Output is always BT.709/SDR

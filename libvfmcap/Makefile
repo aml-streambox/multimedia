@@ -30,7 +30,7 @@ ifdef STAGING_DIR
   LDFLAGS += -L$(STAGING_DIR)/usr/lib
 endif
 
-LIB_LDFLAGS = $(LDFLAGS) -lvulkan -lm -shared
+LIB_LDFLAGS = $(LDFLAGS) -lvulkan -lm -shared -Wl,-Bsymbolic
 DEMO_LDFLAGS = $(LDFLAGS) -L$(LOCAL_PATH) -lvfmcap -lm -Wl,-rpath,/usr/lib
 
 # --- Targets ---

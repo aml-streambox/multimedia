@@ -141,6 +141,19 @@ static int needs_vulkan(const vfmcap_config_t *cfg)
     }
 }
 
+static int is_signal_lost_errno(int err)
+{
+    return err == ENOTTY || err == ENODEV || err == EIO || err == EPIPE;
+}
+
+static int vfmcap_report_signal_lost_ioctl(vfmcap_ctx_t *ctx, const char *op, int err)
+{
+    ctx->signal_lost = 1;
+    snprintf(ctx->last_error, sizeof(ctx->last_error),
+             "%s failed: %s", op, strerror(err));
+    return VFMCAP_ERR_NOSIG;
+}
+
 static vfmcap_vk_fmt_t to_vk_fmt(vfmcap_output_fmt_t fmt)
 {
     switch (fmt) {
@@ -550,12 +563,14 @@ again:
                 memset(&event, 0, sizeof(event));
                 while (xioctl(ctx->fd, VIDIOC_DQEVENT, &event) == 0) {
                     if (event.type == V4L2_EVENT_SOURCE_CHANGE) {
-                        struct vfm_cap_signal_info_kern *sig =
-                            (struct vfm_cap_signal_info_kern *)event.u.data;
-                        if (sig->status == 1) {
-                            memset(&event, 0, sizeof(event));
-                            continue;
-                        }
+                        /*
+                         * vfm_cap queues a standard V4L2_SOURCE_CHANGE event;
+                         * it does not embed vfm_cap_signal_info_kern in
+                         * event.u.data. Reaching this path means we previously
+                         * returned NOSIG and are now seeing the next source
+                         * change, which vfm_cap emits after the restored signal
+                         * has produced a new stable format.
+                         */
                         ctx->signal_lost = 0;
                         ctx->prev_width = ctx->width;
                         ctx->prev_height = ctx->height;
@@ -613,10 +628,15 @@ again:
             if (ret < 0) {
                 if (errno == EINTR)
                     continue;
+                if (is_signal_lost_errno(errno))
+                    return vfmcap_report_signal_lost_ioctl(ctx, "poll()", errno);
                 snprintf(ctx->last_error, sizeof(ctx->last_error),
                          "poll() failed: %s", strerror(errno));
                 return VFMCAP_ERR_IOCTL;
             }
+
+            if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
+                return vfmcap_report_signal_lost_ioctl(ctx, "poll()", ENODEV);
 
             /* Handle events */
             if (pfd.revents & POLLPRI) {
@@ -624,40 +644,17 @@ again:
                 memset(&event, 0, sizeof(event));
                 while (xioctl(ctx->fd, VIDIOC_DQEVENT, &event) == 0) {
                     if (event.type == V4L2_EVENT_SOURCE_CHANGE) {
-                        struct vfm_cap_signal_info_kern *sig =
-                            (struct vfm_cap_signal_info_kern *)event.u.data;
-                        if (sig->status == 1) {
-                            ctx->signal_lost = 1;
-                            return VFMCAP_ERR_NOSIG;
-                        }
-                        /* Signal changed — save prev dims, read new format, reconfig */
-                        ctx->prev_width = ctx->width;
-                        ctx->prev_height = ctx->height;
-                        struct v4l2_format fmt;
-                        memset(&fmt, 0, sizeof(fmt));
-                        fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-                        if (xioctl(ctx->fd, VIDIOC_G_FMT, &fmt) == 0) {
-                            ctx->width = fmt.fmt.pix_mp.width;
-                            ctx->height = fmt.fmt.pix_mp.height;
-                            ctx->pixelformat = fmt.fmt.pix_mp.pixelformat;
-                            ctx->bytesperline = fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
-                            ctx->sizeimage = fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
-                            if (ctx->pixelformat == v4l2_fourcc('A', 'M', 'L', 'Y'))
-                                ctx->bitdepth = 10;
-                            else if (ctx->pixelformat == V4L2_PIX_FMT_NV12 ||
-                                     ctx->pixelformat == V4L2_PIX_FMT_NV21)
-                                ctx->bitdepth = 8;
-                            else if (ctx->pixelformat == v4l2_fourcc('P', '0', '1', '0'))
-                                ctx->bitdepth = 10;
-                            else
-                                ctx->bitdepth = 8;
-                        }
-                        int rc = vfmcap_do_reconfig(ctx);
-                        if (rc != VFMCAP_OK) {
-                            ctx->reconfig_pending = 1;
-                            return rc;
-                        }
-                        ctx->reconfig_pending = 1;
+                        /*
+                         * SOURCE_CHANGE can be queued as soon as HDMI RX leaves
+                         * STABLE. Do not reconfigure V4L2 buffers here: doing
+                         * STREAMOFF/REQBUFS/STREAMON while vdin0 is tearing down
+                         * or rebuilding can hang the board. Report NOSIG so the
+                         * caller stops using the current buffers; the signal_lost
+                         * path above will reconfigure after the next stable
+                         * SOURCE_CHANGE if the caller keeps this context alive.
+                         */
+                        ctx->signal_lost = 1;
+                        return VFMCAP_ERR_NOSIG;
                     }
                     memset(&event, 0, sizeof(event));
                 }
@@ -679,10 +676,13 @@ again:
     buf.m.planes = &plane;
 
     if (xioctl(ctx->fd, VIDIOC_DQBUF, &buf) < 0) {
-        if (errno == EAGAIN)
+        int err = errno;
+        if (err == EAGAIN)
             return VFMCAP_ERR_TIMEOUT;
+        if (is_signal_lost_errno(err))
+            return vfmcap_report_signal_lost_ioctl(ctx, "VIDIOC_DQBUF", err);
         snprintf(ctx->last_error, sizeof(ctx->last_error),
-                 "VIDIOC_DQBUF failed: %s", strerror(errno));
+                 "VIDIOC_DQBUF failed: %s", strerror(err));
         return VFMCAP_ERR_IOCTL;
     }
 
@@ -692,9 +692,14 @@ again:
     dmabuf_req.index = buf.index;
 
     if (xioctl(ctx->fd, VFM_CAP_IOC_GET_DMABUF, &dmabuf_req) < 0) {
+        int err = errno;
         snprintf(ctx->last_error, sizeof(ctx->last_error),
-                 "VFM_CAP_IOC_GET_DMABUF failed: %s", strerror(errno));
+                 "VFM_CAP_IOC_GET_DMABUF failed: %s", strerror(err));
         xioctl(ctx->fd, VIDIOC_QBUF, &buf);
+        if (is_signal_lost_errno(err)) {
+            ctx->signal_lost = 1;
+            return VFMCAP_ERR_NOSIG;
+        }
         return VFMCAP_ERR_IOCTL;
     }
 
@@ -770,6 +775,7 @@ again:
             frame->dmabuf_fd2 = out_uv_fd;
             frame->width = dst_w;
             frame->height = dst_h;
+            frame->bytesperline = (vk_fmt == VFMCAP_VK_FMT_NV12) ? dst_w : dst_w * 2;
             frame->size = vfmcap_output_size(dst_w, dst_h, ctx->config.output_format);
             frame->pixelformat = (vk_fmt == VFMCAP_VK_FMT_NV12) ?
                                  V4L2_PIX_FMT_NV12 :
@@ -808,6 +814,7 @@ again:
             frame->dmabuf_fd2 = -1;
             frame->width = dst_w;
             frame->height = dst_h;
+            frame->bytesperline = dst_w;
             frame->size = vfmcap_output_size(dst_w, dst_h, ctx->config.output_format);
             frame->pixelformat = V4L2_PIX_FMT_NV12;
             frame->drm_modifier = out_modifier;
@@ -845,6 +852,7 @@ again:
             frame->dmabuf_fd2 = out_uv_fd;
             frame->width = dst_w;
             frame->height = dst_h;
+            frame->bytesperline = (vk_fmt == VFMCAP_VK_FMT_NV12) ? dst_w : dst_w * 2;
             frame->size = vfmcap_output_size(dst_w, dst_h, ctx->config.output_format);
             frame->pixelformat = (vk_fmt == VFMCAP_VK_FMT_NV12) ?
                                  V4L2_PIX_FMT_NV12 :
@@ -883,6 +891,7 @@ again:
             frame->dmabuf_fd2 = -1;
             frame->width = dst_w;
             frame->height = dst_h;
+            frame->bytesperline = dst_w;
             frame->size = vfmcap_output_size(dst_w, dst_h, ctx->config.output_format);
             frame->pixelformat = V4L2_PIX_FMT_NV12;
             frame->drm_modifier = out_modifier;
@@ -920,6 +929,7 @@ again:
             frame->dmabuf_fd2 = -1;
             frame->width = dst_w;
             frame->height = dst_h;
+            frame->bytesperline = dst_w * 4;
             frame->size = vfmcap_output_size(dst_w, dst_h, ctx->config.output_format);
             frame->pixelformat = v4l2_fourcc('A', 'B', '3', '0');
             frame->drm_modifier = out_modifier;
@@ -1080,36 +1090,27 @@ int vfmcap_poll_event(vfmcap_ctx_t *ctx, int timeout_ms)
     if (ret == 0) return VFMCAP_EVENT_TIMEOUT;
     if (ret < 0) return VFMCAP_EVENT_ERROR;
 
+    if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+        ctx->signal_lost = 1;
+        return VFMCAP_EVENT_NOSIG;
+    }
+
     if (pfd.revents & POLLPRI) {
         struct v4l2_event event;
         memset(&event, 0, sizeof(event));
         if (xioctl(ctx->fd, VIDIOC_DQEVENT, &event) == 0) {
             if (event.type == V4L2_EVENT_SOURCE_CHANGE) {
-                struct vfm_cap_signal_info_kern *sig =
-                    (struct vfm_cap_signal_info_kern *)event.u.data;
-
-                struct v4l2_format fmt;
-                memset(&fmt, 0, sizeof(fmt));
-                fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-                if (xioctl(ctx->fd, VIDIOC_G_FMT, &fmt) == 0) {
-                    ctx->width = fmt.fmt.pix_mp.width;
-                    ctx->height = fmt.fmt.pix_mp.height;
-                    ctx->pixelformat = fmt.fmt.pix_mp.pixelformat;
-                    ctx->bytesperline = fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
-                    ctx->sizeimage = fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
-                    if (ctx->pixelformat == v4l2_fourcc('A', 'M', 'L', 'Y'))
-                        ctx->bitdepth = 10;
-                    else if (ctx->pixelformat == V4L2_PIX_FMT_NV12 ||
-                             ctx->pixelformat == V4L2_PIX_FMT_NV21)
-                        ctx->bitdepth = 8;
-                    else if (ctx->pixelformat == v4l2_fourcc('P', '0', '1', '0'))
-                        ctx->bitdepth = 10;
-                    else
-                        ctx->bitdepth = 8;
-                }
-
-                if (sig->status == 1)
-                    return VFMCAP_EVENT_NOSIG;
+                /*
+                 * The kernel queues a standard SOURCE_CHANGE event only; no
+                 * vfm_cap_signal_info_kern is embedded in event.u.data. Treat
+                 * the event as a boundary where current buffers must stop being
+                 * used, but leave actual STREAMOFF/REQBUFS/STREAMON to an
+                 * explicit reopen or to acquire_frame() after signal_lost sees
+                 * the next stable SOURCE_CHANGE. Reconfiguring from poll_event()
+                 * can race HDMI RX/vdin teardown and hang the board.
+                 */
+                ctx->signal_lost = 1;
+                ctx->reconfig_pending = 1;
                 return VFMCAP_EVENT_SOURCE_CHANGE;
             }
         }

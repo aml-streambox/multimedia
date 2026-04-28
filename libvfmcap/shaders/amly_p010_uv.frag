@@ -39,20 +39,17 @@ uint bswap32(uint val) {
 }
 
 // Optimized read_pair: inline bswap64 correction, reuse shared 64-bit blocks.
-// Loads raw 64-bit blocks directly and reuses when consecutive words share a block.
-// Reduces SSBO reads from 4-6 to 2-3 and bswap32 calls from 5-7 to 2-3.
+// The vdin path presents each 64-bit block word-swapped and byte-reversed.
 void read_pair(uint pair_idx, out uint lo, out uint hi) {
     uint byte_offset = pair_idx * 5u;
     uint word_idx = byte_offset >> 2;
     uint shift = (byte_offset & 3u) << 3;
 
-    // Load the 64-bit block containing word_idx
     uint base0 = word_idx & ~1u;
     uint blk0_lo = amly.data[base0];
     uint blk0_hi = amly.data[base0 + 1u];
     uint cw0 = ((word_idx & 1u) == 0u) ? bswap32(blk0_hi) : bswap32(blk0_lo);
 
-    // word_idx+1: may be in same block or next block
     uint p1 = word_idx + 1u;
     uint base1 = p1 & ~1u;
 
@@ -101,8 +98,8 @@ void main() {
     uint lo0, hi0;
     read_pair(pair_idx0, lo0, hi0);
     uint bs0 = bswap32(lo0);
-    uint u0 = (bs0 >> 12) & 0x3FFu;
-    uint v0 = ((bs0 & 0x3u) << 8) | hi0;
+    uint u0 = ((bs0 & 0x3u) << 8) | hi0;
+    uint v0 = (bs0 >> 12) & 0x3FFu;
     uint y0_val = (bs0 >> 22) & 0x3FFu;
 
     // Read next row pair for vertical averaging
@@ -114,8 +111,8 @@ void main() {
         uint lo1, hi1;
         read_pair(pair_idx1, lo1, hi1);
         uint bs1 = bswap32(lo1);
-        uint nu0 = (bs1 >> 12) & 0x3FFu;
-        uint nv0 = ((bs1 & 0x3u) << 8) | hi1;
+        uint nu0 = ((bs1 & 0x3u) << 8) | hi1;
+        uint nv0 = (bs1 >> 12) & 0x3FFu;
         y1_val = (bs1 >> 22) & 0x3FFu;
 
         u_avg = (u0 + nu0 + 1u) >> 1;

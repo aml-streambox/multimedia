@@ -42,27 +42,20 @@ uint bswap32(uint val) {
 }
 
 // Optimized read_pair: inline bswap64 correction, reuse shared 64-bit blocks.
-// Loads raw 64-bit blocks directly and reuses when consecutive words share a block.
-// Reduces SSBO reads from 4-6 to 2-3 and bswap32 calls from 5-7 to 2-3.
+// The vdin path presents each 64-bit block word-swapped and byte-reversed.
 void read_pair(uint pair_idx, out uint lo, out uint hi) {
     uint byte_offset = pair_idx * 5u;
     uint word_idx = byte_offset >> 2;
     uint shift = (byte_offset & 3u) << 3;
 
-    // Load the 64-bit block containing word_idx
     uint base0 = word_idx & ~1u;
-    uint blk0_lo = amly.data[base0];       // raw word at base0
-    uint blk0_hi = amly.data[base0 + 1u];  // raw word at base0+1
-    // Corrected: bswap64 swaps word order and byte-reverses each
-    //   corrected[base0]   = bswap32(blk0_hi)
-    //   corrected[base0+1] = bswap32(blk0_lo)
+    uint blk0_lo = amly.data[base0];
+    uint blk0_hi = amly.data[base0 + 1u];
     uint cw0 = ((word_idx & 1u) == 0u) ? bswap32(blk0_hi) : bswap32(blk0_lo);
 
-    // word_idx+1: may be in same block or next block
     uint p1 = word_idx + 1u;
     uint base1 = p1 & ~1u;
 
-    // Pre-load second block only if needed (base1 != base0)
     uint blk1_lo = blk0_lo;
     uint blk1_hi = blk0_hi;
     if (base1 != base0) {
@@ -75,7 +68,6 @@ void read_pair(uint pair_idx, out uint lo, out uint hi) {
         lo = cw0;
         hi = cw1 & 0xFFu;
     } else {
-        // word_idx+2: may be in block0, block1, or a new block2
         uint p2 = word_idx + 2u;
         uint base2 = p2 & ~1u;
 
@@ -120,8 +112,8 @@ void main() {
         out_y = float(y_val << 6u) / 65535.0;
     } else {
         // HDR->SDR via 3D LUT (modes 1=HDR10, 2=HLG)
-        uint cb_val = (bs >> 12) & 0x3FFu;
-        uint cr_val = ((bs & 0x3u) << 8) | hi;
+        uint cb_val = ((bs & 0x3u) << 8) | hi;
+        uint cr_val = (bs >> 12) & 0x3FFu;
 
         vec3 coord = vec3(float(y_val) / 1023.0,
                           float(cb_val) / 1023.0,

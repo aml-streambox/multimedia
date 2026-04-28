@@ -37,8 +37,7 @@ uint bswap32(uint val) {
 }
 
 // Optimized read_pair: inline bswap64 correction, reuse shared 64-bit blocks.
-// Loads raw 64-bit blocks directly and reuses when consecutive words share a block.
-// Reduces SSBO reads from 4-6 to 2-3 and bswap32 calls from 5-7 to 2-3.
+// The vdin path presents each 64-bit block word-swapped and byte-reversed.
 void read_pair(uint pair_idx, out uint lo, out uint hi) {
     uint byte_offset = pair_idx * 5u;
     uint word_idx = byte_offset >> 2;
@@ -108,8 +107,8 @@ void main() {
         out_y = float(y_val << 6u) / 65535.0;
     } else {
         // HDR->SDR via 3D LUT
-        uint cb_val = (bs >> 12) & 0x3FFu;
-        uint cr_val = ((bs & 0x3u) << 8) | hi;
+        uint cb_val = ((bs & 0x3u) << 8) | hi;
+        uint cr_val = (bs >> 12) & 0x3FFu;
 
         vec3 coord = vec3(float(y_val) / 1023.0,
                           float(cb_val) / 1023.0,

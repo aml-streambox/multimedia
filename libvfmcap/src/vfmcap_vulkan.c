@@ -3101,7 +3101,7 @@ int vfmcap_vk_init(VulkanCtx **vk_out, uint32_t src_width, uint32_t src_height,
         vfmcap_vk_cleanup(vk);
         return -1;
     }
-    if (load_shader(vk, amly_a2b10g10r10_frag_spv, sizeof(amly_a2b10g10r10_frag_spv),
+    if (load_shader(vk, amly_a2b10g10r10_spv, sizeof(amly_a2b10g10r10_spv),
                     &vk->gfx_shader_tbdr_a2b10g10r10) != 0) {
         *vk_out = NULL;
         vfmcap_vk_cleanup(vk);

@@ -37,6 +37,8 @@ uint bswap32(uint val) {
            ((val & 0xFF000000u) >> 24);
 }
 
+// Optimized read_pair: inline bswap64 correction, reuse shared 64-bit blocks.
+// The vdin path presents each 64-bit block word-swapped and byte-reversed.
 void read_pair(uint pair_idx, out uint lo, out uint hi) {
     uint byte_offset = pair_idx * 5u;
     uint word_idx = byte_offset >> 2;
@@ -101,10 +103,10 @@ void main() {
     read_pair(pair_idx, lo, hi);
 
     uint bs = bswap32(lo);
+    uint cb = ((bs & 0x3u) << 8) | hi;
     uint y0 = (bs >> 22) & 0x3FFu;
-    uint cb = (bs >> 12) & 0x3FFu;
+    uint cr = (bs >> 12) & 0x3FFu;
     uint y1 = (bs >> 2) & 0x3FFu;
-    uint cr = ((bs & 0x3u) << 8) | hi;
 
     uint y_val = ((src_x & 1u) == 0u) ? y0 : y1;
 

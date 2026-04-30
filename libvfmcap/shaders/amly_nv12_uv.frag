@@ -95,8 +95,8 @@ void main() {
     uint lo0, hi0;
     read_pair(pair_idx0, lo0, hi0);
     uint bs0 = bswap32(lo0);
-    uint u0 = ((bs0 & 0x3u) << 8) | hi0;
-    uint v0 = (bs0 >> 12) & 0x3FFu;
+    uint u0 = (bs0 >> 12) & 0x3FFu;
+    uint v0 = ((bs0 & 0x3u) << 8) | hi0;
     uint y0_val = (bs0 >> 22) & 0x3FFu;
 
     uint u_avg, v_avg;
@@ -107,8 +107,8 @@ void main() {
         uint lo1, hi1;
         read_pair(pair_idx1, lo1, hi1);
         uint bs1 = bswap32(lo1);
-        uint nu0 = ((bs1 & 0x3u) << 8) | hi1;
-        uint nv0 = (bs1 >> 12) & 0x3FFu;
+        uint nu0 = (bs1 >> 12) & 0x3FFu;
+        uint nv0 = ((bs1 & 0x3u) << 8) | hi1;
         y1_val = (bs1 >> 22) & 0x3FFu;
 
         u_avg = (u0 + nu0 + 1u) >> 1;

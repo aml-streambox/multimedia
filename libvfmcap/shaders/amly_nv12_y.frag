@@ -107,8 +107,8 @@ void main() {
         out_y = float(y_val << 6u) / 65535.0;
     } else {
         // HDR->SDR via 3D LUT
-        uint cb_val = ((bs & 0x3u) << 8) | hi;
-        uint cr_val = (bs >> 12) & 0x3FFu;
+        uint cb_val = (bs >> 12) & 0x3FFu;
+        uint cr_val = ((bs & 0x3u) << 8) | hi;
 
         vec3 coord = vec3(float(y_val) / 1023.0,
                           float(cb_val) / 1023.0,

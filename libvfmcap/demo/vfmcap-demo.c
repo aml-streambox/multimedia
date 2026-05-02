@@ -583,11 +583,12 @@ int main(int argc, char *argv[])
     int color_mode = 0;  /* 0=passthrough, 1=HDR10->SDR, 2=HLG->SDR */
     int target_w = 0, target_h = 0;
     float target_fps = 0.0f;
+    vfmcap_output_layout_t output_layout = VFMCAP_OUTPUT_LAYOUT_AUTO;
     int opt;
 
     const char *raw_path = NULL;
 
-    while ((opt = getopt(argc, argv, "d:n:c:o:r:m:W:H:F:ph")) != -1) {
+    while ((opt = getopt(argc, argv, "d:n:c:o:r:m:W:H:F:L:ph")) != -1) {
         switch (opt) {
         case 'd':
             device = optarg;
@@ -634,10 +635,19 @@ int main(int argc, char *argv[])
         case 'F':
             target_fps = atof(optarg);
             break;
+        case 'L':
+            if (strcmp(optarg, "auto") == 0) output_layout = VFMCAP_OUTPUT_LAYOUT_AUTO;
+            else if (strcmp(optarg, "single") == 0 || strcmp(optarg, "1") == 0) output_layout = VFMCAP_OUTPUT_LAYOUT_SINGLE_DMABUF;
+            else if (strcmp(optarg, "two") == 0 || strcmp(optarg, "2") == 0) output_layout = VFMCAP_OUTPUT_LAYOUT_TWO_DMABUF;
+            else {
+                fprintf(stderr, "Unknown output layout: %s (use: auto, single, two)\n", optarg);
+                return 1;
+            }
+            break;
         case 'h':
         default:
             fprintf(stderr,
-                "Usage: %s [-d device] [-n frames] [-c p010|nv12|nv12-afbc|a2b10g10r10-afbc|both] [-o outfile] [-r rawfile] [-m pass|hdr10|hlg] [-W width] [-H height] [-F fps] [-p]\n"
+                "Usage: %s [-d device] [-n frames] [-c p010|nv12|nv12-afbc|a2b10g10r10-afbc|both] [-o outfile] [-r rawfile] [-m pass|hdr10|hlg] [-W width] [-H height] [-F fps] [-L auto|single|two] [-p]\n"
                 "  -d  Device path (default: /dev/video_cap)\n"
                 "  -n  Number of frames to capture (default: 100)\n"
                 "  -c  GPU convert: p010, nv12, nv12-afbc, a2b10g10r10-afbc, or both\n"
@@ -647,6 +657,7 @@ int main(int argc, char *argv[])
                 "  -W  Target output width (0 = match source)\n"
                 "  -H  Target output height (0 = match source)\n"
                 "  -F  Target framerate (0 = match source)\n"
+                "  -L  Linear NV12/P010 plane layout: auto, single, or two\n"
                 "  -p  Profiling mode: GPU-convert every frame, report timing stats\n",
                 argv[0]);
             return (opt == 'h') ? 0 : 1;
@@ -667,6 +678,9 @@ int main(int argc, char *argv[])
                             color_mode == 2 ? "HLG->SDR" : "unknown");
     if (target_w || target_h) fprintf(stderr, "Target: %dx%d\n", target_w, target_h);
     if (target_fps > 0) fprintf(stderr, "Target FPS: %.1f\n", target_fps);
+    fprintf(stderr, "Output layout: %s\n",
+            output_layout == VFMCAP_OUTPUT_LAYOUT_SINGLE_DMABUF ? "single" :
+            output_layout == VFMCAP_OUTPUT_LAYOUT_TWO_DMABUF ? "two" : "auto");
     if (do_profile) fprintf(stderr, "Mode: PROFILING\n");
 
     /* Open */
@@ -685,6 +699,13 @@ int main(int argc, char *argv[])
     if (!ctx) {
         fprintf(stderr, "ERROR: vfmcap_open failed: %s\n",
                 vfmcap_last_error(NULL));
+        return 1;
+    }
+
+    if (vfmcap_set_output_layout(ctx, output_layout) != VFMCAP_OK) {
+        fprintf(stderr, "ERROR: vfmcap_set_output_layout failed: %s\n",
+                vfmcap_last_error(ctx));
+        vfmcap_close(ctx);
         return 1;
     }
 

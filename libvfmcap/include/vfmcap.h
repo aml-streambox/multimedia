@@ -69,6 +69,14 @@ typedef enum {
     VFMCAP_COLOR_HLG_TO_SDR = 2,   /* BT.2020+HLG -> BT.709 SDR (Reinhard tone map) */
 } vfmcap_color_mode_t;
 
+/* ---------- Linear YUV plane layout ---------- */
+
+typedef enum {
+    VFMCAP_OUTPUT_LAYOUT_AUTO = 0,          /* Prefer single DMA-buf, fall back when needed */
+    VFMCAP_OUTPUT_LAYOUT_SINGLE_DMABUF = 1, /* Y and UV in one DMA-buf; dmabuf_fd2 = -1 */
+    VFMCAP_OUTPUT_LAYOUT_TWO_DMABUF = 2,    /* Y in dmabuf_fd, UV in dmabuf_fd2 */
+} vfmcap_output_layout_t;
+
 /* ---------- Frame descriptor ---------- */
 
 /**
@@ -167,6 +175,18 @@ typedef struct {
  * Call vfmcap_last_error() for error details.
  */
 vfmcap_ctx_t *vfmcap_open(const char *device, const vfmcap_config_t *config);
+
+/**
+ * vfmcap_set_output_layout - Select linear NV12/P010 DMA-buf plane layout
+ * @ctx: Context from vfmcap_open()
+ * @layout: AUTO, SINGLE_DMABUF, or TWO_DMABUF
+ *
+ * Must be called before vfmcap_start(). This does not affect RAW/VYUY passthrough
+ * or AFBC outputs. Environment overrides are also supported:
+ * VFMCAP_OUTPUT_LAYOUT=auto|single|two, VFMCAP_P010_SEPARATE=1,
+ * VFMCAP_NV12_SEPARATE=1.
+ */
+int vfmcap_set_output_layout(vfmcap_ctx_t *ctx, vfmcap_output_layout_t layout);
 
 /**
  * vfmcap_start - Start V4L2 streaming

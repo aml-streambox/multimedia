@@ -75,6 +75,7 @@ struct vfmcap_ctx {
 
     /* Configuration */
     vfmcap_config_t      config;
+    vfmcap_output_layout_t output_layout;
 
     /* Current format */
     uint32_t             width;
@@ -164,6 +165,46 @@ static vfmcap_vk_fmt_t to_vk_fmt(vfmcap_output_fmt_t fmt)
     case VFMCAP_FMT_A2B10G10R10_AFBC: return VFMCAP_VK_FMT_A2B10G10R10_AFBC;
     default: return VFMCAP_VK_FMT_NV12;
     }
+}
+
+static int env_enabled(const char *name)
+{
+    const char *value = getenv(name);
+    return value && value[0] == '1';
+}
+
+static vfmcap_output_layout_t parse_output_layout_env(const char *value)
+{
+    if (!value || value[0] == '\0')
+        return VFMCAP_OUTPUT_LAYOUT_AUTO;
+    if (strcmp(value, "single") == 0 || strcmp(value, "one") == 0 ||
+        strcmp(value, "contiguous") == 0 || strcmp(value, "contig") == 0 ||
+        strcmp(value, "1") == 0)
+        return VFMCAP_OUTPUT_LAYOUT_SINGLE_DMABUF;
+    if (strcmp(value, "two") == 0 || strcmp(value, "separate") == 0 ||
+        strcmp(value, "split") == 0 || strcmp(value, "2") == 0)
+        return VFMCAP_OUTPUT_LAYOUT_TWO_DMABUF;
+    return VFMCAP_OUTPUT_LAYOUT_AUTO;
+}
+
+static vfmcap_output_layout_t resolve_output_layout(vfmcap_output_fmt_t fmt,
+                                                     vfmcap_output_layout_t requested)
+{
+    if (requested != VFMCAP_OUTPUT_LAYOUT_AUTO)
+        return requested;
+
+    vfmcap_output_layout_t from_env =
+        parse_output_layout_env(getenv("VFMCAP_OUTPUT_LAYOUT"));
+    if (from_env != VFMCAP_OUTPUT_LAYOUT_AUTO)
+        return from_env;
+
+    if (fmt == VFMCAP_FMT_P010 && env_enabled("VFMCAP_P010_SEPARATE"))
+        return VFMCAP_OUTPUT_LAYOUT_TWO_DMABUF;
+    if ((fmt == VFMCAP_FMT_NV12 || fmt == VFMCAP_FMT_NV21) &&
+        env_enabled("VFMCAP_NV12_SEPARATE"))
+        return VFMCAP_OUTPUT_LAYOUT_TWO_DMABUF;
+
+    return VFMCAP_OUTPUT_LAYOUT_AUTO;
 }
 
 /* ---------- Dynamic reconfiguration ---------- */
@@ -451,10 +492,13 @@ int vfmcap_start(vfmcap_ctx_t *ctx, unsigned int num_buffers)
     if (needs_vulkan(&ctx->config) && !ctx->vk && ctx->width > 0 && ctx->height > 0) {
         uint32_t dst_w = ctx->config.target_width ? ctx->config.target_width : ctx->width;
         uint32_t dst_h = ctx->config.target_height ? ctx->config.target_height : ctx->height;
+        vfmcap_output_layout_t output_layout =
+            resolve_output_layout(ctx->config.output_format, ctx->output_layout);
         if (vfmcap_vk_init(&ctx->vk, ctx->width, ctx->height,
                             dst_w, dst_h,
                             to_vk_fmt(ctx->config.output_format),
-                            (uint32_t)ctx->config.color_mode) == 0) {
+                            (uint32_t)ctx->config.color_mode,
+                            output_layout) == 0) {
             /* success */
         } else {
             fprintf(stderr, "[vfmcap] WARNING: Vulkan init failed: %s\n",
@@ -476,6 +520,27 @@ int vfmcap_start(vfmcap_ctx_t *ctx, unsigned int num_buffers)
             ctx->width, ctx->height, (char *)&ctx->pixelformat,
             ctx->vk ? "yes" : "no");
 
+    return VFMCAP_OK;
+}
+
+int vfmcap_set_output_layout(vfmcap_ctx_t *ctx, vfmcap_output_layout_t layout)
+{
+    if (!ctx)
+        return VFMCAP_ERR_INVAL;
+    if (layout != VFMCAP_OUTPUT_LAYOUT_AUTO &&
+        layout != VFMCAP_OUTPUT_LAYOUT_SINGLE_DMABUF &&
+        layout != VFMCAP_OUTPUT_LAYOUT_TWO_DMABUF) {
+        snprintf(ctx->last_error, sizeof(ctx->last_error),
+                 "Invalid output layout: %d", layout);
+        return VFMCAP_ERR_INVAL;
+    }
+    if (ctx->streaming) {
+        snprintf(ctx->last_error, sizeof(ctx->last_error),
+                 "Output layout must be set before start");
+        return VFMCAP_ERR_STATE;
+    }
+
+    ctx->output_layout = layout;
     return VFMCAP_OK;
 }
 

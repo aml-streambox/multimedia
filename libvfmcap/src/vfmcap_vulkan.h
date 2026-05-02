@@ -44,7 +44,8 @@ typedef enum {
  */
 int vfmcap_vk_init(VulkanCtx **vk, uint32_t src_width, uint32_t src_height,
                     uint32_t dst_width, uint32_t dst_height,
-                    vfmcap_vk_fmt_t fmt, uint32_t color_mode);
+                    vfmcap_vk_fmt_t fmt, uint32_t color_mode,
+                    vfmcap_output_layout_t output_layout);
 
 /**
  * vfmcap_vk_convert_submit - Submit async GPU conversion
